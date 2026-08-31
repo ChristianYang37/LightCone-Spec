@@ -109,6 +109,12 @@ def test_s10_scientific_rejection_is_terminal_without_stopping_siblings():
 
     assert _records_scientific_rejection(replacement)
     assert not _records_scientific_rejection(original)
+    width = replace(
+        replacement,
+        job_id="e3-width-lightcone-4__segment-000",
+        node="E3-width-calibration",
+    )
+    assert _records_scientific_rejection(width)
 
 
 def test_native_timestamps_accept_scheduler_field_names():
@@ -1121,12 +1127,35 @@ def test_cosine_horizon_and_e1a_fixed_settings():
                 "schedule": "cosine_to_zero",
                 "stride": 10,
                 "coalescing": 2,
+                "registered_request_count": 3,
             },
         }
     )
     payload = adaptation_payload(job)
     assert payload["optimizer"]["schedule_total_published_updates"] == max(
-        8, math.ceil((16384 - 128) / 20)
+        8, math.ceil(3 * job.parameters["generation_tokens"] / 20)
+    )
+    muon_job = job.__class__(
+        **{
+            **job.to_dict(),
+            "parameters": {
+                **job.parameters,
+                "optimizer": "muon",
+                "learning_rate": 3e-4,
+                "weight_decay": 0.01,
+                "schedule": "constant",
+            },
+        }
+    )
+    muon = adaptation_payload(muon_job)["optimizer"]
+    assert muon["momentum"] == 0.95
+    assert muon["muon_ns_steps"] == 5
+    assert muon["muon_auxiliary_learning_rate"] == 3e-4
+    assert muon["muon_auxiliary_weight_decay"] == 0.01
+    calibration = next(
+        item
+        for item in materialize("E1a")
+        if item.parameters.get("workload") == "confidence_calibration"
     )
     e1a = adaptation_payload(
         materialize("E1a")[0],
@@ -1135,6 +1164,10 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     assert e1a["fixed_total_token_budget"] == 8
     assert e1a["confidence_loss_weight"] == 0.25
     assert e1a["canvas_tokens"] == 8
+    assert calibration.parameters["regime"] == "short_input_long_generation"
+    assert calibration.parameters["generation_tokens"] == 8192
+    assert calibration.parameters["scope"] == "last1_native_heads"
+    assert calibration.parameters["parameterization"] == "full"
 
 
 def test_tts_always_resets_between_requests():

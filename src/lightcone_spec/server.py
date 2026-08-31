@@ -101,13 +101,31 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "grad_clip": float(chosen.get("grad_clip", 1.0)),
         "momentum": chosen.get(
             "momentum",
-            0.9 if chosen.get("optimizer") in {"sgdm", "nag"} else None,
+            0.9
+            if chosen.get("optimizer") in {"sgdm", "nag"}
+            else 0.95
+            if chosen.get("optimizer") == "muon"
+            else None,
         ),
         "schedule": chosen.get("schedule", "constant"),
     }
+    if optimizer["name"] == "muon":
+        optimizer.update(
+            muon_ns_steps=int(chosen.get("muon_ns_steps", 5)),
+            muon_auxiliary_learning_rate=float(
+                chosen.get("muon_auxiliary_learning_rate", optimizer["learning_rate"])
+            ),
+            muon_auxiliary_weight_decay=float(
+                chosen.get("muon_auxiliary_weight_decay", optimizer["weight_decay"])
+            ),
+        )
     if optimizer["schedule"] == "cosine_to_zero":
         round_index = int(chosen.get("round", 0))
-        expected_rounds = max(1, (job.context or 128) - 128)
+        registered_requests = int(chosen.get("registered_request_count", 1))
+        generation_tokens = int(chosen.get("generation_tokens", 0))
+        if registered_requests < 1 or generation_tokens < 1:
+            raise ValueError("cosine schedule requires a registered request/output budget")
+        expected_rounds = registered_requests * generation_tokens
         optimizer["schedule_total_published_updates"] = max(
             E2_MINIMUM_UPDATES[round_index],
             math.ceil(expected_rounds / (stride * coalescing)),

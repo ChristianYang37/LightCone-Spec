@@ -219,6 +219,21 @@ class StateStore:
                 (status, error, job_id),
             )
 
+    def interrupt(self, job_id: str, attempt: int, error: str) -> None:
+        """Return an interrupted cell to pending without consuming its process retry."""
+
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE attempts SET status='interrupted', completed_at=CURRENT_TIMESTAMP, "
+                "error=? WHERE job_id=? AND attempt=?",
+                (error, job_id, attempt),
+            )
+            connection.execute(
+                "UPDATE jobs SET status='pending', completed_at=NULL, assigned_gpus=NULL, "
+                "started_at=NULL, error=? WHERE job_id=?",
+                (error, job_id),
+            )
+
     def skip_pending(self, node: str, reason: str) -> int:
         with self.connect() as connection:
             changed = connection.execute(

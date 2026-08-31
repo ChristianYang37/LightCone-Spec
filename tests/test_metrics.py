@@ -216,6 +216,34 @@ def test_s10_reconciliation_has_exact_registered_replacement_budget(tmp_path):
     assert len({job.parameters["replaces_job_id"] for job in repairs}) == 19
 
 
+def test_bugfix_reconciliation_has_exact_152_cell_budget(tmp_path):
+    state = StateStore(tmp_path)
+    geometries = [
+        {"parameterization": "lora", "rank": rank, "scope": "last1"}
+        for rank in (1, 8)
+    ]
+    state.add_jobs(
+        "E2-r0",
+        materialize("E2-r0", e2_rows=runner.e2_candidates(geometries)),
+    )
+    for node in ("E1a", "TTS-Cal"):
+        state.add_jobs(node, materialize(node))
+    e3a_parent = materialize("E3a")[111]
+    state.add_internal_jobs(
+        runner._segment_jobs(e3a_parent),
+        storage_node="E3a-segments",
+    )
+    repairs = runner._bugfix_reconciliation_jobs(state)
+    assert len(repairs) == 100
+    assert sum(len(job.parameters.get("segments", [])) or 1 for job in repairs) == 145
+    reasons = [job.parameters["reconciliation_kind"] for job in repairs]
+    assert reasons.count("e2_optimizer_or_cosine_horizon") == 90
+    assert reasons.count("e1a_native_confidence_calibration") == 5
+    assert reasons.count("screening_runtime_error_classification") == 2
+    assert reasons.count("pre_reconstruction_stride1") == 3
+    assert 145 + 7 == 152
+
+
 def test_formal_replacement_excludes_old_attempt_without_overwriting_it(tmp_path):
     state = StateStore(tmp_path)
     source = next(job for job in materialize("E1") if job.method == "tts")

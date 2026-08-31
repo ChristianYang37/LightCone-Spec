@@ -23,7 +23,9 @@ from lightcone_spec.runner import (
     _capacity_infeasible,
     _gpu_pairs,
     _job_from_metric_config,
+    _schedule_exhausted_updates,
     _scientific_rejection,
+    _screening_incomplete_classification,
     _screening_job,
     _segment_jobs,
     _single_gpu_queues,
@@ -335,3 +337,31 @@ def test_screening_capacity_detects_zero_kv_after_adaptation_headroom():
         "under --mem-fraction-static=0.88"
     )
     assert _capacity_infeasible(error)
+
+
+def test_screening_outcome_classification_separates_runtime_and_capacity():
+    assert (
+        _screening_incomplete_classification([{"status": "timed_out"}])
+        == "scientific_infeasible"
+    )
+    assert (
+        _screening_incomplete_classification([{"status": "unfinished"}])
+        == "scientific_infeasible"
+    )
+    assert (
+        _screening_incomplete_classification(
+            [{"status": "error", "error": "connection refused"}]
+        )
+        == "runtime_failure"
+    )
+    assert (
+        _screening_incomplete_classification([{"status": "cancelled"}])
+        == "interrupted"
+    )
+
+
+def test_cosine_schedule_endpoint_and_registered_overrun():
+    adaptation = {"optimizer": {"schedule_total_published_updates": 100}}
+    assert _schedule_exhausted_updates({"updates_published": 100}, adaptation) == 0
+    assert _schedule_exhausted_updates({"updates_published": 101}, adaptation) == 1
+    assert _schedule_exhausted_updates({"updates_published": 101}, None) is None

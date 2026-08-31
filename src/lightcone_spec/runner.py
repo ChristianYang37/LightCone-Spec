@@ -78,6 +78,10 @@ class ScientificFailure(RuntimeError):
     """A measured cell violated a scientific correctness requirement."""
 
 
+class RunnerInterrupted(RuntimeError):
+    """A user or runner cancellation that must resume from pending."""
+
+
 CANDIDATE_METHODS = {
     "lightcone_candidate",
     "onlinespec_candidate",
@@ -113,6 +117,8 @@ def _records_scientific_rejection(job: Job) -> bool:
     """
     return (
         job.node == "S10-reconciliation"
+        or job.node == "bugfix-reconciliation-v1"
+        or job.node == "E3-width-calibration"
         or job.method in CANDIDATE_METHODS
         or bool(job.parameters.get("interface_fit"))
         or _screening_job(job)
@@ -120,7 +126,8 @@ def _records_scientific_rejection(job: Job) -> bool:
 
 
 def _screening_job(job: Job) -> bool:
-    return job.node in {
+    node = str(job.parameters.get("source_node", job.node))
+    return node in {
         "E3a",
         "TTS-Cal",
         "E1-common-load",
@@ -189,6 +196,31 @@ def _capacity_infeasible(
         )
         is not None
     )
+
+
+def _screening_incomplete_classification(rows: Sequence[dict[str, Any]]) -> str:
+    statuses = {str(row.get("status")) for row in rows}
+    if "cancelled" in statuses:
+        return "interrupted"
+    if "error" in statuses:
+        return "runtime_failure"
+    if statuses <= {"timed_out", "unfinished"}:
+        return "scientific_infeasible"
+    return "runtime_failure"
+
+
+def _schedule_exhausted_updates(
+    metrics: dict[str, Any], adaptation: dict[str, Any] | None
+) -> int | None:
+    if not isinstance(adaptation, dict):
+        return None
+    optimizer = adaptation.get("optimizer")
+    if not isinstance(optimizer, dict):
+        return None
+    horizon = optimizer.get("schedule_total_published_updates")
+    if not isinstance(horizon, int):
+        return None
+    return max(0, int(metrics.get("updates_published", 0)) - horizon)
 
 
 def _exactness_bootstrap(job: Job) -> Job:
@@ -683,7 +715,14 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
     return max(per_method, key=lambda row: row[0])
 
 
-def _runtime_job(state: StateStore, job: Job) -> Job:
+def _runtime_job(config: ExperimentConfig, state: StateStore, job: Job) -> Job:
+    job = replace(
+        job,
+        parameters={
+            **job.parameters,
+            "registered_request_count": _request_count(config, state, job),
+        },
+    )
     if job.node == "E1" and job.load is None:
         job = replace(
             job,
@@ -1062,7 +1101,7 @@ def _execute_cell(
         offered = 0
         metrics: dict[str, Any] | None = None
         try:
-            runtime_job = _runtime_job(state, job)
+            runtime_job = _runtime_job(config, state, job)
             declared_concurrency = _cell_concurrency(runtime_job)
             dispatcher_concurrency = _dispatcher_concurrency(runtime_job)
             runtime_job = replace(
@@ -1396,6 +1435,17 @@ def _execute_cell(
                     raise RuntimeError(
                         f"{len(incomplete)} requests did not complete in a measured cell"
                     )
+                classification = _screening_incomplete_classification(incomplete)
+                if classification == "interrupted":
+                    raise RunnerInterrupted("screening request was cancelled")
+                if classification == "runtime_failure":
+                    raise RuntimeError(
+                        "screening request failed at runtime: "
+                        + "; ".join(
+                            str(row.get("error") or row["status"])
+                            for row in incomplete
+                        )
+                    )
                 counters = {
                     name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
                 }
@@ -1592,6 +1642,12 @@ def _execute_cell(
                 and metrics["resolved_stride"] != FORMAL_ADAPTATION_STRIDE
             ):
                 raise ScientificFailure("formal adaptive cell did not resolve to stride S=10")
+            exhausted = _schedule_exhausted_updates(metrics, adaptation)
+            if exhausted is not None:
+                metrics["schedule_horizon_basis"] = "registered_max_output_tokens"
+                metrics["schedule_exhausted_updates"] = exhausted
+                if exhausted:
+                    raise ScientificFailure("registered cosine schedule horizon was exceeded")
             if (
                 uses_formal_adaptation_stride(runtime_job)
                 and runtime_job.parameters.get("regime") == "multi_turn_shared_prefix"
@@ -1650,6 +1706,18 @@ def _execute_cell(
                 < int(job.parameters.get("minimum_updates", 1))
             ):
                 raise ScientificFailure("adaptive cell did not publish the required updates")
+            if job.parameters.get("workload") == "confidence_calibration":
+                probabilities = metrics.get("confidence_probabilities")
+                outcomes = metrics.get("confidence_outcomes")
+                if (
+                    not isinstance(probabilities, list)
+                    or not probabilities
+                    or not isinstance(outcomes, list)
+                    or len(probabilities) != len(outcomes)
+                ):
+                    raise ScientificFailure(
+                        "confidence calibration produced incomplete probability/outcome telemetry"
+                    )
             if runtime_job.parameters.get("controlled_replay"):
                 if after.get("controlled_candidate_compared") is not True:
                     raise ScientificFailure("controlled replay did not compare a candidate")
@@ -1665,6 +1733,23 @@ def _execute_cell(
                 raise ScientificFailure("fault diagnostic did not complete its expected action")
             _write_json(output_dir / "metrics.json", metrics)
             state.complete(job.job_id, attempt)
+            return
+        except RunnerInterrupted as error:
+            _write_json(
+                output_dir / "metrics.json",
+                {
+                    "status": "interrupted",
+                    "error": str(error),
+                    "request_outcomes": {
+                        "offered": offered,
+                        "completed": 0,
+                        "error": 0,
+                        "cancelled": int(offered > 0),
+                        "unfinished": max(0, offered - 1),
+                    },
+                },
+            )
+            state.interrupt(job.job_id, attempt, str(error))
             return
         except ScientificFailure as error:
             if job.parameters.get("probe"):
@@ -1818,6 +1903,7 @@ def _retryable_process_error(error: Exception) -> bool:
             "SGLang exited during startup",
             "server did not recover",
             "stream did not return a complete result",
+            "screening request failed at runtime",
         )
     )
 
@@ -2591,8 +2677,9 @@ def _complete_segment_parent(
         outcomes.update(row["metrics"].get("request_outcomes", {}))
     committed = sum(int(row["metrics"].get("committed_tokens", 0)) for row in rows)
     duration = sum(float(row["metrics"].get("duration_seconds", 0.0)) for row in rows)
+    feasible = all(row["metrics"].get("feasible") is not False for row in rows)
     metrics = {
-        "scientific_outcome": "completed",
+        "scientific_outcome": "completed" if feasible else "rejected",
         "segments": rows,
         "segment_count": len(rows),
         "committed_tokens": committed,
@@ -2601,7 +2688,7 @@ def _complete_segment_parent(
         "peak_hbm_bytes": max(int(row["metrics"].get("peak_hbm_bytes", 0)) for row in rows),
         "request_count": sum(int(row["metrics"].get("request_count", 0)) for row in rows),
         "request_outcomes": dict(outcomes),
-        "feasible": all(row["metrics"].get("feasible") is not False for row in rows),
+        "feasible": feasible,
         "slo_pass": all(row["metrics"].get("slo_pass") is not False for row in rows),
     }
     for counter in SAFETY_COUNTERS:
@@ -2657,7 +2744,7 @@ def _run_pending_jobs(
     def run_sessions(jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str) -> None:
         grouped: dict[tuple[object, ...], list[tuple[Job, Job, dict[str, Any] | None]]] = {}
         for job in jobs:
-            runtime_job = _runtime_job(state, job)
+            runtime_job = _runtime_job(config, state, job)
             selection = _selection_for_job(state, job)
             probe = job.job_id if job.parameters.get("adaptive_probe") else None
             process_job = _exactness_bootstrap(runtime_job)
@@ -3105,6 +3192,8 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
             if isinstance(segments, list):
                 for segment in segments:
                     segment_config = dict(segment["config"])
+                    if str(segment_config.get("job_id")) in excluded:
+                        continue
                     segment_metrics = dict(segment["metrics"])
                     segment_config, segment_metrics = normalize_attempt_semantics(
                         segment_config,
@@ -4558,6 +4647,109 @@ def _e2_missing_dependency_jobs(
     return tuple(rows)
 
 
+def _bugfix_replacement(source: Job, *, ordinal: int, reason: str) -> Job:
+    return replace(
+        source,
+        job_id=f"bugfix-v1__{source.job_id}",
+        node="bugfix-reconciliation-v1",
+        ordinal=ordinal,
+        parameters={
+            **source.parameters,
+            "source_node": source.node,
+            "replaces_job_id": source.job_id,
+            "reconciliation_kind": reason,
+        },
+    )
+
+
+def _bugfix_reconciliation_jobs(state: StateStore) -> tuple[Job, ...]:
+    """Materialize only evidence known to be contaminated by the four fixed bugs."""
+
+    sources: dict[str, tuple[Job, str]] = {}
+    for job in state.jobs("E2-r0"):
+        if job.method != "lightcone_candidate":
+            continue
+        optimizer = str(job.parameters.get("optimizer"))
+        schedule = str(job.parameters.get("schedule"))
+        if optimizer == "muon" or schedule == "cosine_to_zero":
+            sources[job.job_id] = (job, "e2_optimizer_or_cosine_horizon")
+
+    for job in state.jobs("E1a"):
+        if job.parameters.get("workload") == "confidence_calibration":
+            sources[job.job_id] = (
+                replace(
+                    job,
+                    parameters={
+                        **job.parameters,
+                        "scope": "last1_native_heads",
+                        "parameterization": "full",
+                        "regime": "short_input_long_generation",
+                        "generation_tokens": GEOMETRY_GENERATION_TOKENS,
+                        "stride": FORMAL_ADAPTATION_STRIDE,
+                    },
+                ),
+                "e1a_native_confidence_calibration",
+            )
+
+    e3a_prefix = "E3a__000111__static__Qwen-Qwen3-8B__DFLASH__MATH-500__segment-"
+    for job in state.jobs("E3a-segments"):
+        if job.job_id in {f"{e3a_prefix}000", f"{e3a_prefix}001"}:
+            sources[job.job_id] = (job, "screening_runtime_error_classification")
+
+    tts_ordinals = {8, 24, 56}
+    for job in state.jobs("TTS-Cal"):
+        if job.ordinal in tts_ordinals:
+            sources[job.job_id] = (job, "pre_reconstruction_stride1")
+
+    counts = Counter(reason for _, reason in sources.values())
+    expected = {
+        "e2_optimizer_or_cosine_horizon": 90,
+        "e1a_native_confidence_calibration": 5,
+        "screening_runtime_error_classification": 2,
+        "pre_reconstruction_stride1": 3,
+    }
+    if counts != expected:
+        raise ScientificFailure(
+            f"bugfix reconciliation source mismatch: found {dict(counts)}, expected {expected}"
+        )
+    return tuple(
+        _bugfix_replacement(source, ordinal=index, reason=reason)
+        for index, (source, reason) in enumerate(
+            sorted(sources.values(), key=lambda row: row[0].job_id)
+        )
+    )
+
+
+def _set_e2_expected_evidence(
+    state: StateStore,
+    node: str,
+    recipes: list[dict[str, Any]],
+) -> int:
+    """Exclude stale downstream finalists while preserving all raw attempts."""
+
+    expected = {_e2_recipe_key(recipe) for recipe in recipes}
+    previous = set(state.selection("bugfix_v1_e2_obsolete_ids", []))
+    exclusions = set(state.selection("formal_evidence_exclusions", [])) - previous
+    obsolete: set[str] = set()
+    for job_id, directory in state.completed_attempt_rows():
+        path = directory / "config.json"
+        if not path.is_file():
+            continue
+        config = json.loads(path.read_text(encoding="utf-8"))
+        parameters = dict(config.get("parameters", {}))
+        effective_node = str(parameters.get("source_node", config.get("node")))
+        if effective_node != node or config.get("method") != "lightcone_candidate":
+            continue
+        for name in ("source_node", "replaces_job_id", "reconciliation_kind"):
+            parameters.pop(name, None)
+        if _e2_recipe_key(parameters) not in expected:
+            obsolete.add(job_id)
+    exclusions.update(obsolete)
+    state.set_selection("bugfix_v1_e2_obsolete_ids", sorted(obsolete))
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    return len(obsolete)
+
+
 def _audit_e2_after_s10(
     config: ExperimentConfig,
     state: StateStore,
@@ -4571,7 +4763,9 @@ def _audit_e2_after_s10(
     previous = geometries
     for round_index in range(4):
         node = f"E2-r{round_index}"
+        obsolete = 0
         if round_index > 0:
+            obsolete = _set_e2_expected_evidence(state, node, previous)
             missing = _e2_missing_dependency_jobs(state, node, previous)
             if missing:
                 state.add_internal_jobs(missing, storage_node="S10-e2-dependency-repair")
@@ -4625,6 +4819,7 @@ def _audit_e2_after_s10(
                 "corrected_finalists": len(winners),
                 "same_scientific_set": same_set,
                 "dependency_jobs_added": len(missing) if round_index > 0 else 0,
+                "obsolete_evidence_excluded": obsolete,
             }
         )
         previous = selected_rows
@@ -4773,6 +4968,226 @@ def _repair_completed_s10_downstream_resume(state: StateStore) -> None:
     state.set_selection("formal_s10_downstream_resume_version", 2)
 
 
+def _run_recipe_change_replacements(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> int:
+    """Replace only completed evidence whose runtime recipe is selected globally."""
+
+    exclusions = set(state.selection("formal_evidence_exclusions", []))
+
+    def replacement(source: Job, *, ordinal: int, group: str) -> Job:
+        exclusions.add(source.job_id)
+        return replace(
+            source,
+            job_id=f"bugfix-recipe-v1__{source.job_id}",
+            node=group,
+            ordinal=ordinal,
+            parameters={
+                **source.parameters,
+                "source_node": source.node,
+                "replaces_job_id": source.job_id,
+                "reconciliation_kind": "changed_lightcone_recipe",
+            },
+        )
+
+    screen_sources = tuple(
+        job for job in state.jobs("E4-screen") if job.method == "lightcone"
+    )
+    if len(screen_sources) != 48:
+        raise ScientificFailure(
+            f"recipe closure expected 48 E4-screen rows, found {len(screen_sources)}"
+        )
+    screen = tuple(
+        replacement(job, ordinal=index, group="bugfix-recipe-v1-screen")
+        for index, job in enumerate(screen_sources)
+    )
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    state.add_internal_jobs(screen, storage_node="bugfix-recipe-v1-screen")
+    _run_pending_jobs(
+        config,
+        state,
+        "bugfix-recipe-v1-screen",
+        stop_event,
+        state.pending_jobs("bugfix-recipe-v1-screen"),
+    )
+    if stop_event.is_set():
+        return 0
+    _require_internal_jobs(state, "bugfix-recipe-v1-screen")
+    _reduce_node(config, state, "E4-screen")
+
+    local_sources = materialize(
+        "E4-local",
+        e4_neighborhoods=state.selection("e4_neighborhoods", None),
+    )
+    old_local = state.jobs("E4-local")
+    if len(local_sources) != 168 or len(old_local) != 168:
+        raise ScientificFailure("recipe closure expected 168 E4-local rows")
+    exclusions.update(job.job_id for job in old_local)
+    local = tuple(
+        replacement(job, ordinal=index, group="bugfix-recipe-v1-local")
+        for index, job in enumerate(local_sources)
+    )
+
+    profile_sources = tuple(
+        job
+        for job in state.jobs("E4-profile")
+        if job.parameters.get("profiler") != "ncu"
+    )
+    if len(profile_sources) != 2:
+        raise ScientificFailure(
+            f"recipe closure expected 2 non-NCU profile rows, found {len(profile_sources)}"
+        )
+    profile = tuple(
+        replacement(job, ordinal=index, group="bugfix-recipe-v1-profile")
+        for index, job in enumerate(profile_sources)
+    )
+
+    width_sources = tuple(
+        job for job in _deployment_width_jobs(state) if job.method == "lightcone"
+    )
+    if len(width_sources) != 3:
+        raise ScientificFailure("recipe closure expected three LightCone width parents")
+    width = tuple(
+        replacement(job, ordinal=index, group="bugfix-recipe-v1-width")
+        for index, job in enumerate(width_sources)
+    )
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+
+    groups = (
+        ("bugfix-recipe-v1-local", local),
+        ("bugfix-recipe-v1-profile", profile),
+        ("bugfix-recipe-v1-width", width),
+    )
+    for group, jobs in groups:
+        state.add_internal_jobs(jobs, storage_node=group)
+        _run_pending_jobs(config, state, group, stop_event, state.pending_jobs(group))
+        if stop_event.is_set():
+            return 0
+        _require_internal_jobs(state, group)
+    widths = _select_deployment_widths(state)
+    state.set_selection("deployment_widths", widths)
+    state.set_selection("deployment_widths_tuned", True)
+    return 48 + 168 + 2 + 9
+
+
+def _run_bugfix_reconciliation_v1(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    """Repair the E1a/E2/screening/width evidence without rewriting raw attempts."""
+
+    if state.selection("formal_bugfix_reconciliation_version", 0) >= 1:
+        return
+    if state.selection("formal_s10_downstream_resume_version", 0) < 2:
+        return
+    confidence_jobs = tuple(
+        job
+        for job in state.jobs("E1a")
+        if job.parameters.get("workload") == "confidence_calibration"
+    )
+    if len(confidence_jobs) != 5:
+        return
+
+    old_e3a = state.selection("e3a", None)
+    old_recipe = state.selection("lightcone_recipe", None)
+    repairs = _bugfix_reconciliation_jobs(state)
+    exclusions = set(state.selection("formal_evidence_exclusions", []))
+    exclusions.update(str(job.parameters["replaces_job_id"]) for job in repairs)
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    state.add_internal_jobs(repairs, storage_node="bugfix-reconciliation-v1")
+    _run_pending_jobs(
+        config,
+        state,
+        "bugfix-reconciliation-v1",
+        stop_event,
+        state.pending_jobs("bugfix-reconciliation-v1"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "bugfix-reconciliation-v1")
+
+    width_segment_retries = int(state.selection("bugfix_v1_width_retries", 0))
+    if not width_segment_retries:
+        width_segment_retries = state.retry_failed("E3-width-calibration-segments")
+        if width_segment_retries != 7:
+            raise ScientificFailure(
+                f"bugfix reconciliation expected 7 width retries, found {width_segment_retries}"
+            )
+        state.set_selection("bugfix_v1_width_retries", width_segment_retries)
+    _run_pending_jobs(
+        config,
+        state,
+        "E3-width-calibration",
+        stop_event,
+        state.pending_jobs("E3-width-calibration-segments"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "E3-width-calibration-segments")
+    _run_pending_jobs(
+        config,
+        state,
+        "E3-width-calibration",
+        stop_event,
+        state.pending_jobs("E3-width-calibration"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "E3-width-calibration")
+
+    _reduce_node(config, state, "E3a")
+    new_e3a = state.selection("e3a", None)
+    if new_e3a != old_e3a:
+        raise ScientificFailure(
+            f"E3a selection changed from {old_e3a} to {new_e3a}; broader closure required"
+        )
+
+    _audit_e2_after_s10(config, state, stop_event)
+    if stop_event.is_set():
+        return
+    new_recipe = state.selection("lightcone_recipe", None)
+    recipe_changed = (
+        isinstance(old_recipe, dict)
+        and isinstance(new_recipe, dict)
+        and _e2_recipe_key(old_recipe) != _e2_recipe_key(new_recipe)
+    )
+    conditional_cells = (
+        _run_recipe_change_replacements(config, state, stop_event)
+        if recipe_changed
+        else 0
+    )
+    if stop_event.is_set():
+        return
+
+    reopened = state.reopen_skipped(
+        ("E3b-pilot", "E3b-final", "E1a", "E5-pilot", "E5-final")
+    )
+    audit_path = (
+        state.run_dir
+        / "stages"
+        / "bugfix-reconciliation-v1"
+        / "reconciliation.json"
+    )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        audit_path,
+        {
+            "direct_replacement_jobs": len(repairs),
+            "direct_gpu_cells": 145,
+            "width_retry_cells": width_segment_retries,
+            "total_direct_gpu_cells": 145 + width_segment_retries,
+            "e3a_selection_unchanged": new_e3a == old_e3a,
+            "lightcone_recipe_changed": recipe_changed,
+            "conditional_recipe_cells": conditional_cells,
+            "downstream_jobs_reopened": reopened,
+        },
+    )
+    state.set_selection("formal_bugfix_reconciliation_version", 1)
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -4806,6 +5221,11 @@ class PaperRunner:
                     self.stop_event,
                 )
                 _repair_completed_s10_downstream_resume(self.state)
+                _run_bugfix_reconciliation_v1(
+                    self.config,
+                    self.state,
+                    self.stop_event,
+                )
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)

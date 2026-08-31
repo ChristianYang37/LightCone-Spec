@@ -698,8 +698,12 @@ def _e1a() -> Iterator[dict[str, Any]]:
             task="CalibrationMix",
             context=40928,
             width=16,
+            scope="last1_native_heads",
+            parameterization="full",
             confidence_loss_weight=weight,
             verification="native_scheduler",
+            regime="short_input_long_generation",
+            generation_tokens=GEOMETRY_GENERATION_TOKENS,
             workload="confidence_calibration",
             segments=_segments(
                 *(

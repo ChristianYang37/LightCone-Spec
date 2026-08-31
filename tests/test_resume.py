@@ -50,6 +50,21 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     assert state.status_counts("preflight") == {"completed": 1, "pending": 2}
 
 
+def test_explicit_interruption_returns_job_to_pending(tmp_path: Path):
+    state = StateStore(tmp_path)
+    job = materialize("preflight")[0]
+    state.add_jobs("preflight", (job,))
+    attempt = state.start(job, (0, 1), tmp_path / "attempt")
+    state.interrupt(job.job_id, attempt, "runner cancellation")
+    assert state.status_counts("preflight") == {"pending": 1}
+    assert state.failed_attempts(job.job_id) == 0
+    with state.connect() as connection:
+        row = connection.execute(
+            "SELECT status,error FROM attempts WHERE job_id=?", (job.job_id,)
+        ).fetchone()
+    assert (row["status"], row["error"]) == ("interrupted", "runner cancellation")
+
+
 def test_segment_jobs_resume_without_expanding_paper_stage(tmp_path: Path):
     state = StateStore(tmp_path)
     parent = materialize("E3a")[0]

@@ -2095,7 +2095,7 @@ index 00000000..7b2cb5db
 +            scale = 0.5 * (
 +                1.0 + torch.cos(math.pi * (clamped - 1) / (horizon - 1))
 +            )
-+            valid = (step >= 1) & (step <= horizon)
++            valid = step >= 1
 +        return floating_step.new_tensor(base) * scale, valid
 +
 +    def propose(
