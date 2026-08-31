@@ -1561,7 +1561,7 @@ def _execute_cell(
                 metrics["compatible"] = True
                 metrics["static_interface_passed"] = static_interface_passed
                 metrics["adaptive_interface_passed"] = True
-            if job.node == "E1a":
+            if str(job.parameters.get("source_node", job.node)) == "E1a":
                 metrics["fixed_verification_budget"] = (
                     8 if job.parameters.get("verification") == "fixed_budget" else None
                 )

@@ -1177,6 +1177,24 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     assert calibration.parameters["generation_tokens"] == 8192
     assert calibration.parameters["scope"] == "last1_native_heads"
     assert calibration.parameters["parameterization"] == "full"
+    replacement = calibration.__class__(
+        **{
+            **calibration.to_dict(),
+            "node": "bugfix-reconciliation-v1",
+            "parameters": {
+                **calibration.parameters,
+                "source_node": "E1a",
+                "confidence_threshold": 0.5,
+                "save_confidence_outcomes": True,
+            },
+        }
+    )
+    replacement_payload = adaptation_payload(replacement)
+    assert replacement_payload["confidence_loss_weight"] == calibration.parameters[
+        "confidence_loss_weight"
+    ]
+    assert replacement_payload["confidence_threshold"] == 0.5
+    assert replacement_payload["save_confidence_outcomes"] is True
 
 
 def test_tts_always_resets_between_requests():

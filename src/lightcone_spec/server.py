@@ -163,11 +163,12 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "controlled_candidate_role": chosen.get("controlled_candidate_role"),
         "failure_injection": chosen.get("failure"),
     }
-    if job.node == "E1a" and chosen.get("verification") == "fixed_budget":
+    scientific_node = str(job.parameters.get("source_node", job.node))
+    if scientific_node == "E1a" and chosen.get("verification") == "fixed_budget":
         payload["fixed_total_token_budget"] = int(
             chosen.get("proposal_budget", 8)
         ) * _concurrency(job)
-    if job.node == "E1a":
+    if scientific_node == "E1a":
         payload["confidence_loss_weight"] = float(chosen.get("confidence_loss_weight", 0.1))
         payload["save_confidence_outcomes"] = bool(
             chosen.get("save_confidence_outcomes", False)
