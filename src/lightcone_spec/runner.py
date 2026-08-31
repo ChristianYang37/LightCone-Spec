@@ -182,7 +182,8 @@ def _capacity_infeasible(
     return (
         isinstance(error, MemoryError)
         or re.search(
-            r"out of memory|\b(?:cuda )?oom\b|adaptation peak .* exceeds pre-KV reserve",
+            r"out of memory|\b(?:cuda )?oom\b|adaptation peak .* exceeds pre-KV reserve|"
+            r"leave no GPU memory for the KV cache",
             message,
             flags=re.IGNORECASE,
         )

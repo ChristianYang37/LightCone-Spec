@@ -20,6 +20,7 @@ from lightcone_spec.runner import (
     _all_jobs_completed,
     _assigned_gpu,
     _assigned_pair,
+    _capacity_infeasible,
     _gpu_pairs,
     _job_from_metric_config,
     _scientific_rejection,
@@ -325,3 +326,12 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     }
     with pytest.raises(ScientificFailure, match="fallbacks=1"):
         _validate_measured_metrics(unsafe)
+
+
+def test_screening_capacity_detects_zero_kv_after_adaptation_headroom():
+    error = RuntimeError(
+        "SGLang exited during startup with -9: Loaded weights and the 31.735 GiB "
+        "unallocated adaptation headroom leave no GPU memory for the KV cache "
+        "under --mem-fraction-static=0.88"
+    )
+    assert _capacity_infeasible(error)
