@@ -506,6 +506,13 @@ def test_qwen_speculative_workspace_covers_registered_width():
     assert "speculative_num_draft_tokens or 0" not in patch
 
 
+def test_unified_dspark_model_accepts_markovless_dflash_checkpoint():
+    patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
+    assert "+        return None" in patch
+    assert "-        if not dspark_config.require_markov():" in patch
+    assert "-                \"DSpark draft requires markov_rank > 0, \"" in patch
+
+
 def test_sglang_terminal_hook_preserves_abort_identity():
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff")
     lines = patch.read_text().splitlines()

@@ -358,7 +358,18 @@ index a1ca3f1..45f9076 100644
      markov_head_type = "rnn"
  
      def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-@@ -287,7 +284,6 @@ def build_markov_head(config) -> Optional[nn.Module]:
+@@ -263,9 +260,6 @@ def build_markov_head(config) -> Optional[nn.Module]:
+     markov_rank = int(getattr(config, "markov_rank", 0))
+     if markov_rank <= 0:
+-        raise ValueError(
+-            "DSpark requires markov_rank > 0 (the Markov head is the core of the "
+-            f"semi-AR draft); got markov_rank={markov_rank}."
+-        )
++        return None
+     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+     vocab_size = int(config.vocab_size)
+     hidden_size = int(config.hidden_size)
+@@ -287,7 +280,6 @@ def build_markov_head(config) -> Optional[nn.Module]:
  
  
  class DSparkConfidenceHead(nn.Module):
@@ -366,7 +377,7 @@ index a1ca3f1..45f9076 100644
      def __init__(
          self,
          *,
-@@ -361,7 +357,6 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
+@@ -361,15 +353,9 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
  
  
  class DSparkDraftMixin:
@@ -374,7 +385,15 @@ index a1ca3f1..45f9076 100644
      def __init__(self, config, quant_config=None, prefix: str = "") -> None:
          super().__init__(config=config, quant_config=quant_config, prefix=prefix)
          dspark_config = parse_dspark_draft_config(draft_hf_config=config)
-@@ -390,6 +385,13 @@ class DSparkDraftMixin:
+-        if not dspark_config.require_markov():
+-            raise ValueError(
+-                "DSpark draft requires markov_rank > 0, "
+-                f"got markov_rank={dspark_config.markov_rank}."
+-            )
+         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
+         self.markov_head = build_markov_head(config)
+         self.confidence_head = build_confidence_head(config)
+@@ -390,6 +376,13 @@ class DSparkDraftMixin:
      def compute_base_logits(
          self, hidden: torch.Tensor
      ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -388,7 +407,7 @@ index a1ca3f1..45f9076 100644
          if self.lm_head is None:
              raise ValueError(
                  "DSpark dense draft requires the target lm_head "
-@@ -400,7 +402,7 @@ class DSparkDraftMixin:
+@@ -400,7 +393,7 @@ class DSparkDraftMixin:
              hidden = hidden.to(weight.dtype)
          local_logits = torch.matmul(hidden, weight.T)
          base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
@@ -397,7 +416,7 @@ index a1ca3f1..45f9076 100644
  
      def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
          markov_weights = []
-@@ -595,7 +597,6 @@ class DSparkDraftMixin:
+@@ -595,7 +588,6 @@ class DSparkDraftMixin:
  
  
  class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
