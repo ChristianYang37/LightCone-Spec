@@ -10,6 +10,7 @@ from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
     _complete_blocked_profiler,
+    _e2_missing_dependency_jobs,
     _ncu_permission_block_reason,
     _repair_completed_s10_downstream_resume,
     _resume_materialization,
@@ -77,6 +78,36 @@ def test_segment_jobs_resume_without_expanding_paper_stage(tmp_path: Path):
     attempt = state.start(children[0], (0,), tmp_path / "child")
     state.complete(children[0].job_id, attempt)
     assert state.completed_attempt_dir(children[0].job_id) == tmp_path / "child"
+
+
+def test_e2_dependency_identity_survives_candidate_reordering(tmp_path: Path):
+    state = StateStore(tmp_path)
+    first = {
+        "parameterization": "lora",
+        "rank": 1,
+        "scope": "last1",
+        "optimizer": "nag",
+        "learning_rate": 3e-5,
+        "schedule": "constant",
+    }
+    changed = {
+        **first,
+        "optimizer": "adamw",
+        "learning_rate": 1e-3,
+    }
+
+    first_jobs = _e2_missing_dependency_jobs(state, "E2-r2", [first])
+    changed_jobs = _e2_missing_dependency_jobs(state, "E2-r2", [changed])
+    assert len(first_jobs) == len(changed_jobs) == 1
+    assert first_jobs[0].ordinal == changed_jobs[0].ordinal == 0
+    assert first_jobs[0].job_id != changed_jobs[0].job_id
+    assert "nag__lr-3em05" in first_jobs[0].job_id
+    assert "adamw__lr-0p001" in changed_jobs[0].job_id
+
+    state.add_internal_jobs(first_jobs, storage_node="S10-e2-dependency-repair")
+    state.add_internal_jobs(changed_jobs, storage_node="S10-e2-dependency-repair")
+    state.add_internal_jobs(changed_jobs, storage_node="S10-e2-dependency-repair")
+    assert state.status_counts("S10-e2-dependency-repair") == {"pending": 2}
 
 
 def test_plain_config_resume_rejects_different_values(tmp_path: Path):

@@ -4789,10 +4789,26 @@ def _e2_missing_dependency_jobs(
             continue
         if _e2_recipe_key(job.parameters) in existing:
             continue
+        learning_rate = format(float(job.parameters["learning_rate"]), ".12g")
+        learning_rate = learning_rate.replace("+", "").replace("-", "m").replace(".", "p")
+        recipe_identity = "__".join(
+            (
+                f"{job.parameters['parameterization']}-r{job.parameters['rank']}",
+                str(job.parameters["scope"]),
+                str(job.parameters["optimizer"]),
+                f"lr-{learning_rate}",
+                str(job.parameters["schedule"]),
+            )
+        )
         rows.append(
             replace(
                 job,
-                job_id=f"s10-e2-dependency__{job.job_id}",
+                # Ordinals are positions within a selected candidate set and can
+                # legitimately refer to a different recipe after the preceding
+                # round is re-audited.  Keep the internal evidence identity tied
+                # to the scientific recipe so a resumed audit can add the new
+                # dependency without mutating or colliding with the old attempt.
+                job_id=f"s10-e2-dependency-v2__{node}__{recipe_identity}",
                 node="S10-e2-dependency-repair",
                 ordinal=job.ordinal,
                 parameters={
