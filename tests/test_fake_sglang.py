@@ -1593,6 +1593,29 @@ def test_preflight_interference_only_captures_registered_concurrency(tmp_path: P
         "64",
     ]
 
+    c256 = replace(
+        c64,
+        job_id="e5-c256",
+        node="E5-pilot",
+        load="closed_loop_c256",
+        parameters={**c64.parameters, "server_capacity": 256},
+    )
+    command = server_command(
+        config, c256, port=30000, output_dir=tmp_path, adaptation=None
+    )
+    assert command[command.index("--max-running-requests") + 1] == "256"
+    graph_index = command.index("--cuda-graph-bs-decode")
+    assert command[graph_index + 1 : graph_index + 8] == [
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64",
+    ]
+    assert command[graph_index + 8].startswith("--")
+
 
 def test_formal_request_evidence_omits_text_and_token_trajectory(tmp_path: Path):
     result = GenerationResult(

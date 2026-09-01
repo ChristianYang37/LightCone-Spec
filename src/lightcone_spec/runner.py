@@ -288,6 +288,9 @@ def _incomplete_scientific_outcome(
 
     if _screening_incomplete_classification(rows) != "scientific_infeasible":
         return None
+    scientific_node = str(job.parameters.get("source_node", job.node))
+    if scientific_node.startswith("E5") and job.parameters.get("registered_load"):
+        return "infeasible"
     if _screening_job(job):
         return "infeasible"
     if _records_scientific_rejection(job):
@@ -2702,7 +2705,11 @@ def _deployment_width_jobs(state: StateStore) -> tuple[Job, ...]:
 def _select_deployment_widths(state: StateStore) -> dict[str, int]:
     groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for config, metrics in _metric_rows(state, "E3-width-calibration"):
-        if metrics.get("slo_pass") is True:
+        if (
+            metrics.get("slo_pass") is True
+            and metrics.get("feasible") is not False
+            and all(metrics.get(counter, 0) == 0 for counter in SAFETY_COUNTERS)
+        ):
             groups.setdefault((config["method"], int(config["width"])), []).append(metrics)
     selected = {}
     for method in ("static", "tts", "l0_naive", "lightcone"):
@@ -3460,6 +3467,13 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
             config = json.loads(config_path.read_text())
             if config.get("parameters", {}).get("source_node") == node:
                 candidates.append((job_id, directory))
+    # A bundled replacement is represented twice after completion: once by its
+    # parent's ``segments`` array and once by each independently persisted child
+    # attempt.  Reducers operate on logical cells, so collapse those two storage
+    # views by the child's stable job id.  Also collapse repeated references to
+    # the same attempt directory before reading files.
+    candidates = list(dict.fromkeys(candidates))
+    seen_logical_rows: set[str] = set()
     for job_id, directory in candidates:
         if job_id in excluded:
             continue
@@ -3486,7 +3500,8 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
             if isinstance(segments, list):
                 for segment in segments:
                     segment_config = dict(segment["config"])
-                    if str(segment_config.get("job_id")) in excluded:
+                    logical_job_id = str(segment_config.get("job_id"))
+                    if logical_job_id in excluded or logical_job_id in seen_logical_rows:
                         continue
                     segment_metrics = dict(segment["metrics"])
                     segment_config, segment_metrics = normalize_attempt_semantics(
@@ -3497,9 +3512,14 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
                     segment_metrics["source_attempt"] = metrics["source_attempt"]
                     segment_metrics["source_attempt_dir"] = segment["attempt_dir"]
                     rows.append((segment_config, segment_metrics))
+                    seen_logical_rows.add(logical_job_id)
             else:
+                logical_job_id = str(config.get("job_id", job_id))
+                if logical_job_id in seen_logical_rows:
+                    continue
                 config, metrics = normalize_attempt_semantics(config, metrics, directory)
                 rows.append((config, metrics))
+                seen_logical_rows.add(logical_job_id)
     return rows
 
 
@@ -5638,6 +5658,60 @@ def _repair_e0_e6_partial_resume_v1(state: StateStore) -> None:
     )
 
 
+def _repair_metric_dedup_e5_resume_v1(state: StateStore) -> None:
+    """Reopen only evidence affected by metric duplication and E5 load semantics."""
+
+    previous = state.selection("formal_metric_dedup_e5_resume_version", None)
+    if isinstance(previous, dict) and int(previous.get("version", 0)) >= 1:
+        return
+
+    deleted = state.delete_selections(
+        (
+            "E1a_failed",
+            "E5-pilot_failed",
+            "E5-final_failed",
+            "dspark_confidence_weight",
+            "dspark_confidence_temperature",
+            "dspark_recipe",
+            "e1a_finalists",
+        )
+    )
+    e1a_reopened = state.reopen_skipped_errors(
+        ("E1a",),
+        "DSpark confidence calibration is incomplete",
+        reason="logical metric-row deduplication repair",
+    )
+    e5_dependency_reopened = state.reopen_skipped_errors(
+        ("E5-pilot", "E5-final"),
+        "DSpark confidence calibration was scientifically infeasible",
+        reason="DSpark calibration reducer repair",
+    )
+    e5_retried = sum(
+        state.retry_failed_errors(
+            node,
+            "requests did not complete in a measured cell",
+            reason="registered-load incomplete outcome classification repair",
+        )
+        for node in ("E5-pilot-segments", "E5-final-segments")
+    )
+    audit = {
+        "version": 1,
+        "invalidated_selections_deleted": deleted,
+        "e1a_jobs_reopened": e1a_reopened,
+        "e5_dependency_jobs_reopened": e5_dependency_reopened,
+        "e5_registered_load_cells_retried": e5_retried,
+    }
+    audit_path = (
+        state.run_dir
+        / "stages"
+        / "metric-dedup-e5-repair"
+        / "resume-v1.json"
+    )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(audit_path, audit)
+    state.set_selection("formal_metric_dedup_e5_resume_version", audit)
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -5677,6 +5751,7 @@ class PaperRunner:
                     self.stop_event,
                 )
                 _repair_e0_e6_partial_resume_v1(self.state)
+                _repair_metric_dedup_e5_resume_v1(self.state)
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)

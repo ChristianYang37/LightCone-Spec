@@ -18,6 +18,7 @@ from lightcone_spec.runner import (
     _ncu_permission_block_reason,
     _repair_completed_s10_downstream_resume,
     _repair_e0_e6_partial_resume_v1,
+    _repair_metric_dedup_e5_resume_v1,
     _resume_materialization,
     _save_or_validate_run_config,
     _segment_jobs,
@@ -417,6 +418,50 @@ def test_e0_e6_partial_resume_is_scoped_and_idempotent(tmp_path: Path):
     assert audit == {"version": 1, "e0_retried": 1, "e6_retried": 2, "reopened": 7}
     _repair_e0_e6_partial_resume_v1(state)
     assert state.selection("formal_e0_e6_partial_resume_version") == audit
+
+
+def test_metric_dedup_e5_resume_reopens_only_diagnosed_rows(tmp_path: Path):
+    state = StateStore(tmp_path)
+    e1a = Job("e1a-bug", "E1a", 0, "static", "m", "DFLASH", "t")
+    e1a_science = replace(e1a, job_id="e1a-science", ordinal=1)
+    e5 = Job("e5-bug", "E5-pilot", 0, "static", "m", "DSPARK", "t")
+    e5_segment = replace(e5, job_id="e5-segment", node="E5-pilot-segments")
+    state.add_jobs("E1a", (e1a, e1a_science))
+    state.skip_pending("E1a", "DSpark confidence calibration is incomplete")
+    state.add_jobs("E5-pilot", (e5,))
+    state.skip_pending(
+        "E5-pilot", "DSpark confidence calibration was scientifically infeasible"
+    )
+    state.add_internal_jobs((e5_segment,), storage_node="E5-pilot-segments")
+    attempt = state.start(e5_segment, (0, 1), tmp_path / "e5-attempt")
+    state.fail(
+        e5_segment.job_id,
+        attempt,
+        "RuntimeError: 8 requests did not complete in a measured cell",
+        retry=False,
+    )
+    # One unrelated skip must remain untouched by the exact migration.
+    with state.connect() as connection:
+        connection.execute(
+            "UPDATE jobs SET error='independent scientific rejection' WHERE job_id=?",
+            (e1a_science.job_id,),
+        )
+    for name in ("E1a_failed", "dspark_confidence_weight", "e1a_finalists"):
+        state.set_selection(name, True)
+
+    _repair_metric_dedup_e5_resume_v1(state)
+
+    assert state.pending_jobs("E1a") == (e1a,)
+    assert state.status_counts("E1a") == {"pending": 1, "skipped": 1}
+    assert state.status_counts("E5-pilot") == {"pending": 1}
+    assert state.status_counts("E5-pilot-segments") == {"pending": 1}
+    assert state.selection("E1a_failed", None) is None
+    audit = state.selection("formal_metric_dedup_e5_resume_version")
+    assert audit["e1a_jobs_reopened"] == 1
+    assert audit["e5_dependency_jobs_reopened"] == 1
+    assert audit["e5_registered_load_cells_retried"] == 1
+    _repair_metric_dedup_e5_resume_v1(state)
+    assert state.selection("formal_metric_dedup_e5_resume_version") == audit
 
 
 def test_e0_source_transfer_upgrade_is_idempotent_and_preserves_old_evidence(

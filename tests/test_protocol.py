@@ -503,6 +503,16 @@ def test_screening_outcome_classification_separates_runtime_and_capacity():
     )
     ordinary = replace(candidate, job_id="ordinary", method="static")
     assert _incomplete_scientific_outcome(ordinary, [{"status": "timed_out"}]) is None
+    e5 = replace(
+        ordinary,
+        job_id="e5-serving",
+        node="E5-pilot",
+        parameters={"registered_load": "closed_loop_c256"},
+    )
+    assert _incomplete_scientific_outcome(e5, [{"status": "unfinished"}]) == (
+        "infeasible"
+    )
+    assert _incomplete_scientific_outcome(e5, [{"status": "error"}]) is None
 
 
 def test_cosine_schedule_endpoint_and_registered_overrun():

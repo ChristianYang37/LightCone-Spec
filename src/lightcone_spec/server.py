@@ -235,8 +235,13 @@ def server_command(
     if job.parameters.get("graph_replay", True) is False:
         argv.append("--disable-cuda-graph")
     else:
+        # FlashInfer's decode workspace in the pinned SGLang runtime cannot
+        # capture the 128/256-request graphs at the formal 40K context.  Keep
+        # the registered server capacity unchanged so those loads still run;
+        # requests above 64 use SGLang's eager fallback instead of failing the
+        # entire server during graph capture.
         graph_sizes = tuple(
-            size for size in (1, 2, 4, 8, 16, 32, 64, 128, 256) if size <= max_running
+            size for size in (1, 2, 4, 8, 16, 32, 64) if size <= max_running
         )
         argv.extend(
             [

@@ -282,6 +282,77 @@ def test_formal_replacement_excludes_old_attempt_without_overwriting_it(tmp_path
     assert json.loads((old_dir / "metrics.json").read_text()) == {"goodput": 1.0}
 
 
+def test_metric_rows_deduplicates_bundled_parent_and_child_storage(tmp_path):
+    state = StateStore(tmp_path)
+    source = materialize("E1a")[0]
+    parent = replace(
+        source,
+        job_id="bugfix-parent",
+        node="bugfix-reconciliation-v1",
+        parameters={
+            **source.parameters,
+            "source_node": "E1a",
+            "replaces_job_id": source.job_id,
+            "segments": [{"confidence_threshold": 0.0}],
+        },
+    )
+    child = runner._segment_jobs(parent)[0]
+    state.add_internal_jobs((parent,), storage_node="bugfix-reconciliation-v1")
+    state.add_internal_jobs((child,), storage_node="bugfix-reconciliation-v1-segments")
+
+    child_dir = tmp_path / "child" / "attempt-01"
+    child_dir.mkdir(parents=True)
+    child_attempt = state.start(child, (0,), child_dir)
+    (child_dir / "config.json").write_text(json.dumps(child.to_dict()))
+    (child_dir / "metrics.json").write_text(json.dumps({"goodput": 2.0}))
+    state.complete(child.job_id, child_attempt)
+
+    parent_dir = tmp_path / "parent" / "attempt-01"
+    parent_dir.mkdir(parents=True)
+    parent_attempt = state.start(parent, (0,), parent_dir)
+    (parent_dir / "config.json").write_text(json.dumps(parent.to_dict()))
+    (parent_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "config": child.to_dict(),
+                        "metrics": {"goodput": 2.0},
+                        "attempt_dir": str(child_dir),
+                    }
+                ]
+            }
+        )
+    )
+    state.complete(parent.job_id, parent_attempt)
+
+    rows = runner._metric_rows(state, "E1a")
+    assert len(rows) == 1
+    assert rows[0][0]["job_id"] == child.job_id
+    assert rows[0][1]["goodput"] == 2.0
+
+
+def test_deployment_width_selector_rejects_infeasible_slo_rows(monkeypatch):
+    rows = []
+    for method in ("static", "tts", "l0_naive", "lightcone"):
+        for _ in range(3):
+            rows.append(
+                (
+                    {"method": method, "width": 4},
+                    {
+                        "slo_pass": True,
+                        "feasible": method != "tts",
+                        "goodput": 1.0,
+                        "peak_hbm_bytes": 1,
+                        **{counter: 0 for counter in SAFETY_COUNTERS},
+                    },
+                )
+            )
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+    with pytest.raises(runner.ScientificFailure, match="failed for tts"):
+        runner._select_deployment_widths(object())
+
+
 def test_e2_ranking_uses_static_goodput_and_tts_native_user_speed(monkeypatch):
     rows = [
         ({"method": "static", "parameters": {}}, {"goodput": 100.0}),

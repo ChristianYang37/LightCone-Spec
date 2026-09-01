@@ -322,6 +322,49 @@ class StateStore:
             )
             return changed
 
+    def reopen_skipped_errors(
+        self,
+        nodes: tuple[str, ...],
+        fragment: str,
+        *,
+        reason: str,
+    ) -> int:
+        """Resume only skipped jobs attributable to one diagnosed error class."""
+
+        if not nodes:
+            return 0
+        if not fragment:
+            raise ValueError("skipped error fragment must be nonempty")
+        placeholders = ",".join("?" for _ in nodes)
+        with self.connect() as connection:
+            changed = connection.execute(
+                f"UPDATE jobs SET status='pending', completed_at=NULL, "
+                f"assigned_gpus=NULL, started_at=NULL, error=? "
+                f"WHERE node IN ({placeholders}) AND status='skipped' "
+                "AND instr(error, ?) > 0",
+                (reason, *nodes, fragment),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    f"UPDATE stage_state SET status='pending', "
+                    f"updated_at=CURRENT_TIMESTAMP WHERE node IN ({placeholders})",
+                    nodes,
+                )
+            return int(changed)
+
+    def delete_selections(self, names: tuple[str, ...]) -> int:
+        """Delete derived selections invalidated by a diagnosed reducer bug."""
+
+        if not names:
+            return 0
+        placeholders = ",".join("?" for _ in names)
+        with self.connect() as connection:
+            return int(
+                connection.execute(
+                    f"DELETE FROM selections WHERE name IN ({placeholders})", names
+                ).rowcount
+            )
+
     def finish_stage(self, node: str) -> str:
         counts = self.status_counts(node)
         status = (
