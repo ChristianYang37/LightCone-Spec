@@ -11,11 +11,14 @@ from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
     _complete_blocked_profiler,
     _e2_missing_dependency_jobs,
+    _exclude_redundant_e2_dependency_jobs,
     _ncu_permission_block_reason,
     _repair_completed_s10_downstream_resume,
     _resume_materialization,
     _save_or_validate_run_config,
     _segment_jobs,
+    _set_e2_expected_evidence,
+    _skip_satisfied_e2_dependency_jobs,
 )
 from lightcone_spec.state import StateStore
 
@@ -108,6 +111,65 @@ def test_e2_dependency_identity_survives_candidate_reordering(tmp_path: Path):
     state.add_internal_jobs(changed_jobs, storage_node="S10-e2-dependency-repair")
     state.add_internal_jobs(changed_jobs, storage_node="S10-e2-dependency-repair")
     assert state.status_counts("S10-e2-dependency-repair") == {"pending": 2}
+
+
+def test_e2_dependency_reuses_equivalent_completed_evidence(tmp_path: Path):
+    state = StateStore(tmp_path)
+    selection = {
+        "parameterization": "lora",
+        "rank": 8,
+        "scope": "last1",
+        "optimizer": "adamw",
+        "learning_rate": 1e-3,
+        "schedule": "constant",
+        "registered_request_count": 16,
+        "stride": 10,
+    }
+    source = materialize("E2-r1", e2_rows=[selection])[0]
+    completed = replace(
+        source,
+        job_id="legacy-dependency",
+        node="S10-e2-dependency-repair",
+        parameters={
+            **source.parameters,
+            "source_node": "E2-r1",
+            "reconciliation_kind": "e2_dependency_closure",
+        },
+    )
+    pending = replace(completed, job_id="recipe-identity-dependency")
+    duplicate = replace(
+        completed,
+        job_id=(
+            "s10-e2-dependency-v2__E2-r1__"
+            "lora-r8__last1__adamw__lr-0p001__constant"
+        ),
+    )
+    state.add_internal_jobs(
+        (completed, pending, duplicate),
+        storage_node="S10-e2-dependency-repair",
+    )
+    attempt_dir = tmp_path / "legacy" / "attempt-01"
+    attempt_dir.mkdir(parents=True)
+    (attempt_dir / "config.json").write_text(json.dumps(completed.to_dict()))
+    (attempt_dir / "metrics.json").write_text(json.dumps({"finite": True}))
+    attempt = state.start(completed, (0,), attempt_dir)
+    state.complete(completed.job_id, attempt)
+    duplicate_dir = tmp_path / "duplicate" / "attempt-01"
+    duplicate_dir.mkdir(parents=True)
+    (duplicate_dir / "config.json").write_text(json.dumps(duplicate.to_dict()))
+    (duplicate_dir / "metrics.json").write_text(json.dumps({"finite": True}))
+    duplicate_attempt = state.start(duplicate, (1,), duplicate_dir)
+    state.complete(duplicate.job_id, duplicate_attempt)
+
+    assert _set_e2_expected_evidence(state, "E2-r1", [selection]) == 0
+    assert _exclude_redundant_e2_dependency_jobs(state, "E2-r1") == 1
+    assert _skip_satisfied_e2_dependency_jobs(state, "E2-r1") == 1
+    assert state.status_counts("S10-e2-dependency-repair") == {
+        "completed": 2,
+        "skipped": 1,
+    }
+    assert completed.job_id not in state.selection("formal_evidence_exclusions", [])
+    assert duplicate.job_id in state.selection("formal_evidence_exclusions", [])
 
 
 def test_plain_config_resume_rejects_different_values(tmp_path: Path):

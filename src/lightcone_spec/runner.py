@@ -3834,23 +3834,22 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
     return [row[-1] for row in ordered[:keep]]
 
 
-_E2_RUNTIME_PARAMETER_KEYS = {
-    "declared_concurrency",
-    "dispatcher_concurrency",
-    "effective_load",
-    "metric_semantics",
-    "registered_load",
-    "stimulus_id",
-    "stride",
-}
+_E2_RECIPE_PARAMETER_KEYS = (
+    "parameterization",
+    "rank",
+    "scope",
+    "optimizer",
+    "learning_rate",
+    "schedule",
+)
 
 
 def _e2_recipe_key(recipe: dict[str, Any]) -> str:
     return json.dumps(
         {
-            key: value
-            for key, value in recipe.items()
-            if key not in _E2_RUNTIME_PARAMETER_KEYS
+            key: recipe[key]
+            for key in _E2_RECIPE_PARAMETER_KEYS
+            if key in recipe
         },
         sort_keys=True,
     )
@@ -4821,6 +4820,52 @@ def _e2_missing_dependency_jobs(
     return tuple(rows)
 
 
+def _skip_satisfied_e2_dependency_jobs(state: StateStore, node: str) -> int:
+    """Retire pending closure work already backed by equivalent valid evidence."""
+
+    existing = {
+        _e2_recipe_key(config["parameters"])
+        for config, _ in _metric_rows(state, node)
+        if config["method"] == "lightcone_candidate"
+    }
+    skipped = 0
+    for job in state.pending_jobs("S10-e2-dependency-repair"):
+        if job.parameters.get("source_node") != node:
+            continue
+        if _e2_recipe_key(job.parameters) not in existing:
+            continue
+        state.skip_job(job.job_id, "dependency satisfied by equivalent completed evidence")
+        skipped += 1
+    return skipped
+
+
+def _exclude_redundant_e2_dependency_jobs(state: StateStore, node: str) -> int:
+    """Exclude v2 closure reruns when older equivalent evidence already exists."""
+
+    canonical: set[str] = set()
+    versioned: list[tuple[str, str]] = []
+    for job_id, directory in state.completed_attempt_rows():
+        config_path = directory / "config.json"
+        if not config_path.is_file():
+            continue
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        parameters = dict(config.get("parameters", {}))
+        if parameters.get("source_node", config.get("node")) != node:
+            continue
+        if config.get("method") != "lightcone_candidate":
+            continue
+        recipe_key = _e2_recipe_key(parameters)
+        if job_id.startswith("s10-e2-dependency-v2__"):
+            versioned.append((job_id, recipe_key))
+        else:
+            canonical.add(recipe_key)
+    redundant = {job_id for job_id, recipe_key in versioned if recipe_key in canonical}
+    exclusions = set(state.selection("formal_evidence_exclusions", []))
+    exclusions.update(redundant)
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    return len(redundant)
+
+
 def _bugfix_replacement(source: Job, *, ordinal: int, reason: str) -> Job:
     return replace(
         source,
@@ -4938,8 +4983,12 @@ def _audit_e2_after_s10(
     for round_index in range(4):
         node = f"E2-r{round_index}"
         obsolete = 0
+        redundant_dependencies = 0
+        satisfied_dependencies = 0
         if round_index > 0:
             obsolete = _set_e2_expected_evidence(state, node, previous)
+            redundant_dependencies = _exclude_redundant_e2_dependency_jobs(state, node)
+            satisfied_dependencies = _skip_satisfied_e2_dependency_jobs(state, node)
             missing = _e2_missing_dependency_jobs(state, node, previous)
             if missing:
                 state.add_internal_jobs(missing, storage_node="S10-e2-dependency-repair")
@@ -4993,6 +5042,8 @@ def _audit_e2_after_s10(
                 "corrected_finalists": len(winners),
                 "same_scientific_set": same_set,
                 "dependency_jobs_added": len(missing) if round_index > 0 else 0,
+                "redundant_dependency_jobs_excluded": redundant_dependencies,
+                "satisfied_dependency_jobs_skipped": satisfied_dependencies,
                 "obsolete_evidence_excluded": obsolete,
             }
         )
