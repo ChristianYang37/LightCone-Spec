@@ -15,6 +15,7 @@ from lightcone_spec.runner import (
     _exclude_redundant_e2_dependency_jobs,
     _ncu_permission_block_reason,
     _repair_completed_s10_downstream_resume,
+    _repair_e0_e6_partial_resume_v1,
     _resume_materialization,
     _save_or_validate_run_config,
     _segment_jobs,
@@ -332,6 +333,57 @@ def test_reopened_stage_preserves_completed_rows_but_checks_pending_rows(
     assert resumed[1] == changed_pending
     with pytest.raises(RuntimeError, match="row 1 changed after materialization"):
         state.add_jobs("E1a", resumed)
+
+
+def test_e0_e6_partial_resume_is_scoped_and_idempotent(tmp_path: Path):
+    state = StateStore(tmp_path)
+    e0 = Job("e0-unsupported", "E0-tune", 0, "static", "m", "DFLASH", "t")
+    e0_sibling = Job("e0-sibling", "E0-tune", 1, "static", "m", "DFLASH", "t")
+    state.add_jobs("E0-tune", (e0, e0_sibling))
+    attempt = state.start(e0, (0, 1), tmp_path / "e0-attempt")
+    state.fail(
+        e0.job_id,
+        attempt,
+        "RuntimeError: specialized variants fail closed",
+        retry=False,
+    )
+    state.skip_job(e0_sibling.job_id, "stopped after sibling failure")
+    e6_rows = tuple(
+        Job(
+            f"e6-{index}",
+            "E6-common-load-segments",
+            index,
+            "target_only",
+            "m",
+            "NONE",
+            "t",
+        )
+        for index in range(2)
+    )
+    state.add_internal_jobs(e6_rows, storage_node="E6-common-load-segments")
+    for index, job in enumerate(e6_rows):
+        attempt = state.start(job, (0, 1), tmp_path / f"e6-attempt-{index}")
+        state.fail(
+            job.job_id,
+            attempt,
+            "ValueError: dataset supplied 175 prompts; 256 required",
+            retry=False,
+        )
+    downstream = ("E5-pilot", "E5-final", "E6-pilot", "E6-final", "E0-pilot", "E0-final")
+    for index, node in enumerate(downstream):
+        job = Job(f"downstream-{index}", node, 0, "static", "m", "DFLASH", "t")
+        state.add_jobs(node, (job,))
+        state.skip_pending(node, "old dependency failure")
+
+    _repair_e0_e6_partial_resume_v1(state)
+
+    assert state.status_counts("E0-tune") == {"pending": 2}
+    assert state.status_counts("E6-common-load-segments") == {"pending": 2}
+    assert all(state.status_counts(node) == {"pending": 1} for node in downstream)
+    audit = state.selection("formal_e0_e6_partial_resume_version")
+    assert audit == {"version": 1, "e0_retried": 1, "e6_retried": 2, "reopened": 7}
+    _repair_e0_e6_partial_resume_v1(state)
+    assert state.selection("formal_e0_e6_partial_resume_version") == audit
 
 
 def test_e0_source_transfer_upgrade_is_idempotent_and_preserves_old_evidence(

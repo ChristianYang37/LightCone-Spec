@@ -361,6 +361,36 @@ def test_final_stage_requires_completed_pilot():
     assert runner._dependency_reason(None, State(), "E5-final") == "E5-pilot did not complete"
 
 
+def test_e5_pilot_can_run_without_dspark_recipe():
+    class State:
+        def stage_status(self, node):
+            return "completed" if node == "preflight" else None
+
+        def selection(self, name, default=None):
+            return {"lightcone_recipe": {"rank": 8}}.get(name, default)
+
+    assert runner._dependency_reason(None, State(), "E5-pilot") is None
+
+
+def test_explicit_adaptive_support_boundary_is_compatibility_infeasible(tmp_path):
+    log = tmp_path / "server.log"
+    log.write_text(
+        "ValueError: DFlash updates currently require the base DFlashDraftModel; "
+        "specialized variants fail closed\n"
+    )
+    assert runner._adaptive_probe_incompatible(RuntimeError("startup failed"), log)
+    assert not runner._adaptive_probe_incompatible(ConnectionError("connection refused"))
+
+
+def test_only_serving_load_protocols_allow_transparent_prompt_replay():
+    e5 = materialize("E5-pilot")[0]
+    e6 = runner._e6_load_jobs()[0]
+    ordinary = materialize("E3a")[0]
+    assert runner._allow_prompt_repeat(e5)
+    assert runner._allow_prompt_repeat(e6)
+    assert not runner._allow_prompt_repeat(ordinary)
+
+
 def test_safety_metrics_reject_numerical_failures():
     metrics = {
         "committed_tokens": 100,

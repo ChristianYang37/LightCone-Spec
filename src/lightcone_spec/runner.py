@@ -252,6 +252,24 @@ def _capacity_infeasible(
     )
 
 
+def _adaptive_probe_incompatible(
+    error: Exception,
+    server_log: Path | None = None,
+    offset: int = 0,
+) -> bool:
+    """Recognize an explicit backend/model adaptation support boundary."""
+
+    message = str(error)
+    if server_log is not None and server_log.exists():
+        with server_log.open("rb") as stream:
+            stream.seek(offset)
+            message += stream.read().decode("utf-8", errors="replace")
+    return (
+        "specialized variants fail closed" in message
+        or "updates currently require the base DFlashDraftModel" in message
+    )
+
+
 def _screening_incomplete_classification(rows: Sequence[dict[str, Any]]) -> str:
     statuses = {str(row.get("status")) for row in rows}
     if "cancelled" in statuses:
@@ -570,6 +588,13 @@ def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int
     return max(config.server.requests_per_cell, concurrency)
 
 
+def _allow_prompt_repeat(job: Job) -> bool:
+    return (
+        job.node.startswith("E5")
+        or job.parameters.get("workload") == "excluded_e6_common_load_probe"
+    )
+
+
 def _cell_concurrency(job: Job) -> int:
     load = job.load or ""
     if load.startswith("closed_loop_c"):
@@ -625,7 +650,7 @@ def _cell_inputs(
             config.dataset_path(dataset_key),
             limit=count,
             selection_seed=_prompt_offset(job, count),
-            allow_repeat=job.node.startswith("E5"),
+            allow_repeat=_allow_prompt_repeat(job),
         )
         prompts = tuple(str(row["prompt"]) for row in records)
         metadata["examples"] = records
@@ -1860,6 +1885,33 @@ def _execute_cell(
             )
             return
         except Exception as error:
+            if job.parameters.get("probe") and _adaptive_probe_incompatible(
+                error,
+                session_files["server.log"],
+                session_offsets["server.log"],
+            ):
+                _write_json(
+                    output_dir / "metrics.json",
+                    {
+                        "scientific_outcome": "infeasible",
+                        "feasible": False,
+                        "compatible": False,
+                        "static_interface_passed": True,
+                        "adaptive_interface_passed": False,
+                        "error": f"{type(error).__name__}: {error}",
+                        "request_outcomes": {
+                            "offered": offered,
+                            "admitted": 0,
+                            "completed": 0,
+                            "error": 0,
+                            "timed_out": 0,
+                            "cancelled": 0,
+                            "unfinished": offered,
+                        },
+                    },
+                )
+                state.complete(job.job_id, attempt)
+                return
             if _screening_job(job) and _capacity_infeasible(
                 error,
                 session_files["server.log"],
@@ -3155,6 +3207,14 @@ def _run_node_jobs(
     stop_event: threading.Event,
 ) -> None:
     pending = state.pending_jobs(node)
+    if node.startswith("E5") and state.selection("dspark_recipe", None) is None:
+        for job in pending:
+            if job.backend == "DSPARK" and job.method == "lightcone":
+                state.skip_job(
+                    job.job_id,
+                    "DSpark confidence calibration was scientifically infeasible",
+                )
+        pending = state.pending_jobs(node)
     if (
         node == "preflight"
         and len(_gpu_pairs(config)) > 1
@@ -4855,7 +4915,7 @@ def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -
         "E4-profile": ("lightcone_recipe",),
         "E3b-pilot": ("e3a", "lightcone_recipe"),
         "E1a": ("lightcone_recipe",),
-        "E5-pilot": ("lightcone_recipe", "dspark_recipe"),
+        "E5-pilot": ("lightcone_recipe",),
         "E6-pilot": ("e3a", "lightcone_recipe"),
         "E0-tune": ("lightcone_recipe",),
         "E0-pilot": ("e3a", "valid_e0", "e0_recipes"),
@@ -5522,6 +5582,63 @@ def _run_bugfix_reconciliation_v1(
     state.set_selection("formal_bugfix_reconciliation_version", 1)
 
 
+def _repair_e0_e6_partial_resume_v1(state: StateStore) -> None:
+    """Resume nodes affected by compatibility and finite-load classification bugs."""
+
+    previous = state.selection("formal_e0_e6_partial_resume_version", None)
+    if isinstance(previous, dict) and int(previous.get("version", 0)) >= 1:
+        return
+    with state.connect() as connection:
+        e0 = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM jobs WHERE node='E0-tune' AND status='failed' "
+                "AND instr(error, 'specialized variants fail closed') > 0"
+            ).fetchone()[0]
+        )
+        e6 = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM jobs WHERE node='E6-common-load-segments' "
+                "AND status='failed' AND instr(error, 'supplied 175 prompts; 256 required') > 0"
+            ).fetchone()[0]
+        )
+    if not e0 and not e6:
+        return
+    if (e0, e6) != (1, 2):
+        raise RuntimeError(
+            f"partial resume expected one E0 and two E6 affected rows, found {(e0, e6)}"
+        )
+    retried_e0 = state.retry_failed_errors(
+        "E0-tune",
+        "specialized variants fail closed",
+        reason="compatibility probe outcome classification repair",
+    )
+    retried_e6 = state.retry_failed_errors(
+        "E6-common-load-segments",
+        "supplied 175 prompts; 256 required",
+        reason="finite serving-load prompt replay repair",
+    )
+    reopened = state.reopen_skipped(
+        (
+            "E0-tune",
+            "E5-pilot",
+            "E5-final",
+            "E6-pilot",
+            "E6-final",
+            "E0-pilot",
+            "E0-final",
+        )
+    )
+    state.set_selection(
+        "formal_e0_e6_partial_resume_version",
+        {
+            "version": 1,
+            "e0_retried": retried_e0,
+            "e6_retried": retried_e6,
+            "reopened": reopened,
+        },
+    )
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -5560,6 +5677,7 @@ class PaperRunner:
                     self.state,
                     self.stop_event,
                 )
+                _repair_e0_e6_partial_resume_v1(self.state)
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)
