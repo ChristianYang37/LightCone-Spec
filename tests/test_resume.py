@@ -304,6 +304,36 @@ def test_pending_stage_resume_uses_current_materialization(tmp_path: Path):
     assert _resume_materialization(state, "E2-r2", (changed,)) == (changed,)
 
 
+def test_reopened_stage_preserves_completed_rows_but_checks_pending_rows(
+    tmp_path: Path,
+):
+    state = StateStore(tmp_path)
+    completed, pending = materialize("E1a")[116:118]
+    state.add_jobs("E1a", (completed, pending))
+    attempt = state.start(completed, (0,), tmp_path / "completed-attempt")
+    state.complete(completed.job_id, attempt)
+
+    changed_completed = replace(
+        completed,
+        parameters={**completed.parameters, "generation_tokens": 16_384},
+    )
+    changed_pending = replace(
+        pending,
+        parameters={**pending.parameters, "generation_tokens": 16_384},
+    )
+    resumed = _resume_materialization(
+        state,
+        "E1a",
+        (changed_completed, changed_pending),
+    )
+
+    assert resumed[0].job_id == completed.job_id
+    assert resumed[0].parameters["generation_tokens"] == 8192
+    assert resumed[1] == changed_pending
+    with pytest.raises(RuntimeError, match="row 1 changed after materialization"):
+        state.add_jobs("E1a", resumed)
+
+
 def test_e0_source_transfer_upgrade_is_idempotent_and_preserves_old_evidence(
     tmp_path: Path,
 ):

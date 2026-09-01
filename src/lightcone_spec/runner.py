@@ -96,18 +96,38 @@ CANDIDATE_METHODS = {
 def _resume_materialization(
     state: StateStore, node: str, planned: tuple[Job, ...]
 ) -> tuple[Job, ...]:
-    """Keep a completed stage's immutable rows when selections later change.
+    """Keep immutable completed rows when selections or repairs later change.
 
     Selection audits can add narrowly scoped dependency-repair jobs without
-    authorizing a completed paper stage to be rematerialized.  Reducers still
-    need to run on resume, so return the stored rows instead of skipping the
-    stage entirely.  Pending or reopened stages continue to use the current
-    protocol materialization.
+    authorizing existing paper evidence to be rematerialized.  A stage can be
+    reopened after some rows completed, so preserve only those completed rows
+    while still requiring pending rows to match the current protocol.  This
+    keeps the StateStore immutability gate effective for genuine pending-row
+    drift.
     """
     existing = state.jobs(node)
     if existing and state.stage_status(node) == "completed":
         return existing
-    return planned
+    if not existing:
+        return planned
+    with state.connect() as connection:
+        statuses = {
+            str(row["job_id"]): str(row["status"])
+            for row in connection.execute(
+                "SELECT job_id,status FROM jobs WHERE node=?", (node,)
+            ).fetchall()
+        }
+    resumed = list(planned)
+    for index, stored in enumerate(existing):
+        if index >= len(resumed):
+            break
+        candidate = resumed[index]
+        if (
+            stored.job_id == candidate.job_id
+            and statuses.get(stored.job_id) == "completed"
+        ):
+            resumed[index] = stored
+    return tuple(resumed)
 
 
 def _upgrade_legacy_e0_materialization(
