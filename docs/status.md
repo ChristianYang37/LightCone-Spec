@@ -14,7 +14,7 @@ Empirical status: **PAPER-V2 RUN PAUSED FOR FORMAL S=10 RECONCILIATION**.
 - `paper-v2` keeps the 21-node order and now has 1,960 static jobs by running compatible conditions as measured segments on one
   resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
   evidence uses six.
-- The next SGLang semantic marker is `paper-v1-nextn-shadow-v18`; cohort telemetry
+- The next SGLang semantic marker is `paper-v1-nextn-shadow-v19`; cohort telemetry
   is sized for a complete measured cell rather than one request.
 - Full TTS remains faithful request-reset `c1`. E3b uses matched `c1` for every
   method; E5 uses TTS-LoRA-Batched, not Full TTS, for concurrency sweeps.
