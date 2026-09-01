@@ -1,4 +1,5 @@
 import json
+import signal
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ import yaml
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import E0_ONLINESPEC_RECIPES, Job, materialize
 from lightcone_spec.runner import (
+    _cleanup_interrupted_servers,
     _complete_blocked_profiler,
     _e2_keep_count,
     _e2_missing_dependency_jobs,
@@ -57,6 +59,37 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     attempt = state.start(first, (0, 1), tmp_path / "attempt-3")
     state.complete(first.job_id, attempt)
     assert state.status_counts("preflight") == {"completed": 1, "pending": 2}
+
+
+def test_interrupted_server_cleanup_reads_proc_without_spawning_ps(
+    monkeypatch, tmp_path: Path
+):
+    run_dir = tmp_path / "run"
+    proc_root = tmp_path / "proc"
+    active = run_dir / "jobs" / "job-a" / "attempt-01"
+    unrelated = run_dir / "jobs" / "job-b" / "attempt-01"
+    stopped = run_dir / "sessions" / "session-c"
+    for path, pid in ((active, 101), (unrelated, 102), (stopped, 103)):
+        path.mkdir(parents=True)
+        (path / "server.pid").write_text(str(pid), encoding="utf-8")
+        (proc_root / str(pid)).mkdir(parents=True)
+    (proc_root / "101" / "cmdline").write_bytes(
+        b"python\0-m\0sglang.launch_server\0"
+    )
+    (proc_root / "102" / "cmdline").write_bytes(b"python\0worker.py\0")
+    (proc_root / "103" / "cmdline").write_bytes(
+        b"python\0-m\0sglang.launch_server\0"
+    )
+    (stopped / "server.stopped").touch()
+    killed = []
+    monkeypatch.setattr(
+        "lightcone_spec.runner.os.killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    _cleanup_interrupted_servers(run_dir, proc_root=proc_root)
+
+    assert killed == [(101, signal.SIGTERM)]
 
 
 def test_e2_halving_floor_never_invents_infeasible_finalists():

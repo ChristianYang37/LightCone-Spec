@@ -4794,7 +4794,9 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         )
 
 
-def _cleanup_interrupted_servers(run_dir: Path) -> None:
+def _cleanup_interrupted_servers(
+    run_dir: Path, *, proc_root: Path = Path("/proc")
+) -> None:
     pid_paths = list(run_dir.glob("jobs/*/attempt-*/server.pid"))
     pid_paths.extend(run_dir.glob("sessions/**/server.pid"))
     for pid_path in pid_paths:
@@ -4802,13 +4804,10 @@ def _cleanup_interrupted_servers(run_dir: Path) -> None:
             continue
         try:
             pid = int(pid_path.read_text(encoding="utf-8").strip())
-            command = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "command="],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout
-            if "sglang.launch_server" in command:
+            command = (proc_root / str(pid) / "cmdline").read_bytes().replace(
+                b"\0", b" "
+            )
+            if b"sglang.launch_server" in command:
                 os.killpg(pid, signal.SIGTERM)
         except (OSError, ValueError):
             continue
