@@ -2942,6 +2942,35 @@ def _select_deployment_widths(state: StateStore) -> dict[str, int]:
     return {method: selected for method in methods}
 
 
+def _seed_e3a_static_deployment_width(state: StateStore, selected_width: int) -> None:
+    """Seed the legacy Static width without overwriting a frozen common width."""
+
+    if state.selection("deployment_widths_tuned", None) is None:
+        state.set_selection("deployment_widths", {"static": selected_width})
+
+
+def _restore_soft_gate_width_selection(
+    state: StateStore,
+    audit: dict[str, Any],
+) -> None:
+    """Keep the live selection consistent with the immutable v1 audit."""
+
+    methods = {"static", "tts", "l0_naive", "lightcone"}
+    widths = audit.get("deployment_widths")
+    common = audit.get("common_deployment_width")
+    if (
+        not isinstance(widths, dict)
+        or set(widths) != methods
+        or not isinstance(common, int)
+        or {int(value) for value in widths.values()} != {common}
+    ):
+        raise ScientificFailure("soft-gate width audit is incomplete or inconsistent")
+    expected = {method: common for method in sorted(methods)}
+    if state.selection("deployment_widths", None) != expected:
+        state.set_selection("deployment_widths", expected)
+    state.set_selection("deployment_widths_tuned", True)
+
+
 def _e6_load_jobs() -> tuple[Job, ...]:
     models = ("Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.5-122B-A10B-FP8")
     roles = ("target_only", "static", "tts", "l0_naive", "lightcone")
@@ -4951,10 +4980,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         }
         selected_width = max(width_scores, key=width_scores.get, default=16)
         state.set_selection("e3a", {"width": selected_width, "load": common_load})
-        state.set_selection(
-            "deployment_widths",
-            {"static": selected_width},
-        )
+        _seed_e3a_static_deployment_width(state, selected_width)
     elif node == "TTS-Cal":
         state.set_selection("tts_recipe", _select_tts_recipe(state))
     elif node == "E1":
@@ -6071,6 +6097,7 @@ def _run_soft_gate_resume_v1(
 ) -> None:
     previous = state.selection("formal_soft_gate_resume_version", None)
     if isinstance(previous, dict) and int(previous.get("version", 0)) >= 1:
+        _restore_soft_gate_width_selection(state, previous)
         return
     if state.selection("formal_bugfix_reconciliation_version", 0) < 1:
         return

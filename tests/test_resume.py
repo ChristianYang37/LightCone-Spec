@@ -20,8 +20,10 @@ from lightcone_spec.runner import (
     _repair_completed_s10_downstream_resume,
     _repair_e0_e6_partial_resume_v1,
     _repair_metric_dedup_e5_resume_v1,
+    _restore_soft_gate_width_selection,
     _resume_materialization,
     _save_or_validate_run_config,
+    _seed_e3a_static_deployment_width,
     _segment_jobs,
     _select_e0_recipes,
     _selection_for_job,
@@ -687,3 +689,25 @@ def test_soft_gate_resume_reopens_exact_e3b_rows_once(tmp_path: Path):
     assert _reopen_soft_gate_e3b(state) == (20, 132)
     assert state.status_counts("E3b-pilot") == {"pending": 20}
     assert state.status_counts("E3b-final") == {"pending": 132, "skipped": 1}
+
+
+def test_frozen_common_width_survives_late_e3a_reduction(tmp_path: Path):
+    state = StateStore(tmp_path / "run")
+    state.set_selection("deployment_widths", {"static": 4})
+    _seed_e3a_static_deployment_width(state, 8)
+    assert state.selection("deployment_widths", None) == {"static": 8}
+
+    audit = {
+        "version": 1,
+        "common_deployment_width": 16,
+        "deployment_widths": {
+            "static": 16,
+            "tts": 16,
+            "l0_naive": 16,
+            "lightcone": 16,
+        },
+    }
+    _restore_soft_gate_width_selection(state, audit)
+    _seed_e3a_static_deployment_width(state, 4)
+    assert state.selection("deployment_widths", None) == audit["deployment_widths"]
+    assert state.selection("deployment_widths_tuned", None) is True
