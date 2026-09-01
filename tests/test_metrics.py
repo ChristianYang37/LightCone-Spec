@@ -446,6 +446,13 @@ def test_nsys_activity_csv_parser_preserves_timing_totals():
     assert summary["numeric_totals"]["Instances"] == 6
 
 
+def test_nsys_activity_csv_parser_rejects_empty_payload():
+    assert runner._nsys_csv_summary("NOTICE: no report rows") == {
+        "row_count": 0,
+        "numeric_totals": {},
+    }
+
+
 def test_e2_ranking_uses_static_goodput_and_tts_native_user_speed(monkeypatch):
     rows = [
         ({"method": "static", "parameters": {}}, {"goodput": 100.0}),

@@ -6026,6 +6026,18 @@ def _write_activity_proxy_stats(
         "summaries": summaries,
         "ncu_hardware_counters": "BLOCKED",
     }
+    kernel_summary = summaries.get("cuda_gpu_kern_sum")
+    kernel_totals = (
+        kernel_summary.get("activity_totals", {})
+        if isinstance(kernel_summary, dict)
+        else {}
+    )
+    if (
+        not isinstance(kernel_summary, dict)
+        or kernel_summary.get("available") is not True
+        or int(kernel_totals.get("row_count", 0)) < 1
+    ):
+        raise ScientificFailure("unprivileged proxy lacks Nsys CUDA kernel activity")
     _write_json(directory / "activity-proxy-summary.json", output)
     return output
 

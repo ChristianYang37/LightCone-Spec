@@ -116,12 +116,14 @@ normalized values. Ties prefer lower peak HBM and then the smaller width.
 
 The original NCU row remains `BLOCKED` when the provider denies privileged GPU
 performance counters. An internal `unprivileged_activity_proxy` uses the same
-controlled profile window and records a PyTorch CPU/CUDA/memory trace with
+controlled profile window and requests a PyTorch CPU/CUDA/memory trace with
 shapes, Nsys activity summaries, and 100 ms NVML utilization, memory, power,
-energy, and clock samples. Kernel/API time, launch/queue delay, GPU gaps, stream
-overlap, and memcpy activity are activity-level evidence. Occupancy, warp-stall
-reasons, SM issue efficiency, and hardware DRAM bandwidth remain `N/A`; they are
-not inferred from the proxy.
+energy, and clock samples. Some SGLang/PyTorch builds emit only CPU and memory
+events in the Kineto trace; that absence is labelled rather than hidden, while
+non-empty Nsys CUDA kernel activity is mandatory. Kernel/API time, launch/queue
+delay, GPU gaps, stream overlap, and memcpy activity are activity-level
+evidence. Occupancy, warp-stall reasons, SM issue efficiency, and hardware DRAM
+bandwidth remain `N/A`; they are not inferred from the proxy.
 
 Formal evidence is compressed numeric request/cycle data, GPU telemetry,
 configuration, metrics, SQLite state, and source attempt directories. Generated
