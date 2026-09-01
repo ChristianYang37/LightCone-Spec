@@ -1,20 +1,20 @@
 # Current status
 
-Empirical status: **PAPER-V2 RUN PAUSED FOR FORMAL S=10 RECONCILIATION**.
+Empirical status: **PAPER-V2 RUN ACTIVE AFTER ONLINESPEC V19 DEPLOYMENT**.
 
 - The excluded `paper-v1-efficiency-main-v3` pilot stopped cleanly after
   preflight and 76 E3a cells. Its SQLite database passed `integrity_check` and
   its raw attempts were copied outside the repository; it cannot enter v2
   statistics.
-- Preflight, E3a, TTS-Cal, E1, and E2-r0 through E2-r3 are complete. The
-  SQLite database passed `integrity_check`. Before future confirmation stages,
-  the runner will execute eight paired TTS `S=10` learning-rate jobs, 19 exact
-  replacement jobs, and the single failed E4-profile retry. Original attempts
-  remain immutable and excluded replacements are recorded explicitly.
+- Preflight, E3a, TTS-Cal, E1, E2-r0 through E2-r3, and E4 are complete. The
+  SQLite database passes `integrity_check`. The corrected S10 audit retained
+  20 feasible r2 candidates rather than inventing an unavailable 21st row and
+  reopened only ten missing r3 dependency cells. Original attempts remain
+  immutable and excluded replacements are recorded explicitly.
 - `paper-v2` keeps the 21-node order and now has 1,960 static jobs by running compatible conditions as measured segments on one
   resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
   evidence uses six.
-- The next SGLang semantic marker is `paper-v1-nextn-shadow-v19`; cohort telemetry
+- The active SGLang semantic marker is `paper-v1-nextn-shadow-v19`; cohort telemetry
   is sized for a complete measured cell rather than one request.
 - Full TTS remains faithful request-reset `c1`. E3b uses matched `c1` for every
   method; E5 uses TTS-LoRA-Batched, not Full TTS, for concurrency sweeps.
@@ -29,4 +29,5 @@ Empirical status: **PAPER-V2 RUN PAUSED FOR FORMAL S=10 RECONCILIATION**.
 - E0 replaces the 236-row custom OnlineSPEC grid with three frozen
   Qwen3-8B+DFlash source-transfer validations: OGD, optimistic OGD, and Hedge
   ensemble. Their public chunk/epoch settings are recorded as provenance and
-  are not reinterpreted as adaptation stride.
+  are not reinterpreted as adaptation stride. All three passed the v19 GPU
+  smoke with finite publications and zero safety-counter increments.
