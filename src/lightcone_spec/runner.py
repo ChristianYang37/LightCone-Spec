@@ -243,6 +243,20 @@ def _screening_incomplete_classification(rows: Sequence[dict[str, Any]]) -> str:
     return "runtime_failure"
 
 
+def _incomplete_scientific_outcome(
+    job: Job, rows: Sequence[dict[str, Any]]
+) -> str | None:
+    """Map pure registered-load timeouts to an auditable scientific outcome."""
+
+    if _screening_incomplete_classification(rows) != "scientific_infeasible":
+        return None
+    if _screening_job(job):
+        return "infeasible"
+    if _records_scientific_rejection(job):
+        return "rejected"
+    return None
+
+
 def _schedule_exhausted_updates(
     metrics: dict[str, Any], adaptation: dict[str, Any] | None
 ) -> int | None:
@@ -1465,20 +1479,21 @@ def _execute_cell(
             committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
             incomplete = [row for row in outcome_rows if row["status"] != "completed"]
             if incomplete:
-                if not _screening_job(job):
-                    raise RuntimeError(
-                        f"{len(incomplete)} requests did not complete in a measured cell"
-                    )
                 classification = _screening_incomplete_classification(incomplete)
                 if classification == "interrupted":
                     raise RunnerInterrupted("screening request was cancelled")
                 if classification == "runtime_failure":
                     raise RuntimeError(
-                        "screening request failed at runtime: "
+                        "measured request failed at runtime: "
                         + "; ".join(
                             str(row.get("error") or row["status"])
                             for row in incomplete
                         )
+                    )
+                scientific_outcome = _incomplete_scientific_outcome(job, incomplete)
+                if scientific_outcome is None:
+                    raise RuntimeError(
+                        f"{len(incomplete)} requests did not complete in a measured cell"
                     )
                 counters = {
                     name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
@@ -1486,7 +1501,7 @@ def _execute_cell(
                 _write_json(
                     output_dir / "metrics.json",
                     {
-                        "scientific_outcome": "infeasible",
+                        "scientific_outcome": scientific_outcome,
                         "feasible": False,
                         "slo_pass": False,
                         "error": f"{len(incomplete)} requests did not complete at registered load",
@@ -5034,6 +5049,17 @@ def _audit_e2_after_s10(
     state: StateStore,
     stop_event: threading.Event,
 ) -> None:
+    timeout_repair = state.selection("formal_registered_load_timeout_repair", None)
+    if timeout_repair is None:
+        requeued = state.retry_failed_errors(
+            "S10-e2-dependency-repair",
+            "requests did not complete in a measured cell",
+            reason="registered-load timeout classification repair",
+        )
+        state.set_selection(
+            "formal_registered_load_timeout_repair",
+            {"version": 1, "requeued": requeued},
+        )
     geometries = _rank_e1_geometries(state)
     if not geometries:
         raise ScientificFailure("S=10 E1 reconciliation produced no Pareto geometry")

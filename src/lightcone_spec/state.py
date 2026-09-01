@@ -283,6 +283,26 @@ class StateStore:
                 )
             return changed
 
+    def retry_failed_errors(self, node: str, fragment: str, *, reason: str) -> int:
+        """Requeue only failed jobs matching one diagnosed error class."""
+
+        if not fragment:
+            raise ValueError("failed error fragment must be nonempty")
+        with self.connect() as connection:
+            changed = connection.execute(
+                "UPDATE jobs SET status='pending', assigned_gpus=NULL, started_at=NULL, "
+                "completed_at=NULL, error=? WHERE node=? AND status='failed' "
+                "AND instr(error, ?) > 0",
+                (reason, node, fragment),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    "UPDATE stage_state SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                    "WHERE node=?",
+                    (node,),
+                )
+            return int(changed)
+
     def reopen_skipped(self, nodes: tuple[str, ...]) -> int:
         """Resume future DAG nodes skipped by an earlier dependency failure."""
 

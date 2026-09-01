@@ -249,6 +249,39 @@ def test_protocol_repair_requeues_without_deleting_attempt_history(tmp_path: Pat
     ]
 
 
+def test_targeted_registered_load_retry_preserves_other_failures(tmp_path: Path):
+    state = StateStore(tmp_path)
+    first, second = materialize("E4-profile")[:2]
+    state.add_jobs("E4-profile", (first, second))
+    first_attempt = state.start(first, (0, 1), tmp_path / "first-attempt")
+    state.fail(
+        first.job_id,
+        first_attempt,
+        "RuntimeError: 9 requests did not complete in a measured cell",
+        retry=False,
+    )
+    second_attempt = state.start(second, (0, 1), tmp_path / "second-attempt")
+    state.fail(second.job_id, second_attempt, "RuntimeError: connection refused", retry=False)
+
+    assert (
+        state.retry_failed_errors(
+            "E4-profile",
+            "requests did not complete in a measured cell",
+            reason="registered-load timeout classification repair",
+        )
+        == 1
+    )
+    assert state.status_counts("E4-profile") == {"failed": 1, "pending": 1}
+    with state.connect() as connection:
+        attempts = connection.execute(
+            "SELECT job_id,status,error FROM attempts ORDER BY job_id"
+        ).fetchall()
+    assert [(row["job_id"], row["status"], row["error"]) for row in attempts] == [
+        (first.job_id, "failed", "RuntimeError: 9 requests did not complete in a measured cell"),
+        (second.job_id, "failed", "RuntimeError: connection refused"),
+    ]
+
+
 def test_completed_stage_resume_preserves_immutable_materialization(tmp_path: Path):
     state = StateStore(tmp_path)
     original = materialize("E2-r2")[0]

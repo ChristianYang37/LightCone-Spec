@@ -12,6 +12,7 @@ from lightcone_spec.protocol import (
     FORMAL_ADAPTATION_STRIDE,
     PAPER_NODES,
     TTS_STRIDES,
+    Job,
     default_row_counts,
     materialize,
     paper_plan,
@@ -25,6 +26,7 @@ from lightcone_spec.runner import (
     _assigned_pair,
     _capacity_infeasible,
     _gpu_pairs,
+    _incomplete_scientific_outcome,
     _job_from_metric_config,
     _schedule_exhausted_updates,
     _scientific_rejection,
@@ -477,6 +479,30 @@ def test_screening_outcome_classification_separates_runtime_and_capacity():
         _screening_incomplete_classification([{"status": "cancelled"}])
         == "interrupted"
     )
+
+    candidate = Job(
+        job_id="candidate",
+        node="S10-e2-dependency-repair",
+        ordinal=0,
+        method="lightcone_candidate",
+        model="Qwen3-8B",
+        backend="DFLASH",
+        task="CalibrationMix",
+    )
+    assert _incomplete_scientific_outcome(candidate, [{"status": "timed_out"}]) == (
+        "rejected"
+    )
+    screening = replace(
+        candidate,
+        job_id="screening",
+        method="static",
+        parameters={"source_node": "E3a"},
+    )
+    assert _incomplete_scientific_outcome(screening, [{"status": "unfinished"}]) == (
+        "infeasible"
+    )
+    ordinary = replace(candidate, job_id="ordinary", method="static")
+    assert _incomplete_scientific_outcome(ordinary, [{"status": "timed_out"}]) is None
 
 
 def test_cosine_schedule_endpoint_and_registered_overrun():
