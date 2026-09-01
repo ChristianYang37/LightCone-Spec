@@ -11,7 +11,7 @@ Empirical status: **PAPER-V2 RUN PAUSED FOR FORMAL S=10 RECONCILIATION**.
   the runner will execute eight paired TTS `S=10` learning-rate jobs, 19 exact
   replacement jobs, and the single failed E4-profile retry. Original attempts
   remain immutable and excluded replacements are recorded explicitly.
-- `paper-v2` keeps the 21-node order and now has 2,185 static jobs by running compatible conditions as measured segments on one
+- `paper-v2` keeps the 21-node order and now has 1,960 static jobs by running compatible conditions as measured segments on one
   resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
   evidence uses six.
 - The next SGLang semantic marker is `paper-v1-nextn-shadow-v18`; cohort telemetry
@@ -26,3 +26,7 @@ Empirical status: **PAPER-V2 RUN PAUSED FOR FORMAL S=10 RECONCILIATION**.
   is not silently replaced by LoRA or another tensor-parallel degree.
 - All LightCone speed, memory, serving, transfer, table, and figure values
   remain `UNMEASURED` until the new run completes.
+- E0 replaces the 236-row custom OnlineSPEC grid with three frozen
+  Qwen3-8B+DFlash source-transfer validations: OGD, optimistic OGD, and Hedge
+  ensemble. Their public chunk/epoch settings are recorded as provenance and
+  are not reinterpreted as adaptation stride.

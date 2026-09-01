@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1140,14 +1141,117 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
 
 
 def test_onlinespec_payload_contains_independent_learner_settings():
-    job = materialize(
-        "E0-tune", valid_e0=[("Qwen/Qwen3-8B", "DFLASH", "LiveCodeBench")]
-    )[108 + 128]
+    job = next(
+        job for job in materialize("E0-tune") if job.method == "onlinespec_ens"
+    )
     payload = adaptation_payload(job)
     assert payload is not None
     assert payload["method"] == "onlinespec_ens"
     assert payload["online_spec"]["additional_learning_rates"]
     assert payload["online_spec"]["hedge_learning_rate"] > 0
+    assert payload["online_spec"]["hint_momentum"] == 0.9
+
+
+def _patched_online_optimizer():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "online_adaptation_runtime.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    wanted = {
+        "_clip_fp32_gradients",
+        "_project_online_parameters",
+        "ParameterProposal",
+        "OnlineSpecMemberProposal",
+        "OnlineSpecOptimizer",
+    }
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted
+    ]
+    namespace = {
+        "dataclass": dataclass,
+        "OnlineAdaptationConfig": object,
+        "Sequence": Sequence,
+        "torch": torch,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(patch), "exec"), namespace)
+    return namespace["OnlineSpecOptimizer"]
+
+
+def _online_config(method: str):
+    return SimpleNamespace(
+        method=method,
+        optimizer=SimpleNamespace(learning_rate=0.1, grad_clip=1.0),
+        online_spec=SimpleNamespace(
+            projection_radius=None,
+            additional_learning_rates=(0.2, 0.3) if method == "onlinespec_ens" else (),
+            hedge_learning_rate=1.0 if method == "onlinespec_ens" else None,
+            hint_momentum=0.9,
+        ),
+    )
+
+
+def test_onlinespec_opt_uses_committed_historical_hint_and_reset_is_transactional():
+    optimizer_type = _patched_online_optimizer()
+    optimizer = optimizer_type((torch.tensor([0.0]),), _online_config("onlinespec_opt"))
+    first = optimizer.propose((torch.tensor([1.0]),))
+    assert first.parameters[0].item() == pytest.approx(-0.2)
+    optimizer.commit(first)
+
+    second = optimizer.propose((torch.tensor([0.5]),))
+    assert second.second_moments[0].item() == pytest.approx(1.4)
+    assert second.parameters[0].item() == pytest.approx(-0.29)
+    before = tuple(value.clone() for value in optimizer.state_tensors)
+    optimizer.commit(second, valid=torch.tensor(False))
+    assert all(torch.equal(left, right) for left, right in zip(before, optimizer.state_tensors))
+
+    optimizer.reset((torch.tensor([0.0]),))
+    replay = optimizer.propose((torch.tensor([1.0]),))
+    assert replay.parameters[0].item() == pytest.approx(first.parameters[0].item())
+    assert replay.second_moments[0].item() == pytest.approx(1.0)
+
+
+def test_gpu_acceptance_uses_frozen_online_spec_recipes():
+    import importlib.util
+
+    path = Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py"
+    spec = importlib.util.spec_from_file_location("gpu_acceptance_recipes", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ogd = module._job(0, "onlinespec_ogd", "DFLASH", block=0)
+    opt = module._job(1, "onlinespec_opt", "DFLASH", block=0)
+    ens = module._job(2, "onlinespec_ens", "DFLASH", block=0)
+
+    assert ogd.parameters["learning_rate"] == pytest.approx(3e-5)
+    assert ogd.parameters["stride"] == 10
+    assert opt.parameters["learning_rate"] == pytest.approx(1e-1)
+    assert opt.parameters["hint_momentum"] == pytest.approx(0.9)
+    assert ens.parameters["additional_learning_rates"] == (6e-5, 1.2e-4)
+    assert ens.parameters["hedge_learning_rate"] == pytest.approx(1.0)
+
+
+def test_onlinespec_ensemble_experts_and_hedge_weights_remain_independent():
+    optimizer_type = _patched_online_optimizer()
+    optimizer = optimizer_type((torch.tensor([0.0]),), _online_config("onlinespec_ens"))
+    proposal = optimizer.propose_ensemble(
+        torch.tensor([0.1, 0.2, 0.3]),
+        ((torch.tensor([1.0]),), (torch.tensor([1.0]),), (torch.tensor([1.0]),)),
+    )
+    experts = [value.item() for value in proposal.first_moments]
+    assert experts == pytest.approx([-0.1, -0.2, -0.3])
+    assert len(set(experts)) == 3
+    optimizer.commit(proposal)
+    probabilities = optimizer.expert_probabilities
+    assert probabilities is not None
+    assert torch.isfinite(probabilities).all()
+    assert probabilities.sum().item() == pytest.approx(1.0)
 
 
 def test_cosine_horizon_and_e1a_fixed_settings():

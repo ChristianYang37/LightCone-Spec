@@ -211,6 +211,7 @@ index 00000000..8ec8b2c7
 +    projection_radius: float | None
 +    additional_learning_rates: tuple[float, ...]
 +    hedge_learning_rate: float | None
++    hint_momentum: float
 +
 +
 +@dataclass(frozen=True)
@@ -309,7 +310,10 @@ index 00000000..8ec8b2c7
 +                projection_radius=online.get("projection_radius"),
 +                additional_learning_rates=tuple(float(item) for item in online.get("additional_learning_rates", ())),
 +                hedge_learning_rate=online.get("hedge_learning_rate"),
++                hint_momentum=_finite(online.get("hint_momentum", 0.9), "hint_momentum"),
 +            )
++            if not 0 <= online_spec.hint_momentum < 1:
++                raise ValueError("OnlineSPEC hint momentum must be in [0, 1)")
 +        stride = int(value.get("stride", 10))
 +        canvas = int(value.get("canvas_tokens", 16))
 +        microbatch = int(value.get("adaptation_microbatch_size", 1))

@@ -24,7 +24,7 @@ import numpy as np
 from lightcone_spec.config import ExperimentConfig
 from lightcone_spec.data import load_prompts
 from lightcone_spec.metrics import SAFETY_COUNTERS, committed_goodput
-from lightcone_spec.protocol import Job
+from lightcone_spec.protocol import E0_ONLINESPEC_RECIPES, Job
 from lightcone_spec.runner import (
     _speed_metrics,
     _validate_committed_tokens,
@@ -250,6 +250,8 @@ def _job(
     if backend == "NEXTN":
         parameters["parameterization"] = "lora"
         parameters["rank"] = 1
+    if method in E0_ONLINESPEC_RECIPES:
+        parameters.update(E0_ONLINESPEC_RECIPES[method])
     return Job(
         job_id=f"gpu-acceptance-{ordinal:03d}-{method}",
         node="E6-acceptance" if backend == "NEXTN" else "gpu-acceptance",
@@ -882,11 +884,13 @@ def smoke(args: argparse.Namespace) -> None:
         _job(3, "l0_naive", "DFLASH", block=0),
         _job(4, "lightcone", "DFLASH", block=0),
         _job(5, "onlinespec_ogd", "DFLASH", block=0),
-        _job(6, "lightcone", "DFLASH", block=0, tp2=True),
-        _job(7, "lightcone", "DFLASH", block=0, dp2=True),
-        _job(8, "lightcone", "DSPARK", block=0),
+        _job(6, "onlinespec_opt", "DFLASH", block=0),
+        _job(7, "onlinespec_ens", "DFLASH", block=0),
+        _job(8, "lightcone", "DFLASH", block=0, tp2=True),
+        _job(9, "lightcone", "DFLASH", block=0, dp2=True),
+        _job(10, "lightcone", "DSPARK", block=0),
         _job(
-            9,
+            11,
             "lightcone",
             "NEXTN",
             block=0,
@@ -894,7 +898,7 @@ def smoke(args: argparse.Namespace) -> None:
             tp2=True,
         ),
         _job(
-            10,
+            12,
             "lightcone",
             "NEXTN",
             block=0,
@@ -910,6 +914,8 @@ def smoke(args: argparse.Namespace) -> None:
         "l0",
         "lightcone",
         "onlinespec",
+        "onlinespec_opt",
+        "onlinespec_ens",
         "tp2",
         "dp2",
         "dspark",
@@ -1224,6 +1230,8 @@ def main() -> None:
                     "l0",
                     "lightcone",
                     "onlinespec",
+                    "onlinespec_opt",
+                    "onlinespec_ens",
                     "tp2",
                     "dp2",
                     "dspark",

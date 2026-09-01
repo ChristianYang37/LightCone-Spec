@@ -50,6 +50,8 @@ from .metrics import (
 )
 from .protocol import (
     CONFIDENCE_WEIGHTS,
+    E0_ONLINESPEC_METHODS,
+    E0_ONLINESPEC_RECIPES,
     E1_REFERENCE_LOAD,
     E5_DRAIN_SECONDS,
     E5_HEADLINE_SECONDS,
@@ -106,6 +108,36 @@ def _resume_materialization(
     if existing and state.stage_status(node) == "completed":
         return existing
     return planned
+
+
+def _upgrade_legacy_e0_materialization(
+    state: StateStore, planned: tuple[Job, ...]
+) -> tuple[Job, ...] | None:
+    """Supersede an already-materialized 236-row grid without deleting evidence."""
+
+    existing = state.jobs("E0-tune")
+    if len(existing) <= 12:
+        return None
+    if tuple(job.to_dict() for job in existing[:12]) != tuple(
+        job.to_dict() for job in planned[:12]
+    ):
+        raise RuntimeError("legacy E0 compatibility probes do not match the frozen protocol")
+    current_ids = {job.job_id for job in planned}
+    obsolete = tuple(job for job in existing[12:] if job.job_id not in current_ids)
+    state.supersede_jobs(
+        tuple(job.job_id for job in obsolete),
+        "superseded by frozen OnlineSPEC source-transfer protocol",
+    )
+    exclusions = set(state.selection("formal_evidence_exclusions", []))
+    exclusions.update(
+        job.job_id
+        for job in obsolete
+        if state.completed_attempt_dir(job.job_id) is not None
+    )
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    state.add_internal_jobs(planned[12:], storage_node="E0-tune")
+    state.set_selection("formal_e0_source_transfer_upgrade_version", 1)
+    return state.jobs("E0-tune")
 
 
 def _records_scientific_rejection(job: Job) -> bool:
@@ -1888,6 +1920,15 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
         if isinstance(temperature, (int, float)):
             selected["confidence_temperature"] = float(temperature)
         return _formalize_recipe(selected)
+    if job.method in E0_ONLINESPEC_METHODS:
+        if job.parameters.get("recipe_validation"):
+            return None
+        recipes = state.selection("e0_recipes", {})
+        key = "|".join((job.model, job.backend, job.method))
+        selected = recipes.get(key) if isinstance(recipes, dict) else None
+        if not isinstance(selected, dict):
+            raise ScientificFailure(f"formal E0 job lacks validated recipe {key}")
+        return _formalize_recipe(dict(selected))
     return None
 
 
@@ -4339,25 +4380,27 @@ def _select_valid_e0(state: StateStore) -> list[tuple[str, str, str]]:
 
 
 def _select_e0_recipes(state: StateStore) -> dict[str, dict[str, Any]]:
-    winners: dict[str, tuple[tuple[float, int, float], dict[str, Any]]] = {}
+    recipes: dict[str, dict[str, Any]] = {}
+    observed: set[str] = set()
     for config, metrics in _metric_rows(state, "E0-tune"):
         method = config["method"]
-        if method not in {"onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"}:
+        if method not in E0_ONLINESPEC_METHODS or not config["parameters"].get(
+            "recipe_validation"
+        ):
             continue
+        observed.add(method)
+        expected = E0_ONLINESPEC_RECIPES[method]
+        actual = {name: config["parameters"].get(name) for name in expected}
+        if json.dumps(actual, sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ScientificFailure(f"E0 {method} source-transfer recipe drifted")
         if metrics.get("feasible") is False or metrics.get("slo_pass") is not True:
             continue
         key = "|".join((config["model"], config["backend"], method))
-        parameters = {
-            name: value for name, value in config["parameters"].items() if name != "tuning_index"
-        }
-        score = (
-            -float(metrics["goodput"]),
-            int(metrics["peak_hbm_bytes"]),
-            float(metrics["itl_p99_ms"]),
-        )
-        if key not in winners or score < winners[key][0]:
-            winners[key] = (score, parameters)
-    return {key: parameters for key, (_, parameters) in winners.items()}
+        recipes[key] = dict(expected)
+    if observed != set(E0_ONLINESPEC_METHODS):
+        missing = sorted(set(E0_ONLINESPEC_METHODS) - observed)
+        raise ScientificFailure(f"E0 lacks source-transfer validation for {missing}")
+    return recipes
 
 
 def _select_e4_screen(state: StateStore) -> dict[str, tuple[object, object]]:
@@ -4631,12 +4674,13 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
     elif node == "E0-tune":
         valid = _select_valid_e0(state)
         recipes = _select_e0_recipes(state)
-        pairs = {(model, backend) for model, backend, _ in valid}
         state.set_selection("valid_e0", valid)
-        if len(recipes) == 3 * len(pairs):
-            state.set_selection("e0_recipes", recipes)
-        else:
-            state.set_selection("E0_incomplete_onlinespec_tuning", True)
+        state.set_selection("e0_recipes", recipes)
+        feasible = {key.rsplit("|", 1)[-1] for key in recipes}
+        state.set_selection(
+            "E0_infeasible_onlinespec_methods",
+            sorted(set(E0_ONLINESPEC_METHODS) - feasible),
+        )
 
 
 def _cleanup_interrupted_servers(run_dir: Path) -> None:
@@ -5497,7 +5541,15 @@ class PaperRunner:
                         ),
                     ),
                 )
-                self.state.add_jobs(node, jobs)
+                upgraded = (
+                    _upgrade_legacy_e0_materialization(self.state, jobs)
+                    if node == "E0-tune"
+                    else None
+                )
+                if upgraded is None:
+                    self.state.add_jobs(node, jobs)
+                else:
+                    jobs = upgraded
                 dependency_reason = _dependency_reason(self.config, self.state, node)
                 if dependency_reason:
                     self.state.skip_pending(node, dependency_reason)

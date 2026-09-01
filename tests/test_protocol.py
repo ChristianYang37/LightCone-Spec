@@ -8,6 +8,7 @@ import pytest
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import (
     CONFIDENCE_WEIGHTS,
+    E0_ONLINESPEC_RECIPES,
     FORMAL_ADAPTATION_STRIDE,
     PAPER_NODES,
     TTS_STRIDES,
@@ -56,16 +57,16 @@ EXPECTED = {
     "E5-final": 66,
     "E6-pilot": 22,
     "E6-final": 60,
-    "E0-tune": 287,
-    "E0-pilot": 86,
-    "E0-final": 258,
+    "E0-tune": 54,
+    "E0-pilot": 88,
+    "E0-final": 264,
 }
 
 
 def test_paper_v2_node_order_counts_and_plan():
     assert len(PAPER_NODES) == 21
     assert default_row_counts() == EXPECTED
-    assert sum(EXPECTED.values()) == 2185
+    assert sum(EXPECTED.values()) == 1960
     assert len(paper_plan()) == 21
     assert [row.rows for row in paper_plan() if row.name == "TTS-Cal"] == ["<=108"]
 
@@ -106,7 +107,7 @@ def test_primary_and_secondary_block_semantics():
     assert len(secondary) == 72
     assert {job.block for job in secondary} == set(range(6))
     assert len(materialize("E6-final")) == 2 * 5 * 6
-    assert len(materialize("E0-final")) == 43 * 6
+    assert len(materialize("E0-final")) == 44 * 6
 
 
 def test_tts_and_dspark_registered_fidelity():
@@ -162,11 +163,11 @@ def test_formal_adaptive_jobs_resolve_s10_without_erasing_exploratory_sweeps():
         assert uses_formal_adaptation_stride(job)
         assert adaptation_payload(job, {"stride": 50})["stride"] == FORMAL_ADAPTATION_STRIDE
 
-    onlinespec = next(
+    for onlinespec in (
         job for job in materialize("E0-tune") if job.method.startswith("onlinespec")
-    )
-    assert not uses_formal_adaptation_stride(onlinespec)
-    assert adaptation_payload(onlinespec)["stride"] in {20, 40, 80, 160}
+    ):
+        assert uses_formal_adaptation_stride(onlinespec)
+        assert adaptation_payload(onlinespec)["stride"] == FORMAL_ADAPTATION_STRIDE
 
 
 def test_e2_uses_selected_recipe_without_inheriting_e1_runtime_fields():
@@ -218,10 +219,39 @@ def test_e0_method_scope_is_deliberately_sparse():
     rows = materialize("E0-final")
     assert sum(job.method == "target_only" for job in rows) == 4 * 6
     assert sum(job.method == "l0_naive" for job in rows) == 6
-    assert sum(job.method.startswith("onlinespec") for job in rows) == 12
+    assert sum(job.method.startswith("onlinespec") for job in rows) == 18
     assert {(job.model, job.backend) for job in rows if job.method.startswith("onlinespec")} == {
         ("Qwen/Qwen3-8B", "DFLASH")
     }
+
+
+def test_e0_uses_frozen_source_transfer_recipes_without_mapping_chunk_to_stride():
+    validations = [
+        job
+        for job in materialize("E0-tune")
+        if job.parameters.get("recipe_validation")
+    ]
+    assert len(validations) == 3
+    assert {job.method for job in validations} == set(E0_ONLINESPEC_RECIPES)
+    for job in validations:
+        recipe = E0_ONLINESPEC_RECIPES[job.method]
+        assert {
+            name: job.parameters[name] for name in recipe
+        } == recipe
+        assert job.parameters["source_chunk_size"] in {40, 80}
+        assert job.parameters["source_epochs"] in {3, 5}
+        assert job.parameters["stride"] == 10
+        assert job.parameters["source_chunk_size"] != job.parameters["stride"]
+    assert len({server_session_key(job) for job in validations}) == 3
+
+
+def test_e5_burstgpt_segment_count_is_unchanged():
+    assert sum(
+        segment.get("load") == "burstgpt_shape"
+        for node in ("E5-pilot", "E5-final")
+        for job in materialize(node)
+        for segment in job.parameters.get("segments", ())
+    ) == 73
 
 
 def test_server_reuse_and_eight_gpu_block_affinity(tmp_path: Path):

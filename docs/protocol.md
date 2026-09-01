@@ -18,11 +18,11 @@ every segment keeps separate requests, timing, and metrics.
 | E1a | 141 | DSpark geometry, five confidence weights, confirmation |
 | E5-pilot/final | 11/66 | concurrency curves and 12/6-block confirmation |
 | E6-pilot/final | 22/60 | interface/fit and six-block two-model transfer |
-| E0-tune/pilot/final | 287/86/258 | compatibility, representative OnlineSPEC, bundled breadth |
+| E0-tune/pilot/final | 54/88/264 | compatibility, frozen OnlineSPEC validation, bundled breadth |
 
-The static materialization is 2,185 jobs; bounded confirmation, E1 load,
+The static materialization is 1,960 jobs; bounded confirmation, E1 load,
 width, batching calibration, E6 load, eight TTS-S10 confirmation jobs, and 19
-replacement jobs bring the maximum to 2,280 unique runner jobs. The registered
+replacement jobs bring the maximum to about 2,055 unique runner jobs. The registered
 E4-profile retry is a new attempt of an existing job. There is no
 global `N` or `final_blocks` setting.
 
@@ -39,8 +39,10 @@ global `N` or `final_blocks` setting.
 - E5 secondary: DSpark Static/LightCone and the explicitly separate
   TTS-LoRA-Batched engineering variant, six blocks.
 - E4/E6/E0 transfer uses six blocks.
-- L0-naive is the publication-policy ablation. OnlineSPEC is tuned and reported
-  only for Qwen3-8B + DFlash.
+- L0-naive is the publication-policy ablation. OnlineSPEC OGD, Opt, and Ens use
+  frozen public-source hyperparameters and are validated and reported only for
+  Qwen3-8B + DFlash. Public request chunk sizes and epochs are provenance, not
+  speculation-round stride; every formal adaptive row remains at `S=10`.
 
 Screening and tuning are exploratory. Only frozen confirmation blocks support
 effect claims. Paired methods share stimuli and run on the same GPU resource in
@@ -51,7 +53,7 @@ segments are terminal.
 ## TTS and DSpark
 
 Every formal adaptive TTS, L0-naive, LightCone, LightCone-candidate,
-DSpark-LightCone, and TTS-LoRA-Batched row uses stride `S=10`. TTS-Cal retains
+DSpark-LightCone, TTS-LoRA-Batched, and OnlineSPEC row uses stride `S=10`. TTS-Cal retains
 the source-paper stride sweep `1,5,10,15,20,30,40,50`, and E4 retains its
 stride ablation, but both are exploratory and do not select the formal stride.
 TTS uses Adam, one update, latest-round teacher rows, request reset, zero weight

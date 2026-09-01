@@ -182,6 +182,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
             "projection_radius": chosen.get("projection_radius"),
             "additional_learning_rates": chosen.get("additional_learning_rates", ()),
             "hedge_learning_rate": chosen.get("hedge_learning_rate"),
+            "hint_momentum": chosen.get("hint_momentum", 0.9),
         }
     return payload
 
@@ -340,7 +341,9 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
             "two_moment" if optimizer["name"] in {"adam", "adamw", "chronobelief"} else "one_moment"
         )
         adaptation_layout = (
-            "online" if str(adaptation["method"]).startswith("onlinespec_") else "adaptive",
+            adaptation["method"]
+            if str(adaptation["method"]).startswith("onlinespec_")
+            else "adaptive",
             adaptation["weight_update_mode"],
             adaptation["parameter_scope"],
             adaptation["rank"],

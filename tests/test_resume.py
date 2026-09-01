@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
-from lightcone_spec.protocol import materialize
+from lightcone_spec.protocol import E0_ONLINESPEC_RECIPES, Job, materialize
 from lightcone_spec.runner import (
     _complete_blocked_profiler,
     _e2_missing_dependency_jobs,
@@ -17,8 +17,11 @@ from lightcone_spec.runner import (
     _resume_materialization,
     _save_or_validate_run_config,
     _segment_jobs,
+    _select_e0_recipes,
+    _selection_for_job,
     _set_e2_expected_evidence,
     _skip_satisfied_e2_dependency_jobs,
+    _upgrade_legacy_e0_materialization,
 )
 from lightcone_spec.state import StateStore
 
@@ -255,6 +258,76 @@ def test_pending_stage_resume_uses_current_materialization(tmp_path: Path):
     state.add_jobs("E2-r2", (original,))
     changed = replace(original, parameters={**original.parameters, "lr": 9e-4})
     assert _resume_materialization(state, "E2-r2", (changed,)) == (changed,)
+
+
+def test_e0_source_transfer_upgrade_is_idempotent_and_preserves_old_evidence(
+    tmp_path: Path,
+):
+    state = StateStore(tmp_path)
+    planned = materialize("E0-tune")
+    legacy = Job(
+        job_id="E0-tune__legacy-grid-row",
+        node="E0-tune",
+        ordinal=12,
+        method="onlinespec_ogd",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="CalibrationMix",
+        parameters={"stride": 20, "learning_rate": 1e-4},
+    )
+    state.add_jobs("E0-tune", (*planned[:12], legacy))
+    attempt_dir = tmp_path / "legacy-attempt"
+    attempt_dir.mkdir()
+    (attempt_dir / "config.json").write_text(json.dumps(legacy.to_dict()))
+    (attempt_dir / "metrics.json").write_text(json.dumps({"goodput": 1.0}))
+    attempt = state.start(legacy, (0, 1), attempt_dir)
+    state.complete(legacy.job_id, attempt)
+
+    upgraded = _upgrade_legacy_e0_materialization(state, planned)
+    assert upgraded is not None
+    assert state.selection("formal_e0_source_transfer_upgrade_version") == 1
+    assert legacy.job_id in state.selection("formal_evidence_exclusions")
+    assert state.completed_attempt_dir(legacy.job_id) == attempt_dir
+    assert len([job for job in state.jobs("E0-tune") if job.job_id in {row.job_id for row in planned}]) == 54
+
+    _upgrade_legacy_e0_materialization(state, planned)
+    assert len([job for job in state.jobs("E0-tune") if job.job_id in {row.job_id for row in planned}]) == 54
+
+
+def test_e0_recipe_selection_injects_only_feasible_validated_methods(tmp_path: Path):
+    state = StateStore(tmp_path)
+    validations = tuple(
+        job
+        for job in materialize("E0-tune")
+        if job.parameters.get("recipe_validation")
+    )
+    state.add_jobs("E0-tune", validations)
+    for job in validations:
+        attempt_dir = tmp_path / job.method / "attempt-01"
+        attempt_dir.mkdir(parents=True)
+        (attempt_dir / "config.json").write_text(json.dumps(job.to_dict()))
+        feasible = job.method != "onlinespec_opt"
+        (attempt_dir / "metrics.json").write_text(
+            json.dumps({"feasible": feasible, "slo_pass": feasible})
+        )
+        attempt = state.start(job, (0, 1), attempt_dir)
+        state.complete(job.job_id, attempt)
+
+    recipes = _select_e0_recipes(state)
+    assert set(recipes) == {
+        "Qwen/Qwen3-8B|DFLASH|onlinespec_ogd",
+        "Qwen/Qwen3-8B|DFLASH|onlinespec_ens",
+    }
+    state.set_selection("e0_recipes", recipes)
+    downstream = materialize("E0-pilot", e0_recipes=recipes)
+    assert {job.method for job in downstream if job.method.startswith("onlinespec")} == {
+        "onlinespec_ogd",
+        "onlinespec_ens",
+    }
+    job = next(job for job in downstream if job.method == "onlinespec_ens")
+    assert json.dumps(_selection_for_job(state, job), sort_keys=True) == json.dumps(
+        E0_ONLINESPEC_RECIPES["onlinespec_ens"], sort_keys=True
+    )
 
 
 def test_ncu_permission_probe_reports_provider_block(monkeypatch, tmp_path: Path):

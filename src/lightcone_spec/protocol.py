@@ -55,6 +55,9 @@ FORMAL_ADAPTIVE_METHODS = {
     "l0_naive",
     "lightcone",
     "lightcone_candidate",
+    "onlinespec_ogd",
+    "onlinespec_opt",
+    "onlinespec_ens",
 }
 EXPLORATORY_STRIDE_WORKLOADS = {
     "tts_calibration_screen",
@@ -104,6 +107,52 @@ TTS_SOURCE_TASKS = (
     "TheoremQA",
     "LiveCodeBench",
 )
+E0_ONLINESPEC_METHODS = (
+    "onlinespec_ogd",
+    "onlinespec_opt",
+    "onlinespec_ens",
+)
+E0_ONLINESPEC_RECIPES: dict[str, dict[str, Any]] = {
+    "onlinespec_ogd": {
+        "parameterization": "full",
+        "scope": "all",
+        "rank": None,
+        "learning_rate": 3e-5,
+        "stride": FORMAL_ADAPTATION_STRIDE,
+        "grad_clip": 1.0,
+        "source_backend": "EAGLE",
+        "source_chunk_size": 40,
+        "source_epochs": 5,
+        "source_transfer": "qwen3_dflash",
+    },
+    "onlinespec_opt": {
+        "parameterization": "full",
+        "scope": "all",
+        "rank": None,
+        "learning_rate": 1e-1,
+        "stride": FORMAL_ADAPTATION_STRIDE,
+        "grad_clip": 1.0,
+        "hint_momentum": 0.9,
+        "source_backend": "Hydra",
+        "source_chunk_size": 80,
+        "source_epochs": 3,
+        "source_transfer": "qwen3_dflash",
+    },
+    "onlinespec_ens": {
+        "parameterization": "full",
+        "scope": "all",
+        "rank": None,
+        "learning_rate": 3e-5,
+        "stride": FORMAL_ADAPTATION_STRIDE,
+        "grad_clip": 1.0,
+        "additional_learning_rates": (6e-5, 1.2e-4),
+        "hedge_learning_rate": 1.0,
+        "source_backend": "EAGLE",
+        "source_chunk_size": 40,
+        "source_epochs": 5,
+        "source_transfer": "qwen3_dflash",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -158,9 +207,10 @@ def _jobs(node: str, rows: Iterable[dict[str, Any]]) -> tuple[Job, ...]:
         row = dict(source)
         label = "__".join(
             _slug(row.get(name))
-            for name in ("method", "model", "backend", "task", "block")
+            for name in ("method", "model", "backend", "task", "block", "_job_label")
             if row.get(name) is not None
         )
+        row.pop("_job_label", None)
         result.append(
             Job(
                 job_id=f"{node}__{ordinal:06d}__{label}",
@@ -188,7 +238,7 @@ def _segments(*rows: dict[str, Any]) -> list[dict[str, Any]]:
 def paper_plan(
     *, valid_e0: int | None = None, e1_safe: int = MAX_E2_GEOMETRIES
 ) -> tuple[NodePlan, ...]:
-    v_text = str(valid_e0) if valid_e0 is not None else "V (0-108)"
+    v_text = str(valid_e0) if valid_e0 is not None else "V (0-12 pairs)"
     e2 = [105 * e1_safe]
     for _ in range(3):
         e2.append(max(math.ceil(e2[-1] / 4), 21))
@@ -211,9 +261,9 @@ def paper_plan(
         NodePlan("E5-final", "66", 2, "12-block primary and six-block secondary serving curves"),
         NodePlan("E6-pilot", "22", 2, "interface, fit, and bundled pilots"),
         NodePlan("E6-final", "60", 2, "six-block native-MTP transfer"),
-        NodePlan("E0-tune", "287", 2, "compatibility and representative OnlineSPEC tuning"),
-        NodePlan("E0-pilot", "86", 2, f"two-block bundled breadth pilot; {v_text}"),
-        NodePlan("E0-final", "258", 2, "six-block bundled cross-workload transfer"),
+        NodePlan("E0-tune", "54", 2, "compatibility and frozen OnlineSPEC validation"),
+        NodePlan("E0-pilot", "88", 2, f"two-block bundled breadth pilot; {v_text}"),
+        NodePlan("E0-final", "264", 2, "six-block bundled cross-workload transfer"),
     )
 
 
@@ -915,50 +965,23 @@ def _e0_pairs() -> tuple[tuple[str, str], ...]:
     return tuple(itertools.product(E0_MODELS, E0_BACKENDS))
 
 
-def _onlinespec_candidates() -> tuple[dict[str, Any], ...]:
-    rows = []
-    for method in ("onlinespec_ogd", "onlinespec_opt"):
-        for stride, parameterization, rank, lr in itertools.product(
-            (20, 40, 80, 160), ("full", "lora"), (None, 8, 16, 32), (1e-4, 1e-3, 1e-2, 1e-1)
-        ):
-            if (parameterization == "full") == (rank is None):
-                rows.append(
-                    dict(
-                        method=method,
-                        parameterization=parameterization,
-                        scope="all",
-                        rank=rank,
-                        learning_rate=lr,
-                        stride=stride,
-                        grad_clip=1.0,
-                    )
-                )
-    for stride, (parameterization, rank), lr, hedge in itertools.product(
-        (40, 80, 160),
-        (("full", None), ("lora", 8), ("lora", 16), ("lora", 32)),
-        (1e-4, 1e-3, 1e-2),
-        (0.1, 0.5, 1.0),
-    ):
-        rows.append(
-            dict(
-                method="onlinespec_ens",
-                parameterization=parameterization,
-                scope="all",
-                rank=rank,
-                learning_rate=lr,
-                stride=stride,
-                grad_clip=1.0,
-                additional_learning_rates=(lr * 3, lr * 10),
-                hedge_learning_rate=hedge,
-            )
-        )
-    if len(rows) != 236:
-        raise AssertionError("OnlineSPEC grid must contain 236 candidates")
-    return tuple(rows)
+def _onlinespec_source_recipes() -> tuple[dict[str, Any], ...]:
+    """Return the three frozen source-transfer recipes used by E0.
+
+    The source chunk size and epoch count are provenance only.  They describe
+    request-level training in the public OnlineSPEC implementations and are
+    deliberately not mapped to our in-process speculation-round stride.
+    """
+
+    return tuple(
+        {"method": method, **recipe}
+        for method, recipe in E0_ONLINESPEC_RECIPES.items()
+    )
 
 
 def _e0_methods(
     valid_pairs: set[tuple[str, str]] | None = None,
+    e0_recipes: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[tuple[str, str, str], ...]:
     pairs = set(_e0_pairs()) if valid_pairs is None else valid_pairs
     models = {model for model, _ in pairs}
@@ -971,9 +994,18 @@ def _e0_methods(
     representative = ("Qwen/Qwen3-8B", "DFLASH")
     if representative in pairs:
         rows.append((*representative, "l0_naive"))
-        rows.extend((*representative, method) for method in ("onlinespec_ogd", "onlinespec_opt"))
-    if valid_pairs is None and len(rows) != 43:
-        raise AssertionError("E0 bundled method surface must contain 43 rows")
+        feasible = (
+            E0_ONLINESPEC_METHODS
+            if e0_recipes is None
+            else tuple(
+                method
+                for method in E0_ONLINESPEC_METHODS
+                if f"{representative[0]}|{representative[1]}|{method}" in e0_recipes
+            )
+        )
+        rows.extend((*representative, method) for method in feasible)
+    if valid_pairs is None and e0_recipes is None and len(rows) != 44:
+        raise AssertionError("E0 bundled method surface must contain 44 rows")
     return tuple(rows)
 
 
@@ -988,22 +1020,24 @@ def _e0_tune() -> Iterator[dict[str, Any]]:
             adaptive_probe=True,
             gpu_count=2,
         )
-    for index, candidate in enumerate(_onlinespec_candidates()):
+    for candidate in _onlinespec_source_recipes():
         yield dict(
             **candidate,
             model="Qwen/Qwen3-8B",
             backend="DFLASH",
             task="CalibrationMix",
-            tuning_index=index,
+            recipe_validation=True,
+            _job_label="source-transfer",
             gpu_count=2,
         )
-    for index, method in enumerate(("static", "tts", "l0_naive")):
+    for method in ("static", "tts", "l0_naive"):
         yield dict(
             method=method,
             model="Qwen/Qwen3-8B",
             backend="DFLASH",
             task="CalibrationMix",
-            tuning_index=236 + index,
+            source_reference=True,
+            _job_label="source-reference",
             gpu_count=2,
         )
     for model, backend, method in itertools.product(
@@ -1015,6 +1049,7 @@ def _e0_tune() -> Iterator[dict[str, Any]]:
             backend=backend,
             task="CalibrationMix",
             pair_calibration=True,
+            _job_label="pair-calibration",
             gpu_count=2,
         )
 
@@ -1022,10 +1057,11 @@ def _e0_tune() -> Iterator[dict[str, Any]]:
 def _e0_blocks(
     blocks: Iterable[int],
     valid_pairs: set[tuple[str, str]] | None = None,
+    e0_recipes: dict[str, dict[str, Any]] | None = None,
     *,
     source_panel: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    for model, backend, method in _e0_methods(valid_pairs):
+    for model, backend, method in _e0_methods(valid_pairs, e0_recipes):
         segments = _segments(
             *(
                 {
@@ -1081,6 +1117,7 @@ def materialize(
     e2_rows: Iterable[dict[str, Any]] | None = None,
     e4_neighborhoods: dict[str, tuple[object, object]] | None = None,
     valid_e0: Iterable[tuple[str, str, str]] | None = None,
+    e0_recipes: dict[str, dict[str, Any]] | None = None,
     **_legacy: object,
 ) -> tuple[Job, ...]:
     if node not in PAPER_NODES:
@@ -1119,10 +1156,10 @@ def materialize(
         rows = _e0_tune()
     elif node == "E0-pilot":
         pairs = None if valid_e0 is None else {(model, backend) for model, backend, _ in valid_e0}
-        rows = _e0_blocks((0, 1), pairs, source_panel=True)
+        rows = _e0_blocks((0, 1), pairs, e0_recipes, source_panel=True)
     else:
         pairs = None if valid_e0 is None else {(model, backend) for model, backend, _ in valid_e0}
-        rows = _e0_blocks(SECONDARY_BLOCKS, pairs)
+        rows = _e0_blocks(SECONDARY_BLOCKS, pairs, e0_recipes)
     return _jobs(node, rows)
 
 

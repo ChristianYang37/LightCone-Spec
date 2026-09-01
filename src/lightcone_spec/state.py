@@ -196,6 +196,25 @@ class StateStore:
                 (reason, job_id),
             )
 
+    def supersede_jobs(self, job_ids: tuple[str, ...], reason: str) -> int:
+        """Retire obsolete pending/failed protocol rows without deleting attempts."""
+
+        if not job_ids:
+            return 0
+        placeholders = ",".join("?" for _ in job_ids)
+        with self.connect() as connection:
+            changed = connection.execute(
+                f"UPDATE jobs SET status='skipped', completed_at=CURRENT_TIMESTAMP, "
+                f"assigned_gpus=NULL, error=? WHERE job_id IN ({placeholders}) "
+                "AND status IN ('pending','failed')",
+                (reason, *job_ids),
+            ).rowcount
+            connection.execute(
+                "UPDATE stage_state SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                "WHERE node='E0-tune'"
+            )
+        return int(changed)
+
     def complete(self, job_id: str, attempt: int) -> None:
         with self.connect() as connection:
             connection.execute(

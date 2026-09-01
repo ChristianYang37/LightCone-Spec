@@ -2569,9 +2569,13 @@ index 00000000..7b2cb5db
 +            self.initial,
 +            self.online_spec.projection_radius,
 +        )
++        updated_hint = tuple(
++            self.online_spec.hint_momentum * previous + gradient
++            for previous, gradient in zip(self.second, clipped, strict=True)
++        )
 +        decision = tuple(
 +            parameter - self.config.learning_rate * hint
-+            for parameter, hint in zip(anchor, clipped, strict=True)
++            for parameter, hint in zip(anchor, updated_hint, strict=True)
 +        )
 +        decision = _project_online_parameters(
 +            decision,
@@ -2581,7 +2585,7 @@ index 00000000..7b2cb5db
 +        return ParameterProposal(
 +            decision,
 +            anchor,
-+            clipped,
++            updated_hint,
 +            next_step,
 +            gradient_norm.reshape(1),
 +            effective_lr,
@@ -2821,7 +2825,7 @@ index 00000000..7b2cb5db
 +        config.topology.tensor_parallel_size,
 +        config.topology.data_parallel_size,
 +        moment_layout,
-+        config.method.startswith("onlinespec_"),
++        config.method if config.method.startswith("onlinespec_") else "adaptive",
 +        online_experts,
 +    )
 +
@@ -3393,8 +3397,15 @@ index 00000000..7b2cb5db
 +                online_hint_error = (
 +                    torch.stack(
 +                        [
-+                            (candidate - previous).to(torch.float32).square().sum()
-+                            for candidate, previous in zip(
++                            (
++                                updated
++                                - optimizer.online_spec.hint_momentum * previous
++                                - previous
++                            )
++                            .to(torch.float32)
++                            .square()
++                            .sum()
++                            for updated, previous in zip(
 +                                proposal.second_moments,
 +                                optimizer.second,
 +                                strict=True,
