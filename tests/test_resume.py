@@ -16,9 +16,11 @@ from lightcone_spec.runner import (
     _e2_missing_dependency_jobs,
     _exclude_redundant_e2_dependency_jobs,
     _ncu_permission_block_reason,
+    _records_scientific_rejection,
     _reopen_soft_gate_e3b,
     _repair_completed_s10_downstream_resume,
     _repair_e0_e6_partial_resume_v1,
+    _repair_e3b_scientific_rejections,
     _repair_metric_dedup_e5_resume_v1,
     _restore_soft_gate_width_selection,
     _resume_materialization,
@@ -711,3 +713,43 @@ def test_frozen_common_width_survives_late_e3a_reduction(tmp_path: Path):
     _seed_e3a_static_deployment_width(state, 4)
     assert state.selection("deployment_widths", None) == audit["deployment_widths"]
     assert state.selection("deployment_widths_tuned", None) is True
+
+
+def test_e3b_safety_rejection_retries_once_then_records_terminal(tmp_path: Path):
+    state = StateStore(tmp_path / "run")
+    state.set_selection("formal_soft_gate_resume_version", {"version": 1})
+    rejected = Job(
+        "e3b-rejected",
+        "E3b-pilot-segments",
+        0,
+        "tts",
+        "m",
+        "DFLASH",
+        "t",
+    )
+    runtime = Job(
+        "e3b-runtime",
+        "E3b-pilot-segments",
+        1,
+        "tts",
+        "m",
+        "DFLASH",
+        "t",
+    )
+    state.add_internal_jobs((rejected, runtime), storage_node="E3b-pilot-segments")
+    for job, error in (
+        (rejected, "scientific safety failure: fallbacks=1"),
+        (runtime, "connection refused"),
+    ):
+        output = tmp_path / job.job_id
+        output.mkdir()
+        attempt = state.start(job, (0,), output)
+        state.fail(job.job_id, attempt, error, retry=False)
+
+    assert _records_scientific_rejection(rejected) is True
+    assert _repair_e3b_scientific_rejections(state) == 1
+    assert {job.job_id for job in state.pending_jobs("E3b-pilot-segments")} == {
+        rejected.job_id
+    }
+    assert state.failed_attempts(rejected.job_id) == 1
+    assert _repair_e3b_scientific_rejections(state) == 0

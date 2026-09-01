@@ -174,6 +174,7 @@ def _records_scientific_rejection(job: Job) -> bool:
         or job.node == "bugfix-reconciliation-v1"
         or job.node in {"soft-gate-width-v1", "profile-proxy-v1"}
         or job.node == "E3-width-calibration"
+        or job.node in {"E3b-pilot-segments", "E3b-final-segments"}
         or job.method in CANDIDATE_METHODS
         or bool(job.parameters.get("interface_fit"))
         or _screening_job(job)
@@ -2969,6 +2970,21 @@ def _restore_soft_gate_width_selection(
     if state.selection("deployment_widths", None) != expected:
         state.set_selection("deployment_widths", expected)
     state.set_selection("deployment_widths_tuned", True)
+
+
+def _repair_e3b_scientific_rejections(state: StateStore) -> int:
+    """Requeue legacy E3b safety failures once under terminal-rejection semantics."""
+
+    if state.selection("formal_soft_gate_resume_version", None) is None:
+        return 0
+    return sum(
+        state.retry_failed_errors(
+            node,
+            "scientific safety failure:",
+            reason="retry under terminal scientific-rejection semantics",
+        )
+        for node in ("E3b-pilot-segments", "E3b-final-segments")
+    )
 
 
 def _e6_load_jobs() -> tuple[Job, ...]:
@@ -6209,6 +6225,7 @@ class PaperRunner:
                     self.state,
                     self.stop_event,
                 )
+                _repair_e3b_scientific_rejections(self.state)
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)
