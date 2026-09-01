@@ -3875,6 +3875,17 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
     return [row[-1] for row in ordered[:keep]]
 
 
+def _e2_keep_count(candidate_count: int, feasible_count: int, round_index: int) -> int:
+    """Apply the registered halving floor without inventing infeasible finalists."""
+
+    if candidate_count < 0 or feasible_count < 0 or feasible_count > candidate_count:
+        raise ValueError("invalid E2 candidate cardinality")
+    if feasible_count == 0:
+        return 0
+    requested = 1 if round_index == 3 else max(math.ceil(candidate_count / 4), 21)
+    return min(requested, feasible_count)
+
+
 _E2_RECIPE_PARAMETER_KEYS = (
     "parameterization",
     "rank",
@@ -4627,11 +4638,16 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         state.set_selection("e4_neighborhoods", _select_e4_screen(state))
     elif node.startswith("E2-r"):
         round_index = int(node[-1])
-        candidate_count = sum(
-            item["method"] == "lightcone_candidate" for item, _ in _metric_rows(state, node)
+        candidate_count = len(
+            {
+                _e2_recipe_key(item["parameters"])
+                for item, _ in _metric_rows(state, node)
+                if item["method"] == "lightcone_candidate"
+            }
         )
-        keep = max(math.ceil(candidate_count / 4), 21) if round_index < 3 else 1
-        winners = _rank_e2_candidates(state, node, keep)
+        feasible = _rank_e2_candidates(state, node, candidate_count)
+        keep = _e2_keep_count(candidate_count, len(feasible), round_index)
+        winners = feasible[:keep]
         selection_name = (
             "lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}"
         )
@@ -5053,8 +5069,11 @@ def _audit_e2_after_s10(
                 if config_row["method"] == "lightcone_candidate"
             }
         )
-        keep = max(math.ceil(candidate_count / 4), 21) if round_index < 3 else 1
-        winners = _rank_e2_candidates(state, node, keep)
+        feasible = _rank_e2_candidates(state, node, candidate_count)
+        keep = _e2_keep_count(candidate_count, len(feasible), round_index)
+        winners = feasible[:keep]
+        if not winners:
+            raise ScientificFailure(f"{node} S=10 audit found no feasible candidates")
         if len(winners) != keep:
             raise ScientificFailure(
                 f"{node} S=10 audit retained {len(winners)} candidates, expected {keep}"

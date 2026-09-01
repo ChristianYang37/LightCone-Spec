@@ -10,6 +10,7 @@ from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import E0_ONLINESPEC_RECIPES, Job, materialize
 from lightcone_spec.runner import (
     _complete_blocked_profiler,
+    _e2_keep_count,
     _e2_missing_dependency_jobs,
     _exclude_redundant_e2_dependency_jobs,
     _ncu_permission_block_reason,
@@ -55,6 +56,16 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     attempt = state.start(first, (0, 1), tmp_path / "attempt-3")
     state.complete(first.job_id, attempt)
     assert state.status_counts("preflight") == {"completed": 1, "pending": 2}
+
+
+def test_e2_halving_floor_never_invents_infeasible_finalists():
+    assert _e2_keep_count(53, 53, 1) == 21
+    assert _e2_keep_count(21, 20, 2) == 20
+    assert _e2_keep_count(20, 20, 2) == 20
+    assert _e2_keep_count(20, 20, 3) == 1
+    assert _e2_keep_count(21, 0, 2) == 0
+    with pytest.raises(ValueError, match="invalid E2 candidate cardinality"):
+        _e2_keep_count(20, 21, 2)
 
 
 def test_explicit_interruption_returns_job_to_pending(tmp_path: Path):
