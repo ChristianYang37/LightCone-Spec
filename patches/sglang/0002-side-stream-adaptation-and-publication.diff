@@ -294,7 +294,7 @@ index 00000000..20e93274
 +    *,
 +    valid_mask: torch.Tensor | None = None,
 +    relative_units: float = 2.5,
-+    kl_units: float = 32.0,
++    kl_units: float = 64.0,
 +    numerical_unit: float | None = None,
 +) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 +    if inference_logits.shape != differentiable_logits.shape:

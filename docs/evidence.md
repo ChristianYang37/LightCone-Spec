@@ -13,6 +13,12 @@ Stage summaries are reproducible projections from completed attempt folders:
   Holm decisions;
 - `mechanism.json` for the available mechanism, memory, topology, energy, and
   profiler-derived fields, with unsupported hardware counters left `N/A`;
+- feasibility is derived as `hard_feasible`, capacity-only
+  `capacity_feasible`, and report-only `slo_pass`/`slo_pass_rate`; historical
+  raw files are not rewritten when these semantics are recomputed;
+- provider-blocked NCU counters remain `BLOCKED`; the separately labelled
+  `unprivileged_activity_proxy` stores PyTorch activity traces, Nsys activity
+  summaries, and 100 ms NVML samples without synthesizing NCU-only fields;
 - SQLite selections for downstream recipe choices and powered block counts.
 
 Committed-token goodput, native per-token ITL, peak HBM, KV capacity, safety

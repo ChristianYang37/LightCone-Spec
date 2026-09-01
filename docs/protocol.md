@@ -23,7 +23,9 @@ every segment keeps separate requests, timing, and metrics.
 The static materialization is 1,960 jobs; bounded confirmation, E1 load,
 width, batching calibration, E6 load, eight TTS-S10 confirmation jobs, and 19
 replacement jobs bring the maximum to about 2,055 unique runner jobs. The registered
-E4-profile retry is a new attempt of an existing job. There is no
+E4-profile retry is a new attempt of an existing job. The one-time KL64
+reconciliation adds seven replacement cells and one unprivileged activity
+proxy to the current run without adding public DAG nodes. There is no
 global `N` or `final_blocks` setting.
 
 ## Comparisons and repetition
@@ -85,6 +87,41 @@ metrics. Per-user speed is the arithmetic mean of each completed request's
 native decode rate, computed from committed-token timestamps. Full TTS therefore
 records declared and dispatcher concurrency separately and is never divided by
 a nominal load that its request-reset implementation does not execute.
+
+## Feasibility, latency SLOs, and deployment width
+
+Every measured row separates three notions. `hard_feasible` means that the
+server and all standard requests completed without runtime, numerical,
+reconstruction, safety, database, NCCL, or OOM errors. `capacity_feasible` is
+defined only for explicitly registered-load or capacity experiments.
+`slo_pass` and `slo_pass_rate` retain the registered TTFT and p99-ITL thresholds
+but have `slo_semantics=report_only_v2`: an SLO miss is reported and plotted,
+not used to skip a standard scientific row. Capacity failures, scientific
+rejections, and provider-blocked profiler rows remain visible terminal outcomes
+and do not stop independent workers.
+
+DFlash reconstruction uses the same valid-token mask and BF16 numerical unit as
+the differentiable loss. Its mean-KL envelope is 64 BF16 units
+(`64/128^2 = 0.00390625`); finite checks and the relative-RMS threshold are
+unchanged. A one-time reconciliation replaces exactly the seven affected
+width-4 adaptive rows while retaining the original attempts.
+
+One deployment width is shared by Static, Full TTS, L0-naive, and LightCone.
+A candidate in `{4,8,16}` must be hard-feasible for all four methods in all
+three regimes. For every method/regime, goodput is normalized by its best
+common candidate; the selected width maximizes the geometric mean of these 12
+normalized values. Ties prefer lower peak HBM and then the smaller width.
+
+## Profiling evidence boundary
+
+The original NCU row remains `BLOCKED` when the provider denies privileged GPU
+performance counters. An internal `unprivileged_activity_proxy` uses the same
+controlled profile window and records a PyTorch CPU/CUDA/memory trace with
+shapes, Nsys activity summaries, and 100 ms NVML utilization, memory, power,
+energy, and clock samples. Kernel/API time, launch/queue delay, GPU gaps, stream
+overlap, and memcpy activity are activity-level evidence. Occupancy, warp-stall
+reasons, SM issue efficiency, and hardware DRAM bandwidth remain `N/A`; they are
+not inferred from the proxy.
 
 Formal evidence is compressed numeric request/cycle data, GPU telemetry,
 configuration, metrics, SQLite state, and source attempt directories. Generated

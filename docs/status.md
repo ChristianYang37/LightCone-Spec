@@ -14,8 +14,17 @@ Empirical status: **PAPER-V2 RUN ACTIVE AFTER ONLINESPEC V19 DEPLOYMENT**.
 - `paper-v2` keeps the 21-node order and now has 1,960 static jobs by running compatible conditions as measured segments on one
   resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
   evidence uses six.
-- The active SGLang semantic marker is `paper-v1-nextn-shadow-v19`; cohort telemetry
-  is sized for a complete measured cell rather than one request.
+- The next deployed SGLang semantic marker is `paper-v1-nextn-shadow-v20`.
+  It raises only the DFlash BF16 reconstruction KL envelope from 32 to 64
+  numerical units; finite, valid-token masking, relative-RMS, and publication
+  checks remain fail-closed.
+- The pending soft-gate migration reinterprets ITL/TTFT SLOs as report-only,
+  replaces seven affected width-4 cells, selects one hard-feasible public width,
+  and reopens exactly 20 E3b-pilot plus 132 E3b-final rows. The unrelated 51
+  satisfied E2 dependency rows and 36 exploratory exclusions remain skipped.
+- AutoDL blocks privileged NCU counters. The raw blocked row is preserved and
+  an unprivileged PyTorch/Nsys/NVML activity proxy is added without claiming
+  occupancy, warp-stall, SM-issue, or hardware-bandwidth measurements.
 - Full TTS remains faithful request-reset `c1`. E3b uses matched `c1` for every
   method; E5 uses TTS-LoRA-Batched, not Full TTS, for concurrency sweeps.
 - Formal TTS, L0-naive, LightCone, LightCone-candidate, DSpark-LightCone, and

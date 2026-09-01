@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import gzip
 import itertools
 import json
@@ -39,6 +40,7 @@ from .metrics import (
     benjamini_hochberg,
     block_bootstrap_interval,
     committed_goodput,
+    derive_feasibility_semantics,
     holm_decisions,
     normalize_attempt_semantics,
     paired_bca_interval,
@@ -170,6 +172,7 @@ def _records_scientific_rejection(job: Job) -> bool:
     return (
         job.node == "S10-reconciliation"
         or job.node == "bugfix-reconciliation-v1"
+        or job.node in {"soft-gate-width-v1", "profile-proxy-v1"}
         or job.node == "E3-width-calibration"
         or job.method in CANDIDATE_METHODS
         or bool(job.parameters.get("interface_fit"))
@@ -199,7 +202,9 @@ def _scientific_rejection(
         {
             "scientific_outcome": "rejected",
             "feasible": False,
+            "hard_feasible": False,
             "error": str(error),
+            "slo_semantics": "report_only_v2",
         }
     )
     rejected.setdefault(
@@ -516,6 +521,130 @@ def _energy_from_csv(path: Path, offset: int = 0) -> float | None:
     return sum(max(values) - min(values) for values in by_gpu.values())
 
 
+def _gpu_activity_from_csv(path: Path, offset: int = 0) -> dict[str, object]:
+    samples: dict[str, list[float]] = {
+        "gpu_util_pct": [],
+        "memory_util_pct": [],
+        "power_w": [],
+        "sm_clock_mhz": [],
+    }
+    if path.is_file():
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode("utf-8").splitlines()
+        for line in lines:
+            fields = [part.strip() for part in line.split(",")]
+            for name, index in (
+                ("gpu_util_pct", 3),
+                ("memory_util_pct", 4),
+                ("power_w", 5),
+                ("sm_clock_mhz", 8),
+            ):
+                if len(fields) <= index or fields[index] == "N/A":
+                    continue
+                try:
+                    samples[name].append(float(fields[index]))
+                except ValueError:
+                    continue
+    output: dict[str, object] = {"sample_count": max(map(len, samples.values()), default=0)}
+    for name, values in samples.items():
+        output[f"{name}_mean"] = float(np.mean(values)) if values else "N/A"
+        output[f"{name}_max"] = max(values) if values else "N/A"
+    return output
+
+
+def _activity_trace_summary(directory: Path) -> dict[str, object]:
+    paths = sorted(directory.glob("**/*.json")) + sorted(directory.glob("**/*.json.gz"))
+    kernel_intervals: list[tuple[float, float]] = []
+    kernel_time_us = 0.0
+    memcpy_time_us = 0.0
+    cpu_time_us = 0.0
+    kernel_count = 0
+    memcpy_count = 0
+    for path in paths:
+        opener = gzip.open if path.suffix == ".gz" else open
+        try:
+            with opener(path, "rt", encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (OSError, json.JSONDecodeError):
+            continue
+        events = payload.get("traceEvents", []) if isinstance(payload, dict) else []
+        for event in events:
+            if not isinstance(event, dict) or event.get("ph") != "X":
+                continue
+            duration = event.get("dur")
+            timestamp = event.get("ts")
+            if not isinstance(duration, (int, float)) or duration < 0:
+                continue
+            category = str(event.get("cat", "")).lower()
+            name = str(event.get("name", "")).lower()
+            if "kernel" in category or category == "gpu" or "kernel" in name:
+                kernel_count += 1
+                kernel_time_us += float(duration)
+                if isinstance(timestamp, (int, float)):
+                    kernel_intervals.append(
+                        (float(timestamp), float(timestamp) + float(duration))
+                    )
+            elif "memcpy" in category or "memcpy" in name or "memset" in name:
+                memcpy_count += 1
+                memcpy_time_us += float(duration)
+            elif "cpu_op" in category:
+                cpu_time_us += float(duration)
+    merged: list[list[float]] = []
+    for start, end in sorted(kernel_intervals):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    busy_us = sum(end - start for start, end in merged)
+    gap_us = sum(
+        max(0.0, right[0] - left[1]) for left, right in zip(merged, merged[1:], strict=False)
+    )
+    overlap_ratio = (
+        max(0.0, 1.0 - busy_us / kernel_time_us) if kernel_time_us > 0 else "N/A"
+    )
+    return {
+        "trace_files": [str(path) for path in paths],
+        "kernel_count": kernel_count,
+        "kernel_time_us": kernel_time_us,
+        "gpu_busy_time_us": busy_us,
+        "gpu_gap_time_us": gap_us,
+        "stream_overlap_ratio": overlap_ratio,
+        "memcpy_count": memcpy_count,
+        "memcpy_time_us": memcpy_time_us,
+        "cpu_operator_time_us": cpu_time_us,
+    }
+
+
+def _nsys_csv_summary(payload: str) -> dict[str, object]:
+    """Preserve activity-report totals without inventing hardware counters."""
+
+    lines = [line for line in payload.splitlines() if line.strip()]
+    header = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if "Name" in line or "Operation" in line or "API Function" in line
+        ),
+        None,
+    )
+    if header is None:
+        return {"row_count": 0, "numeric_totals": {}}
+    rows = list(csv.DictReader(lines[header:]))
+    totals: dict[str, float] = {}
+    for row in rows:
+        for name, value in row.items():
+            if value is None or name is None or "%" in name:
+                continue
+            cleaned = value.strip().replace(",", "")
+            try:
+                number = float(cleaned)
+            except ValueError:
+                continue
+            totals[name.strip()] = totals.get(name.strip(), 0.0) + number
+    return {"row_count": len(rows), "numeric_totals": totals}
+
+
 def _position_survival(rounds: object) -> list[float] | str:
     if not isinstance(rounds, list):
         return "N/A"
@@ -798,7 +927,7 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
             or config.get("method") not in {"target_only", "static"}
             or not isinstance(load, str)
             or not load.startswith("closed_loop_c")
-            or metrics.get("slo_pass") is not True
+            or not _capacity_feasible_row(metrics)
         ):
             continue
         concurrency = int(load.removeprefix("closed_loop_c"))
@@ -964,6 +1093,29 @@ def _slo_metrics(
     completion_rate = completed / offered if offered else 0.0
     error_rate = errors / offered if offered else 1.0
     return pass_rate, (pass_rate >= 0.99 and error_rate <= 0.001 and completion_rate >= 0.999)
+
+
+def _hard_feasible(metrics: dict[str, Any]) -> bool:
+    value = metrics.get("hard_feasible")
+    if isinstance(value, bool):
+        return value
+    outcomes = metrics.get("request_outcomes")
+    if isinstance(outcomes, dict):
+        offered = int(outcomes.get("offered", 0) or 0)
+        completed = int(outcomes.get("completed", offered) or 0)
+        if completed != offered or any(
+            int(outcomes.get(name, 0) or 0)
+            for name in ("error", "timed_out", "cancelled", "unfinished")
+        ):
+            return False
+    return metrics.get("feasible") is not False and all(
+        int(metrics.get(counter, 0) or 0) == 0 for counter in SAFETY_COUNTERS
+    )
+
+
+def _capacity_feasible_row(metrics: dict[str, Any]) -> bool:
+    value = metrics.get("capacity_feasible")
+    return value if isinstance(value, bool) else _hard_feasible(metrics)
 
 
 def _exercise_request_fault(client, failure: str, prompt, max_new_tokens: int) -> bool:
@@ -1364,10 +1516,11 @@ def _execute_cell(
                 )
             topology = str(runtime_job.parameters.get("topology", "tp1_dp1"))
             profiler = runtime_job.parameters.get("profiler")
-            if profiler in {"nvtx", "nsys", "ncu"}:
+            if profiler in {"nvtx", "nsys", "ncu", "activity_proxy"}:
                 client.start_profile(
                     output_dir=str(output_dir / "torch-profile"),
-                    cuda_range=profiler in {"nsys", "ncu"},
+                    cuda_range=profiler in {"nsys", "ncu", "activity_proxy"},
+                    activity_proxy=profiler == "activity_proxy",
                 )
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
@@ -1487,7 +1640,7 @@ def _execute_cell(
                     drain_seconds=E5_DRAIN_SECONDS,
                 )
                 results, elapsed = scheduled.results, scheduled.elapsed_seconds
-            if profiler in {"nvtx", "nsys", "ncu"}:
+            if profiler in {"nvtx", "nsys", "ncu", "activity_proxy"}:
                 client.stop_profile()
             if request_scoped:
                 _wait_request_scope_release(client)
@@ -1551,7 +1704,10 @@ def _execute_cell(
                     {
                         "scientific_outcome": scientific_outcome,
                         "feasible": False,
+                        "hard_feasible": False,
+                        "capacity_feasible": False,
                         "slo_pass": False,
+                        "slo_semantics": "report_only_v2",
                         "error": f"{len(incomplete)} requests did not complete at registered load",
                         "duration_seconds": elapsed,
                         "committed_tokens": committed,
@@ -1587,6 +1743,20 @@ def _execute_cell(
             reserved_hbm = int(after["peak_hbm_reserved_bytes"])
             nvml_hbm = _peak_hbm_from_csv(server.output_dir / "gpu.csv", session_offsets["gpu.csv"])
             energy_mj = _energy_from_csv(server.output_dir / "gpu.csv", session_offsets["gpu.csv"])
+            activity_proxy = (
+                {
+                    "trace": _activity_trace_summary(output_dir / "torch-profile"),
+                    "nvml": _gpu_activity_from_csv(
+                        server.output_dir / "gpu.csv", session_offsets["gpu.csv"]
+                    ),
+                    "nvml_energy_mj": _energy_from_csv(
+                        server.output_dir / "gpu.csv", session_offsets["gpu.csv"]
+                    )
+                    or "N/A",
+                }
+                if profiler == "activity_proxy"
+                else None
+            )
             kv_capacity = after.get("kv_token_capacity")
             native_intervals = [value for result in results for value in result.inter_token_ms]
             native_itl = float(np.quantile(native_intervals, 0.99)) if native_intervals else 0.0
@@ -1647,6 +1817,16 @@ def _execute_cell(
                 "executed_flops": "N/A",
                 "hbm_bytes_per_committed_token": "N/A",
             }
+            if activity_proxy is not None:
+                metrics.update(
+                    measurement_scope="unprivileged_activity_proxy",
+                    activity_proxy=activity_proxy,
+                    ncu_hardware_counters="BLOCKED",
+                    occupancy="N/A",
+                    warp_stall_reasons="N/A",
+                    sm_issue_efficiency="N/A",
+                    hardware_dram_bandwidth="N/A",
+                )
             checkpoints = runtime_job.parameters.get("generation_checkpoints")
             if isinstance(checkpoints, (list, tuple)):
                 metrics["trajectory_checkpoints"] = _trajectory_checkpoint_metrics(
@@ -1823,6 +2003,7 @@ def _execute_cell(
                 metrics["controlled_candidate_compared"] = True
                 metrics["controlled_candidate_equal"] = True
             if job.parameters.get("workload") != "failure_injection":
+                metrics.update(derive_feasibility_semantics(raw_config, metrics))
                 _validate_measured_metrics(metrics)
             elif not (
                 metrics.get("recovery_health_passed") and metrics.get("expected_action_passed")
@@ -2367,6 +2548,9 @@ def _complete_infeasible_startup(
         {
             "scientific_outcome": "infeasible",
             "feasible": False,
+            "hard_feasible": False,
+            "capacity_feasible": False,
+            "slo_semantics": "report_only_v2",
             "error": f"{type(error).__name__}: {error}",
             "request_outcomes": {
                 "offered": 0,
@@ -2437,6 +2621,9 @@ def _complete_blocked_profiler(
         {
             "scientific_outcome": "blocked",
             "feasible": False,
+            "hard_feasible": False,
+            "capacity_feasible": "N/A",
+            "slo_semantics": "report_only_v2",
             "profiler": job.parameters.get("profiler"),
             "blocked_reason": reason,
             "error": reason,
@@ -2510,9 +2697,7 @@ def _select_e1_common_load(state: StateStore, expected_per_load: int) -> str:
     counts = Counter(
         str(config["load"])
         for config, metrics in _metric_rows(state, "E1-common-load")
-        if metrics.get("slo_pass") is True
-        and metrics.get("feasible") is not False
-        and all(metrics.get(counter, 0) == 0 for counter in SAFETY_COUNTERS)
+        if _capacity_feasible_row(metrics)
     )
     feasible = [load for load, count in counts.items() if count == expected_per_load]
     if not feasible:
@@ -2522,8 +2707,7 @@ def _select_e1_common_load(state: StateStore, expected_per_load: int) -> str:
 
 def _safe_screen_row(metrics: dict[str, Any]) -> bool:
     return (
-        metrics.get("feasible") is not False
-        and metrics.get("slo_pass") is True
+        _capacity_feasible_row(metrics)
         and isinstance(metrics.get("peak_hbm_bytes"), (int, float))
         and float(metrics["peak_hbm_bytes"]) > 0
         and isinstance(metrics.get("kv_capacity"), (int, float))
@@ -2546,8 +2730,7 @@ def _select_confidence_weight(state: StateStore) -> float:
             metrics.get("peak_hbm_bytes"),
         )
         if (
-            metrics.get("slo_pass") is not True
-            or metrics.get("feasible") is False
+            not _hard_feasible(metrics)
             or any(metrics.get(counter) != 0 for counter in SAFETY_COUNTERS)
             or any(
                 not isinstance(value, (int, float))
@@ -2640,7 +2823,7 @@ def _tts_batched_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
 def _select_tts_batched_geometry(state: StateStore) -> dict[str, Any]:
     candidates = []
     for config, metrics in _metric_rows(state, "TTS-batched-calibration"):
-        if metrics.get("feasible") is False:
+        if not _hard_feasible(metrics):
             continue
         if any(int(metrics.get(counter, 0)) for counter in SAFETY_COUNTERS):
             continue
@@ -2703,31 +2886,60 @@ def _deployment_width_jobs(state: StateStore) -> tuple[Job, ...]:
 
 
 def _select_deployment_widths(state: StateStore) -> dict[str, int]:
-    groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    methods = ("static", "tts", "l0_naive", "lightcone")
+    regimes = (
+        "long_input_short_output",
+        "short_input_long_generation",
+        "multi_turn_shared_prefix",
+    )
+    groups: dict[tuple[str, str, int], dict[str, Any]] = {}
     for config, metrics in _metric_rows(state, "E3-width-calibration"):
+        parameters = config.get("parameters", {})
+        regime = parameters.get("regime")
+        method = str(config.get("method"))
+        width = config.get("width")
         if (
-            metrics.get("slo_pass") is True
-            and metrics.get("feasible") is not False
-            and all(metrics.get(counter, 0) == 0 for counter in SAFETY_COUNTERS)
+            method in methods
+            and regime in regimes
+            and isinstance(width, int)
+            and _hard_feasible(metrics)
+            and isinstance(metrics.get("goodput"), (int, float))
+            and float(metrics["goodput"]) > 0
         ):
-            groups.setdefault((config["method"], int(config["width"])), []).append(metrics)
-    selected = {}
-    for method in ("static", "tts", "l0_naive", "lightcone"):
-        candidates = []
-        for width in (4, 8, 16):
-            rows = groups.get((method, width), [])
-            if len(rows) == 3:
-                candidates.append(
-                    (
-                        -float(np.mean([row["goodput"] for row in rows])),
-                        max(int(row["peak_hbm_bytes"]) for row in rows),
-                        width,
-                    )
-                )
-        if not candidates:
-            raise ScientificFailure(f"deployment width tuning failed for {method}")
-        selected[method] = min(candidates)[-1]
-    return selected
+            groups[(method, str(regime), width)] = metrics
+
+    common = [
+        width
+        for width in (4, 8, 16)
+        if all((method, regime, width) in groups for method in methods for regime in regimes)
+    ]
+    if not common:
+        raise ScientificFailure("deployment width tuning found no hard-feasible common width")
+
+    best_by_condition = {
+        (method, regime): max(
+            float(groups[(method, regime, width)]["goodput"]) for width in common
+        )
+        for method in methods
+        for regime in regimes
+    }
+    candidates = []
+    for width in common:
+        ratios = [
+            float(groups[(method, regime, width)]["goodput"])
+            / best_by_condition[(method, regime)]
+            for method in methods
+            for regime in regimes
+        ]
+        geometric_mean = float(np.exp(np.mean(np.log(ratios))))
+        peak_hbm = max(
+            int(groups[(method, regime, width)]["peak_hbm_bytes"])
+            for method in methods
+            for regime in regimes
+        )
+        candidates.append((-geometric_mean, peak_hbm, width))
+    selected = min(candidates)[-1]
+    return {method: selected for method in methods}
 
 
 def _e6_load_jobs() -> tuple[Job, ...]:
@@ -2810,7 +3022,7 @@ def _complete_e6_interface_rows(
         if set(modes) != {"lora", "full"}:
             raise ScientificFailure(f"{parent.job_id} lacks LoRA/Full interface results")
         supported = {
-            mode for mode, (_, metrics) in modes.items() if metrics.get("feasible") is not False
+            mode for mode, (_, metrics) in modes.items() if _hard_feasible(metrics)
         }
         capabilities[parent.model] = supported
         feasible = supported == {"lora", "full"}
@@ -2826,10 +3038,13 @@ def _complete_e6_interface_rows(
             {
                 "scientific_outcome": "completed" if feasible else "blocked",
                 "feasible": feasible,
+                "hard_feasible": feasible,
+                "capacity_feasible": "N/A",
                 "slo_pass": feasible,
+                "slo_semantics": "report_only_v2",
                 "components": {
                     mode: {
-                        "feasible": metrics.get("feasible") is not False,
+                        "feasible": _hard_feasible(metrics),
                         "error": metrics.get("error"),
                         "source_attempt": metrics.get("source_attempt"),
                         "source_attempt_dir": metrics.get("source_attempt_dir"),
@@ -2855,11 +3070,7 @@ def _complete_e6_interface_rows(
 def _select_e6_common_loads(state: StateStore, capabilities: dict[str, set[str]]) -> dict[str, str]:
     counts: Counter[tuple[str, str]] = Counter()
     for config, metrics in _metric_rows(state, "E6-common-load"):
-        if (
-            metrics.get("slo_pass") is True
-            and metrics.get("feasible") is not False
-            and all(metrics.get(counter, 0) == 0 for counter in SAFETY_COUNTERS)
-        ):
+        if _capacity_feasible_row(metrics):
             counts[(str(config["model"]), str(config["load"]))] += 1
     selected = {}
     for model in {key[0] for key in counts}:
@@ -2957,7 +3168,7 @@ def _complete_segment_parent(
         outcomes.update(row["metrics"].get("request_outcomes", {}))
     committed = sum(int(row["metrics"].get("committed_tokens", 0)) for row in rows)
     duration = sum(float(row["metrics"].get("duration_seconds", 0.0)) for row in rows)
-    feasible = all(row["metrics"].get("feasible") is not False for row in rows)
+    feasible = all(_hard_feasible(row["metrics"]) for row in rows)
     metrics = {
         "scientific_outcome": "completed" if feasible else "rejected",
         "segments": rows,
@@ -2973,6 +3184,7 @@ def _complete_segment_parent(
     }
     for counter in SAFETY_COUNTERS:
         metrics[counter] = sum(int(row["metrics"].get(counter, 0)) for row in rows)
+    metrics.update(derive_feasibility_semantics(parent.to_dict(), metrics))
     _write_json(output_dir / "config.json", parent.to_dict())
     _write_json(output_dir / "metrics.json", metrics)
     state.complete(parent.job_id, attempt)
@@ -3625,7 +3837,7 @@ def _rank_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, 
         )
         for config, metrics in _metric_rows(state, node)
         if config["method"] in {"lightcone_candidate", "lightcone"}
-        and metrics.get("feasible") is not False
+        and _hard_feasible(metrics)
         and config.get("parameters", {}).get("workload")
         not in {"confidence_calibration", "dspark_finalist_confirmation"}
     ]
@@ -3638,7 +3850,7 @@ def _select_tts_recipe(state: StateStore) -> dict[str, Any]:
     rows = _metric_rows(state, "TTS-Cal")
     rows.extend(_metric_rows(state, "TTS-Cal-confirmation"))
     for config, metrics in rows:
-        if metrics.get("feasible") is False:
+        if not _hard_feasible(metrics):
             continue
         parameters = {
             key: value
@@ -3669,7 +3881,7 @@ def _job_from_metric_config(config: dict[str, Any]) -> Job:
 def _tts_confirmation_jobs(state: StateStore) -> tuple[Job, ...]:
     candidates = []
     for config, metrics in _metric_rows(state, "TTS-Cal"):
-        if metrics.get("feasible") is False:
+        if not _hard_feasible(metrics):
             continue
         candidates.append(
             (
@@ -3745,7 +3957,7 @@ def _select_tts_s10_recipe(state: StateStore) -> dict[str, Any]:
         valid = (
             blocks == set(range(4))
             and len(rows) == 4
-            and all(metrics.get("feasible") is not False for _, metrics in rows)
+            and all(_hard_feasible(metrics) for _, metrics in rows)
             and all(int(metrics.get("updates_published", 0)) >= 1 for _, metrics in rows)
             and all(
                 all(int(metrics.get(counter, 0)) == 0 for counter in SAFETY_COUNTERS)
@@ -3896,7 +4108,7 @@ def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
     for config, metrics in _metric_rows(state, "E1"):
         if config["method"] != "lightcone_candidate":
             continue
-        if metrics.get("feasible") is False:
+        if not _hard_feasible(metrics):
             continue
         parameters = {
             name: value
@@ -3955,7 +4167,7 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
     for config, metrics in rows:
         if config["method"] != "lightcone_candidate":
             continue
-        if metrics.get("feasible") is False:
+        if not _hard_feasible(metrics):
             continue
         goodput = float(metrics["goodput"])
         user_speed = metrics.get("per_user_generation_speed")
@@ -4076,7 +4288,7 @@ def _natural_spline_fit(
 def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
     grouped: dict[tuple[object, ...], dict[int, list[float]]] = {}
     for config, metrics in _metric_rows(state, node):
-        if metrics.get("feasible") is False:
+        if not _hard_feasible(metrics):
             continue
         context = config.get("context")
         if not isinstance(context, int):
@@ -4427,6 +4639,8 @@ def _e5_frontier_statistic(state: StateStore) -> dict[str, object] | None:
         return None
     points: dict[tuple[int, str], list[tuple[float, float]]] = {}
     for config, metrics in _metric_rows(state, "E5-final"):
+        if not _hard_feasible(metrics):
+            continue
         if config.get("backend") not in {"NONE", "DFLASH"}:
             continue
         block = config.get("block")
@@ -4519,7 +4733,7 @@ def _select_e0_recipes(state: StateStore) -> dict[str, dict[str, Any]]:
         actual = {name: config["parameters"].get(name) for name in expected}
         if json.dumps(actual, sort_keys=True) != json.dumps(expected, sort_keys=True):
             raise ScientificFailure(f"E0 {method} source-transfer recipe drifted")
-        if metrics.get("feasible") is False or metrics.get("slo_pass") is not True:
+        if not _hard_feasible(metrics):
             continue
         key = "|".join((config["model"], config["backend"], method))
         recipes[key] = dict(expected)
@@ -5712,6 +5926,205 @@ def _repair_metric_dedup_e5_resume_v1(state: StateStore) -> None:
     state.set_selection("formal_metric_dedup_e5_resume_version", audit)
 
 
+def _soft_gate_width_replacements(state: StateStore) -> tuple[Job, ...]:
+    rows = []
+    for source in state.jobs("E3-width-calibration-segments"):
+        if source.width != 4 or source.method not in {"tts", "l0_naive", "lightcone"}:
+            continue
+        directory = state.completed_attempt_dir(source.job_id)
+        if directory is None or not (directory / "metrics.json").is_file():
+            continue
+        metrics = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
+        if int(metrics.get("fallbacks", 0)) < 1:
+            continue
+        rows.append(
+            replace(
+                source,
+                job_id=f"soft-gate-width-v1__{source.job_id}",
+                node="soft-gate-width-v1",
+                ordinal=len(rows),
+                parameters={
+                    **source.parameters,
+                    "source_node": "E3-width-calibration",
+                    "replaces_job_id": source.job_id,
+                    "reconciliation_kind": "dflash_reconstruction_kl64",
+                },
+            )
+        )
+    return tuple(rows)
+
+
+def _activity_proxy_job(state: StateStore) -> Job:
+    rows = [
+        job
+        for job in state.jobs("E4-profile")
+        if job.parameters.get("profiler") == "ncu"
+    ]
+    if len(rows) != 1:
+        raise ScientificFailure(f"activity proxy expected one NCU row, found {len(rows)}")
+    source = rows[0]
+    return replace(
+        source,
+        job_id=f"profile-proxy-v1__{source.job_id}",
+        node="profile-proxy-v1",
+        ordinal=0,
+        parameters={
+            **source.parameters,
+            "profiler": "activity_proxy",
+            "source_node": "E4-profile",
+            "reconciliation_kind": "unprivileged_activity_proxy",
+        },
+    )
+
+
+def _write_activity_proxy_stats(
+    config: ExperimentConfig, state: StateStore, job: Job
+) -> dict[str, object]:
+    directory = state.completed_attempt_dir(job.job_id)
+    if directory is None:
+        raise ScientificFailure("activity proxy completed without an attempt directory")
+    reports = tuple(
+        (config.run_dir / "sessions" / "profile-proxy-v1").glob("**/*.nsys-rep")
+    )
+    summaries: dict[str, object] = {}
+    for report in (
+        "cuda_gpu_kern_sum",
+        "cuda_api_sum",
+        "cuda_kern_exec_sum",
+        "cuda_gpu_mem_time_sum",
+        "cuda_gpu_mem_size_sum",
+    ):
+        if len(reports) != 1:
+            summaries[report] = "N/A"
+            continue
+        result = subprocess.run(
+            [
+                str(config.profiler_tools["nsys"]),
+                "stats",
+                "--report",
+                report,
+                "--format",
+                "csv",
+                str(reports[0]),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        path = directory / f"nsys-{report}.csv"
+        path.write_text(result.stdout, encoding="utf-8")
+        summaries[report] = {
+            "path": str(path),
+            "available": result.returncode == 0 and bool(result.stdout.strip()),
+            "activity_totals": _nsys_csv_summary(result.stdout),
+            "error": None if result.returncode == 0 else result.stderr.strip()[-1000:],
+        }
+    output = {
+        "measurement_scope": "unprivileged_activity_proxy",
+        "nsys_report": str(reports[0]) if len(reports) == 1 else "N/A",
+        "summaries": summaries,
+        "ncu_hardware_counters": "BLOCKED",
+    }
+    _write_json(directory / "activity-proxy-summary.json", output)
+    return output
+
+
+def _reopen_soft_gate_e3b(state: StateStore) -> tuple[int, int]:
+    reopened = state.selection("formal_soft_gate_e3b_reopened", None)
+    if isinstance(reopened, dict):
+        return int(reopened["pilot"]), int(reopened["final"])
+    pilot = state.reopen_skipped_errors(
+        ("E3b-pilot",),
+        "deployment width tuning failed for tts",
+        reason="hard-feasible common-width selector repair",
+    )
+    final = state.reopen_skipped_errors(
+        ("E3b-final",),
+        "E3b-pilot did not complete",
+        reason="E3b pilot dependency restored",
+    )
+    if (pilot, final) != (20, 132):
+        raise ScientificFailure(
+            f"soft-gate resume expected 20/132 E3b rows, found {(pilot, final)}"
+        )
+    state.set_selection("formal_soft_gate_e3b_reopened", {"pilot": pilot, "final": final})
+    return pilot, final
+
+
+def _run_soft_gate_resume_v1(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    previous = state.selection("formal_soft_gate_resume_version", None)
+    if isinstance(previous, dict) and int(previous.get("version", 0)) >= 1:
+        return
+    if state.selection("formal_bugfix_reconciliation_version", 0) < 1:
+        return
+
+    replacements = _soft_gate_width_replacements(state)
+    if len(replacements) != 7:
+        raise ScientificFailure(
+            f"soft-gate reconciliation expected 7 width-4 rows, found {len(replacements)}"
+        )
+    exclusions = set(state.selection("formal_evidence_exclusions", []))
+    exclusions.update(str(job.parameters["replaces_job_id"]) for job in replacements)
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    state.add_internal_jobs(replacements, storage_node="soft-gate-width-v1")
+    _run_pending_jobs(
+        config,
+        state,
+        "soft-gate-width-v1",
+        stop_event,
+        state.pending_jobs("soft-gate-width-v1"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "soft-gate-width-v1")
+
+    widths = _select_deployment_widths(state)
+    state.set_selection("deployment_widths", widths)
+    state.set_selection("deployment_widths_tuned", True)
+
+    proxy = _activity_proxy_job(state)
+    state.add_internal_jobs((proxy,), storage_node="profile-proxy-v1")
+    _run_pending_jobs(
+        config,
+        state,
+        "profile-proxy-v1",
+        stop_event,
+        state.pending_jobs("profile-proxy-v1"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "profile-proxy-v1")
+    proxy_rows = [
+        metrics
+        for config_row, metrics in _metric_rows(state, "E4-profile")
+        if config_row.get("parameters", {}).get("profiler") == "activity_proxy"
+    ]
+    if len(proxy_rows) != 1 or not _hard_feasible(proxy_rows[0]):
+        raise ScientificFailure("unprivileged activity proxy did not complete safely")
+    proxy_summary = _write_activity_proxy_stats(config, state, proxy)
+
+    pilot, final = _reopen_soft_gate_e3b(state)
+    audit = {
+        "version": 1,
+        "kl_units": 64.0,
+        "width_replacement_cells": len(replacements),
+        "common_deployment_width": next(iter(widths.values())),
+        "deployment_widths": widths,
+        "e3b_pilot_reopened": pilot,
+        "e3b_final_reopened": final,
+        "profile_proxy": proxy_summary,
+    }
+    path = config.run_dir / "stages" / "soft-gate-resume-v1" / "reconciliation.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, audit)
+    state.set_selection("formal_soft_gate_resume_version", audit)
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -5752,6 +6165,11 @@ class PaperRunner:
                 )
                 _repair_e0_e6_partial_resume_v1(self.state)
                 _repair_metric_dedup_e5_resume_v1(self.state)
+                _run_soft_gate_resume_v1(
+                    self.config,
+                    self.state,
+                    self.stop_event,
+                )
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)

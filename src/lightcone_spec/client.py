@@ -356,12 +356,23 @@ class SGLangClient:
                 raise RuntimeError("SGLang cache reset failed")
 
     def start_profile(
-        self, *, output_dir: str | None = None, cuda_range: bool = False
+        self,
+        *,
+        output_dir: str | None = None,
+        cuda_range: bool = False,
+        activity_proxy: bool = False,
     ) -> None:
+        activities = (
+            ["CPU", "GPU", "MEM", "CUDA_PROFILER"]
+            if activity_proxy
+            else ["CUDA_PROFILER"]
+            if cuda_range
+            else ["CPU", "GPU"]
+        )
         body: dict[str, object] = {
-            "activities": ["CUDA_PROFILER"] if cuda_range else ["CPU", "GPU"],
+            "activities": activities,
             "with_stack": False,
-            "record_shapes": False,
+            "record_shapes": activity_proxy,
         }
         if output_dir is not None:
             body["output_dir"] = output_dir

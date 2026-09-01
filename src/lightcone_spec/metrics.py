@@ -67,6 +67,48 @@ def _attempt_requests(directory: Path) -> list[dict[str, object]]:
     return []
 
 
+def _capacity_cell(config: dict[str, object]) -> bool:
+    parameters = config.get("parameters")
+    parameters = parameters if isinstance(parameters, dict) else {}
+    node = str(parameters.get("source_node", config.get("node", "")))
+    if node.endswith("-segments"):
+        node = node[: -len("-segments")]
+    return node in {"E1-common-load", "E3a", "E6-common-load"} or node.startswith(
+        "E5"
+    )
+
+
+def derive_feasibility_semantics(
+    config: dict[str, object], metrics: dict[str, object]
+) -> dict[str, object]:
+    """Separate runtime correctness, capacity, and report-only latency SLOs."""
+
+    outcomes = metrics.get("request_outcomes")
+    outcomes = outcomes if isinstance(outcomes, dict) else {}
+    offered = int(outcomes.get("offered", metrics.get("request_count", 0)) or 0)
+    completed = int(outcomes.get("completed", metrics.get("request_count", 0)) or 0)
+    incomplete = sum(
+        int(outcomes.get(name, 0) or 0)
+        for name in ("error", "timed_out", "cancelled", "unfinished")
+    )
+    scientific_outcome = str(metrics.get("scientific_outcome", "completed"))
+    safety_clean = all(int(metrics.get(counter, 0) or 0) == 0 for counter in SAFETY_COUNTERS)
+    hard_feasible = (
+        metrics.get("status") != "failed"
+        and scientific_outcome not in {"blocked", "infeasible", "rejected"}
+        and metrics.get("compatible") is not False
+        and safety_clean
+        and incomplete == 0
+        and (offered == 0 or completed == offered)
+    )
+    capacity = _capacity_cell(config)
+    return {
+        "hard_feasible": hard_feasible,
+        "capacity_feasible": hard_feasible if capacity else "N/A",
+        "slo_semantics": "report_only_v2",
+    }
+
+
 def normalize_attempt_semantics(
     config: dict[str, object], metrics: dict[str, object], directory: Path
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -94,6 +136,7 @@ def normalize_attempt_semantics(
         metric_semantics="per_request_native_v2",
         per_user_generation_speed=speed if speed is not None else "N/A",
     )
+    normalized_metrics.update(derive_feasibility_semantics(normalized_config, normalized_metrics))
     return normalized_config, normalized_metrics
 
 

@@ -12,6 +12,7 @@ from lightcone_spec.metrics import (
     benjamini_hochberg,
     block_bootstrap_interval,
     committed_goodput,
+    derive_feasibility_semantics,
     hierarchical_request_interval,
     holm_decisions,
     normalize_attempt_semantics,
@@ -332,25 +333,117 @@ def test_metric_rows_deduplicates_bundled_parent_and_child_storage(tmp_path):
     assert rows[0][1]["goodput"] == 2.0
 
 
-def test_deployment_width_selector_rejects_infeasible_slo_rows(monkeypatch):
+def test_deployment_width_selector_requires_hard_feasible_common_width(monkeypatch):
     rows = []
+    regimes = (
+        "long_input_short_output",
+        "short_input_long_generation",
+        "multi_turn_shared_prefix",
+    )
     for method in ("static", "tts", "l0_naive", "lightcone"):
-        for _ in range(3):
+        for regime in regimes:
             rows.append(
                 (
-                    {"method": method, "width": 4},
+                    {"method": method, "width": 4, "parameters": {"regime": regime}},
                     {
-                        "slo_pass": True,
-                        "feasible": method != "tts",
+                        "slo_pass": False,
+                        "hard_feasible": method != "tts",
                         "goodput": 1.0,
                         "peak_hbm_bytes": 1,
-                        **{counter: 0 for counter in SAFETY_COUNTERS},
                     },
                 )
             )
     monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
-    with pytest.raises(runner.ScientificFailure, match="failed for tts"):
+    with pytest.raises(runner.ScientificFailure, match="no hard-feasible common width"):
         runner._select_deployment_widths(object())
+
+
+def test_deployment_width_selector_uses_report_only_slo_and_common_goodput(monkeypatch):
+    rows = []
+    regimes = (
+        "long_input_short_output",
+        "short_input_long_generation",
+        "multi_turn_shared_prefix",
+    )
+    for method in ("static", "tts", "l0_naive", "lightcone"):
+        for regime in regimes:
+            for width, goodput in ((4, 100.0), (8, 120.0), (16, 110.0)):
+                rows.append(
+                    (
+                        {
+                            "method": method,
+                            "width": width,
+                            "parameters": {"regime": regime},
+                        },
+                        {
+                            "slo_pass": width != 8,
+                            "hard_feasible": True,
+                            "goodput": goodput,
+                            "peak_hbm_bytes": width,
+                        },
+                    )
+                )
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+    assert runner._select_deployment_widths(object()) == {
+        method: 8 for method in ("static", "tts", "l0_naive", "lightcone")
+    }
+
+
+def test_feasibility_semantics_separate_slo_and_capacity():
+    complete = {
+        # Legacy rows sometimes copied the SLO decision into ``feasible``.
+        # The v2 loader derives hard feasibility from requests and safety.
+        "feasible": False,
+        "slo_pass": False,
+        "request_outcomes": {"offered": 2, "completed": 2},
+        **{counter: 0 for counter in SAFETY_COUNTERS},
+    }
+    ordinary = derive_feasibility_semantics(
+        {"node": "E3b-pilot", "parameters": {}}, complete
+    )
+    assert ordinary == {
+        "hard_feasible": True,
+        "capacity_feasible": "N/A",
+        "slo_semantics": "report_only_v2",
+    }
+    incomplete = derive_feasibility_semantics(
+        {"node": "E3a", "parameters": {}},
+        {
+            **complete,
+            "request_outcomes": {"offered": 2, "completed": 1, "timed_out": 1},
+        },
+    )
+    assert incomplete["hard_feasible"] is False
+    assert incomplete["capacity_feasible"] is False
+
+
+def test_activity_trace_proxy_summarizes_kernel_overlap(tmp_path):
+    trace = {
+        "traceEvents": [
+            {"ph": "X", "cat": "kernel", "name": "k1", "ts": 0, "dur": 10},
+            {"ph": "X", "cat": "kernel", "name": "k2", "ts": 5, "dur": 10},
+            {"ph": "X", "cat": "gpu_memcpy", "name": "memcpy", "ts": 20, "dur": 2},
+            {"ph": "X", "cat": "cpu_op", "name": "op", "ts": 0, "dur": 4},
+        ]
+    }
+    (tmp_path / "trace.json").write_text(json.dumps(trace))
+    summary = runner._activity_trace_summary(tmp_path)
+    assert summary["kernel_count"] == 2
+    assert summary["kernel_time_us"] == 20
+    assert summary["gpu_busy_time_us"] == 15
+    assert summary["stream_overlap_ratio"] == pytest.approx(0.25)
+    assert summary["memcpy_count"] == 1
+
+
+def test_nsys_activity_csv_parser_preserves_timing_totals():
+    summary = runner._nsys_csv_summary(
+        'Time (%),Total Time (ns),Instances,Avg (ns),Name\n'
+        '60.0,1200,2,600,"kernel_a"\n'
+        '40.0,800,4,200,"kernel_b"\n'
+    )
+    assert summary["row_count"] == 2
+    assert summary["numeric_totals"]["Total Time (ns)"] == 2000
+    assert summary["numeric_totals"]["Instances"] == 6
 
 
 def test_e2_ranking_uses_static_goodput_and_tts_native_user_speed(monkeypatch):

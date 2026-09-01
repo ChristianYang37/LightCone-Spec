@@ -395,6 +395,22 @@ def test_logit_reconstruction_ignores_only_masked_canvas_positions():
     assert rejected[3].item() == 0.0
 
 
+def test_logit_reconstruction_uses_kl64_bf16_envelope():
+    gate = _patched_logit_reconstruction_gate()
+    assert gate.__kwdefaults__["kl_units"] == 64.0
+    assert 0.002681 <= 64 * (1 / 128) ** 2
+    inference = torch.tensor([[[8.0, 8.0]]], dtype=torch.bfloat16)
+    quantized_drift = torch.tensor([[[8.0625, 7.90625]]], dtype=torch.bfloat16)
+    accepted = gate(
+        inference,
+        quantized_drift,
+        valid_mask=torch.tensor([[True]]),
+    )
+    assert accepted[4].item() > 32 * (1 / 128) ** 2
+    assert accepted[4].item() <= 64 * (1 / 128) ** 2
+    assert bool(accepted[0])
+
+
 def test_logit_reconstruction_empty_mask_cannot_publish():
     gate = _patched_logit_reconstruction_gate()
     logits = torch.zeros((1, 2, 4), dtype=torch.bfloat16)

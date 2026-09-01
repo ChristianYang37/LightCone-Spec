@@ -16,6 +16,7 @@ from lightcone_spec.runner import (
     _e2_missing_dependency_jobs,
     _exclude_redundant_e2_dependency_jobs,
     _ncu_permission_block_reason,
+    _reopen_soft_gate_e3b,
     _repair_completed_s10_downstream_resume,
     _repair_e0_e6_partial_resume_v1,
     _repair_metric_dedup_e5_resume_v1,
@@ -26,6 +27,7 @@ from lightcone_spec.runner import (
     _selection_for_job,
     _set_e2_expected_evidence,
     _skip_satisfied_e2_dependency_jobs,
+    _soft_gate_width_replacements,
     _upgrade_legacy_e0_materialization,
 )
 from lightcone_spec.state import StateStore
@@ -512,7 +514,13 @@ def test_e0_recipe_selection_injects_only_feasible_validated_methods(tmp_path: P
         (attempt_dir / "config.json").write_text(json.dumps(job.to_dict()))
         feasible = job.method != "onlinespec_opt"
         (attempt_dir / "metrics.json").write_text(
-            json.dumps({"feasible": feasible, "slo_pass": feasible})
+            json.dumps(
+                {
+                    "feasible": feasible,
+                    "slo_pass": feasible,
+                    "scientific_outcome": "completed" if feasible else "rejected",
+                }
+            )
         )
         attempt = state.start(job, (0, 1), attempt_dir)
         state.complete(job.job_id, attempt)
@@ -605,3 +613,77 @@ def test_completed_s10_repair_requeues_bundled_segments_and_downstream(
 
     _repair_completed_s10_downstream_resume(state)
     assert state.status_counts("E3-width-calibration-segments") == {"pending": 1}
+
+
+def test_soft_gate_width_reconciliation_materializes_exact_seven_replacements(
+    tmp_path: Path,
+):
+    state = StateStore(tmp_path)
+    methods = ("tts", "lightcone", "l0_naive")
+    counts = {"tts": 3, "lightcone": 3, "l0_naive": 1}
+    rows = []
+    ordinal = 0
+    for method in methods:
+        for index in range(counts[method]):
+            job = Job(
+                job_id=f"width4-{method}-{index}",
+                node="E3-width-calibration-segments",
+                ordinal=ordinal,
+                method=method,
+                model="Qwen/Qwen3-8B",
+                backend="DFLASH",
+                task="CalibrationMix",
+                width=4,
+            )
+            ordinal += 1
+            rows.append(job)
+    unaffected = replace(rows[0], job_id="width8-tts", ordinal=ordinal, width=8)
+    state.add_internal_jobs(tuple((*rows, unaffected)))
+    for index, job in enumerate((*rows, unaffected)):
+        attempt_dir = tmp_path / f"attempt-{index}"
+        attempt_dir.mkdir()
+        (attempt_dir / "config.json").write_text(json.dumps(job.to_dict()))
+        (attempt_dir / "metrics.json").write_text(
+            json.dumps({"fallbacks": 1, "hard_feasible": False})
+        )
+        attempt = state.start(job, (index % 2,), attempt_dir)
+        state.complete(job.job_id, attempt)
+
+    replacements = _soft_gate_width_replacements(state)
+
+    assert len(replacements) == 7
+    assert {job.method for job in replacements} == set(methods)
+    assert all(job.width == 4 for job in replacements)
+    assert all(job.parameters["reconciliation_kind"] == "dflash_reconstruction_kl64" for job in replacements)
+    assert {job.parameters["replaces_job_id"] for job in replacements} == {
+        job.job_id for job in rows
+    }
+
+
+def test_soft_gate_resume_reopens_exact_e3b_rows_once(tmp_path: Path):
+    state = StateStore(tmp_path)
+    pilot = tuple(
+        Job(f"pilot-{index}", "E3b-pilot", index, "static", "m", "DFLASH", "t")
+        for index in range(20)
+    )
+    final = tuple(
+        Job(f"final-{index}", "E3b-final", index, "static", "m", "DFLASH", "t")
+        for index in range(132)
+    )
+    intentional = Job("intentional", "E3b-final", 132, "static", "m", "DFLASH", "t")
+    state.add_jobs("E3b-pilot", pilot)
+    state.skip_pending("E3b-pilot", "deployment width tuning failed for tts")
+    state.add_jobs("E3b-final", (*final, intentional))
+    state.skip_pending("E3b-final", "E3b-pilot did not complete")
+    with state.connect() as connection:
+        connection.execute(
+            "UPDATE jobs SET error='intentional exploratory exclusion' WHERE job_id=?",
+            (intentional.job_id,),
+        )
+
+    assert _reopen_soft_gate_e3b(state) == (20, 132)
+    assert state.status_counts("E3b-pilot") == {"pending": 20}
+    assert state.status_counts("E3b-final") == {"pending": 132, "skipped": 1}
+    assert _reopen_soft_gate_e3b(state) == (20, 132)
+    assert state.status_counts("E3b-pilot") == {"pending": 20}
+    assert state.status_counts("E3b-final") == {"pending": 132, "skipped": 1}

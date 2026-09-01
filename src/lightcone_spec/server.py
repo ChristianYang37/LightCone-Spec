@@ -308,7 +308,7 @@ def server_command(
             ]
         )
     profile = job.parameters.get("profiler")
-    if profile == "nsys":
+    if profile in {"nsys", "activity_proxy"}:
         return [
             str(config.profiler_tools["nsys"]),
             "profile",
@@ -398,9 +398,12 @@ def _server_capacity(job: Job, adaptation: dict[str, Any] | None) -> int:
 
 
 class GpuSampler:
-    def __init__(self, gpus: tuple[int, ...], output: Path):
+    def __init__(
+        self, gpus: tuple[int, ...], output: Path, *, interval_seconds: float = 1.0
+    ):
         self.gpus = gpus
         self.output = output
+        self.interval_seconds = interval_seconds
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.started = False
@@ -454,7 +457,7 @@ class GpuSampler:
                         for line in fallback.stdout.splitlines():
                             fields = [part.strip() for part in line.split(",")]
                             stream.write(",".join((*fields[:6], "N/A", *fields[6:], "N/A")) + "\n")
-            self.stop_event.wait(1.0)
+            self.stop_event.wait(self.interval_seconds)
 
 
 class ServerProcess:
@@ -477,7 +480,13 @@ class ServerProcess:
         self.session_key = server_session_key(job, selection)
         self.process: subprocess.Popen[str] | None = None
         self.log = None
-        self.sampler = GpuSampler(gpus, output_dir / "gpu.csv")
+        self.sampler = GpuSampler(
+            gpus,
+            output_dir / "gpu.csv",
+            interval_seconds=(
+                0.1 if job.parameters.get("profiler") == "activity_proxy" else 1.0
+            ),
+        )
 
     def configure(self, job: Job, selection: dict[str, Any] | None) -> SGLangClient:
         if (
