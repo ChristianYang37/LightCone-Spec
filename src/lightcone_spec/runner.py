@@ -174,7 +174,10 @@ def _records_scientific_rejection(job: Job) -> bool:
         or job.node == "bugfix-reconciliation-v1"
         or job.node in {"soft-gate-width-v1", "profile-proxy-v1"}
         or job.node == "E3-width-calibration"
-        or job.node in {"E3b-pilot-segments", "E3b-final-segments"}
+        or (
+            job.node in {"E3b-pilot", "E3b-final"}
+            and "segment_index" in job.parameters
+        )
         or job.method in CANDIDATE_METHODS
         or bool(job.parameters.get("interface_fit"))
         or _screening_job(job)

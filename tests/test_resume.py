@@ -720,22 +720,25 @@ def test_e3b_safety_rejection_retries_once_then_records_terminal(tmp_path: Path)
     state.set_selection("formal_soft_gate_resume_version", {"version": 1})
     rejected = Job(
         "e3b-rejected",
-        "E3b-pilot-segments",
+        "E3b-pilot",
         0,
         "tts",
         "m",
         "DFLASH",
         "t",
+        parameters={"segment_index": 2},
     )
     runtime = Job(
         "e3b-runtime",
-        "E3b-pilot-segments",
+        "E3b-pilot",
         1,
         "tts",
         "m",
         "DFLASH",
         "t",
+        parameters={"segment_index": 2},
     )
+    parent = Job("e3b-parent", "E3b-pilot", 2, "tts", "m", "DFLASH", "t")
     state.add_internal_jobs((rejected, runtime), storage_node="E3b-pilot-segments")
     for job, error in (
         (rejected, "scientific safety failure: fallbacks=1"),
@@ -747,6 +750,7 @@ def test_e3b_safety_rejection_retries_once_then_records_terminal(tmp_path: Path)
         state.fail(job.job_id, attempt, error, retry=False)
 
     assert _records_scientific_rejection(rejected) is True
+    assert _records_scientific_rejection(parent) is False
     assert _repair_e3b_scientific_rejections(state) == 1
     assert {job.job_id for job in state.pending_jobs("E3b-pilot-segments")} == {
         rejected.job_id
