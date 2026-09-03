@@ -12,10 +12,12 @@ import yaml
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import E0_ONLINESPEC_RECIPES, Job, materialize
 from lightcone_spec.runner import (
+    ScientificFailure,
     _cleanup_interrupted_servers,
     _complete_blocked_profiler,
     _e2_keep_count,
     _e2_missing_dependency_jobs,
+    _e5_reference,
     _exclude_redundant_e2_dependency_jobs,
     _execution_allocations,
     _ncu_permission_block_reason,
@@ -1005,3 +1007,29 @@ def test_e3b_safety_rejection_retries_once_then_records_terminal(tmp_path: Path)
     }
     assert state.failed_attempts(rejected.job_id) == 1
     assert _repair_e3b_scientific_rejections(state) == 0
+
+
+@pytest.mark.parametrize("backend,expected", [("NONE", (4.0, 4)), ("DFLASH", (4.0, 4)), ("DSPARK", (3.0, 8))])
+def test_e5_trace_reference_shares_target_only_and_matches_static_panel(monkeypatch, backend, expected):
+    parents = materialize("E5-pilot")
+    job = next(j for j in parents if j.backend == backend
+               and j.method in {"target_only", "static"})
+    target = next(j for j in parents if j.method == "target_only")
+    dflash = next(j for j in parents if j.method == "static" and j.backend == "DFLASH")
+    dspark = next(j for j in parents if j.method == "static" and j.backend == "DSPARK")
+    def row(j, concurrency, rate, capacity=True):
+        return (replace(j, load=f"closed_loop_c{concurrency}").to_dict(),
+                {"capacity_feasible": capacity, "hard_feasible": capacity,
+                 "request_rate": rate, "slo_pass": False})
+    rows = [row(target, 2, 1.0), row(dflash, 4, 4.0), row(dspark, 8, 3.0),
+            row(dflash, 256, 999.0, False), row(dspark, 256, 999.0, False)]
+    for change in ({"block": 99}, {"model": "other"}, {"task": "other"}, {"context": 8192}):
+        rows.append(row(replace(target, **change), 128, 999.0))
+    rows.append(row(replace(target, parameters={**target.parameters, "topology": "tp2_dp1"}), 128, 999.0))
+    monkeypatch.setattr("lightcone_spec.runner._metric_rows",
+                        lambda state, node: rows if node.endswith("-segments") else [])
+    assert _e5_reference(None, job) == expected
+    # Sharing Target-only does not allow a missing/rejected Static panel.
+    rows[:] = [row(target, 2, 1.0)]
+    with pytest.raises(ScientificFailure, match="capacity-feasible Target-only/Static"):
+        _e5_reference(None, job)

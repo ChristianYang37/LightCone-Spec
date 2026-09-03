@@ -926,13 +926,24 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
     by_method: dict[str, list[tuple[float, int]]] = {}
+    comparison_backend = job.parameters.get("comparison_backend", job.backend)
     rows = _metric_rows(state, job.node)
     rows.extend(_metric_rows(state, f"{job.node}-segments"))
     for config, metrics in rows:
         load = config.get("load")
         if (
             config.get("block") != job.block
-            or config.get("backend") != job.backend
+            or config.get("model") != job.model
+            or config.get("task") != job.task
+            or config.get("context") != job.context
+            or config.get("parameters", {}).get("topology", "tp1_dp1")
+            != job.parameters.get("topology", "tp1_dp1")
+            # Target-only has no drafter backend (NONE) and is shared by the
+            # matched DFlash/DSpark panels. Static must match the panel backend.
+            or (
+                config.get("method") == "static"
+                and config.get("backend") != comparison_backend
+            )
             or config.get("method") not in {"target_only", "static"}
             or not isinstance(load, str)
             or not load.startswith("closed_loop_c")
@@ -944,7 +955,7 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
             (float(metrics["request_rate"]), concurrency)
         )
     if set(by_method) != {"target_only", "static"}:
-        raise ScientificFailure(f"{job.node} lacks SLO-feasible Target-only/Static load anchors")
+        raise ScientificFailure(f"{job.node} lacks capacity-feasible Target-only/Static load anchors")
     per_method = [max(rows) for rows in by_method.values()]
     return max(per_method, key=lambda row: row[0])
 
