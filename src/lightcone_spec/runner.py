@@ -2271,6 +2271,18 @@ def _single_gpu_queues(
     config: ExperimentConfig, jobs: tuple[Job, ...]
 ) -> dict[int, tuple[Job, ...]]:
     if jobs and all(
+        job.node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
+        and job.block is not None
+        for job in jobs
+    ):
+        # Keep every method/segment of a paired block on its registered GPU,
+        # including when resuming after only part of the block completed.
+        return {
+            gpu: rows
+            for gpu in config.gpu_ids
+            if (rows := tuple(job for job in jobs if _assigned_gpu(config, job) == gpu))
+        }
+    if jobs and all(
         job.parameters.get("workload") == "tts_calibration_screen" for job in jobs
     ):
         queues: dict[int, list[Job]] = {gpu: [] for gpu in config.gpu_ids}
@@ -2491,6 +2503,13 @@ def _pair_interference_jobs(config: ExperimentConfig) -> tuple[Job, ...]:
     return tuple(rows)
 
 
+def _interference_within_tolerance(intervals: dict[str, Any]) -> bool:
+    return set(intervals) == {"goodput", "itl"} and all(
+        math.isfinite(point) and -0.01 <= low <= high <= 0.01
+        for point, low, high in intervals.values()
+    )
+
+
 def _select_pair_parallelism(state: StateStore, node: str) -> dict[str, Any]:
     timings: dict[int, dict[str, dict[str, float]]] = {}
     for item, metrics in _metric_rows(state, node):
@@ -2510,8 +2529,9 @@ def _select_pair_parallelism(state: StateStore, node: str) -> dict[str, Any]:
             intervals[metric] = paired_relative_bca_interval(candidate, baseline)
     return {
         "enabled": len(pairs) == len(timings) >= 3
-        and all(abs(point) <= 0.01 and low <= 0 <= high for point, low, high in intervals.values()),
+        and _interference_within_tolerance(intervals),
         "paired_relative_bca": intervals,
+        "criterion": "paired_relative_bca_within_1pct_v2",
     }
 
 
@@ -4939,11 +4959,9 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                 "headline_parallel",
                 {
                     "enabled": len(pairs) == 4
-                    and all(
-                        abs(point) <= 0.01 and low <= 0 <= high
-                        for point, low, high in calibrations.values()
-                    ),
+                    and _interference_within_tolerance(calibrations),
                     "paired_relative_bca": calibrations,
+                    "criterion": "paired_relative_bca_within_1pct_v2",
                 },
             )
     if node == "E3a":

@@ -52,6 +52,17 @@ random order. A segment failure excludes its parent job attempt from reducers;
 resume keeps completed segment evidence and completes the parent only when all
 segments are terminal.
 
+Headline blocks may run concurrently only when the preflight paired-relative
+95% BCa intervals for both goodput and p99 ITL lie entirely within `[-1%, +1%]`.
+The intervals need not contain zero: the admission question is whether the
+measured interference is within tolerance, not whether a difference is
+detectable. Incomplete or non-finite calibration keeps headline execution
+serial. Resume recomputes this decision from the preserved preflight evidence
+and records `criterion=paired_relative_bca_within_1pct_v2`; it does not rerun
+completed cells. Each final block, including all methods and bundled segments,
+stays on its registered GPU resource across resume; only distinct blocks run in
+parallel. TP2/DP2 jobs continue to reserve their entire GPU pair.
+
 ## TTS and DSpark
 
 Every formal adaptive TTS, L0-naive, LightCone, LightCone-candidate,

@@ -27,6 +27,7 @@ from lightcone_spec.runner import (
     _capacity_infeasible,
     _gpu_pairs,
     _incomplete_scientific_outcome,
+    _interference_within_tolerance,
     _job_from_metric_config,
     _schedule_exhausted_updates,
     _scientific_rejection,
@@ -374,6 +375,55 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     }
     with pytest.raises(ScientificFailure, match="fallbacks=1"):
         _validate_measured_metrics(unsafe)
+
+
+@pytest.mark.parametrize(
+    ("interval", "accepted"),
+    [
+        ((-0.0021634, -0.0062713, -0.0005183), True),
+        ((0.0019563, 0.0000536, 0.0043664), True),
+        ((0.0, -0.01, 0.01), True),
+        ((0.0, -0.011, 0.001), False),
+        ((0.0, -0.001, 0.011), False),
+        ((math.nan, -0.001, 0.001), False),
+        ((0.0, math.nan, 0.001), False),
+        ((0.0, -0.001, math.inf), False),
+        ((0.0, 0.001, -0.001), False),
+    ],
+)
+def test_headline_parallel_requires_both_intervals_inside_tolerance(interval, accepted):
+    for metric in ("goodput", "itl"):
+        intervals = {"goodput": (0.0, 0.0, 0.0), "itl": (0.0, 0.0, 0.0)}
+        intervals[metric] = interval
+        assert _interference_within_tolerance(intervals) is accepted
+    assert not _interference_within_tolerance({})
+    assert not _interference_within_tolerance({"goodput": interval})
+
+
+def test_final_bundled_blocks_keep_gpu_affinity_on_partial_resume(tmp_path: Path):
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml", run_name="run", sglang_root=tmp_path,
+        results_root=tmp_path, models={}, drafts={}, datasets={}, gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"), protocol=ProtocolConfig(),
+    )
+    parents = materialize("E3b-final")
+    cells = tuple(child for parent in parents for child in (_segment_jobs(parent) or (parent,)))
+    queues = _single_gpu_queues(config, cells)
+    assert set(queues) == {0, 1}
+    original = {job.job_id: gpu for gpu, rows in queues.items() for job in rows}
+    assert len(original) == len(cells)
+    assert all(original[job.job_id] == config.gpu_ids[job.block % 2] for job in cells)
+    # Remove an uneven subset, including only part of a bundled block.
+    pending = cells[1::3]
+    resumed = _single_gpu_queues(config, pending)
+    assert {
+        job.job_id: gpu for gpu, rows in resumed.items() for job in rows
+    } == {job.job_id: original[job.job_id] for job in pending}
+    for node in ("E5-final", "E6-final", "E0-final"):
+        assert all(
+            job.gpu_count == 2 and _assigned_pair(config, job) == (0, 1)
+            for job in materialize(node)
+        )
 
 
 def test_session_cell_pool_splits_only_independent_segments():

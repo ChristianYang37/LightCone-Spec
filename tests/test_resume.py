@@ -1,6 +1,8 @@
 import json
 import signal
 import subprocess
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from lightcone_spec.runner import (
     _exclude_redundant_e2_dependency_jobs,
     _ncu_permission_block_reason,
     _records_scientific_rejection,
+    _reduce_node,
     _reopen_soft_gate_e3b,
     _repair_completed_s10_downstream_resume,
     _repair_e0_e6_partial_resume_v1,
@@ -24,6 +27,7 @@ from lightcone_spec.runner import (
     _repair_metric_dedup_e5_resume_v1,
     _restore_soft_gate_width_selection,
     _resume_materialization,
+    _run_pending_jobs,
     _save_or_validate_run_config,
     _seed_e3a_static_deployment_width,
     _segment_jobs,
@@ -66,6 +70,99 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     attempt = state.start(first, (0, 1), tmp_path / "attempt-3")
     state.complete(first.job_id, attempt)
     assert state.status_counts("preflight") == {"completed": 1, "pending": 2}
+
+
+def test_preflight_resume_rederives_parallelism_without_new_attempts(monkeypatch, tmp_path: Path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    jobs = materialize("preflight")
+    state.add_jobs("preflight", jobs)
+    evidence = tmp_path / "old-attempt"
+    evidence.mkdir()
+    raw = evidence / "metrics.json"
+    raw.write_text('{"original": true}\n')
+    attempt = state.start(jobs[0], (0, 1), evidence)
+    state.complete(jobs[0].job_id, attempt)
+    state.set_selection("headline_parallel", {"enabled": False})
+    rows = [
+        (job.to_dict(), {"goodput": 100.0, "itl_p99_ms": 10.0})
+        for job in jobs if job.parameters.get("mode") in {"isolated", "concurrent"}
+    ]
+    monkeypatch.setattr("lightcone_spec.runner._metric_rows", lambda *_: rows)
+    monkeypatch.setattr("lightcone_spec.runner.summarize_attempts", lambda *_: None)
+    monkeypatch.setattr("lightcone_spec.runner._check_greedy_trajectories", lambda *_: None)
+    monkeypatch.setattr(
+        "lightcone_spec.runner.paired_relative_bca_interval",
+        lambda candidate, baseline: (
+            (-0.0021634, -0.0062713, -0.0005183)
+            if baseline[0] == 100.0 else (0.0019563, 0.0000536, 0.0043664)
+        ),
+    )
+    for _ in range(2):
+        _reduce_node(config, state, "preflight")
+        selection = state.selection("headline_parallel")
+        assert selection["enabled"] is True
+        assert selection["criterion"] == "paired_relative_bca_within_1pct_v2"
+    assert raw.read_text() == '{"original": true}\n'
+    assert state.next_attempt(jobs[0].job_id) == 2
+    assert state.status_counts("preflight") == {"completed": 1, "pending": 9}
+    rows.pop()  # An incomplete pair must still keep headline execution serial.
+    _reduce_node(config, state, "preflight")
+    assert state.selection("headline_parallel")["enabled"] is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_headline_workers_obey_admission_and_keep_whole_blocks(monkeypatch, tmp_path: Path, enabled):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("headline_parallel", {"enabled": enabled})
+    jobs = tuple(
+        Job(
+            job_id=f"final-{block}-{index}", node="E3b-final", ordinal=block * 2 + index,
+            method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline",
+            context=4096, load="c1", width=16, block=block,
+        )
+        for block in (0, 1) for index in (0, 1)
+    )
+    state.add_jobs("E3b-final", jobs)
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    seen = {}
+    active = peak = 0
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def execute(config, state, job, *, gpus, **kwargs):
+        nonlocal active, peak
+        attempt = state.start(job, gpus, tmp_path / job.job_id)
+        with lock:
+            assert job.job_id not in seen
+            seen[job.job_id] = gpus
+            active += 1
+            peak = max(peak, active)
+        if enabled:
+            barrier.wait(timeout=5)
+        time.sleep(0.01)
+        state.complete(job.job_id, attempt)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", FakeServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    _run_pending_jobs(config, state, "E3b-final", threading.Event(), jobs)
+    assert peak == (2 if enabled else 1)
+    assert seen == {job.job_id: (job.block,) for job in jobs}
+    assert state.status_counts("E3b-final") == {"completed": 4}
 
 
 def test_interrupted_server_cleanup_reads_proc_without_spawning_ps(
