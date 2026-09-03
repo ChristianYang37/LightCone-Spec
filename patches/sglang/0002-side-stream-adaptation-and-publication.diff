@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1429 @@
+@@ -0,0 +1,1433 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -1281,7 +1281,6 @@ index 00000000..20e93274
 +        owned_draft = draft_hidden.detach().clone()
 +        owned_target = target_logits.detach().clone()
 +        owned_mask = valid_mask.detach().clone()
-+        supervision_nonempty = owned_mask.any()
 +        source_tensors = (
 +            self._captured_input,
 +            self._captured_positions,
@@ -1300,6 +1299,11 @@ index 00000000..20e93274
 +                    microbatch = min(
 +                        batch_size, self.config.adaptation_microbatch_size
 +                    )
++                    # Gate, loss, and publication must own the same rows.
++                    # Later requests cannot supply supervision to an empty
++                    # selected microbatch. Compute after the side-stream fence.
++                    training_mask = owned_mask[:microbatch]
++                    supervision_nonempty = training_mask.any()
 +                    target = owned_target.view(batch_size, block, -1)[
 +                        :microbatch, : block - 1
 +                    ]
@@ -1338,12 +1342,12 @@ index 00000000..20e93274
 +                    ) = _logit_reconstruction_gate(
 +                        inference_logits,
 +                        active_logits,
-+                        valid_mask=owned_mask[:microbatch],
++                        valid_mask=training_mask,
 +                    )
 +                    loss = self._distillation_loss(
 +                        inference_logits,
 +                        target,
-+                        owned_mask[:microbatch],
++                        training_mask,
 +                    )
 +
 +                    def member_feedback(parameters):
@@ -1378,7 +1382,7 @@ index 00000000..20e93274
 +                            member_loss = self._distillation_loss(
 +                                draft_logits,
 +                                target,
-+                                owned_mask[:microbatch],
++                                training_mask,
 +                            )
 +                            return torch.where(
 +                                reconstruction_ok,

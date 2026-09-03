@@ -54,7 +54,7 @@ export CUDA_PATH="$cuda_home"
 export PATH="$cuda_home/bin:$PATH"
 export LD_LIBRARY_PATH="$cuda_home/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 marker="$sglang_root/.lightcone-spec-patched"
-patch_version="paper-v1-nextn-shadow-v21"
+patch_version="paper-v1-nextn-shadow-v22"
 
 if [[ ! -e "$marker" ]]; then
   patches=()

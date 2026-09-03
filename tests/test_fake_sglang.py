@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -544,6 +545,103 @@ def test_logit_reconstruction_empty_mask_cannot_publish():
     assert math.isinf(relative_rms.item())
     assert top1.item() == 0.0
     assert math.isinf(mean_kl.item())
+
+
+@pytest.mark.parametrize("selected_valid,mismatch", [(False, False), (True, False), (True, True)])
+def test_dflash_microbatch_supervision_matches_loss_gate_and_publication(selected_valid, mismatch):
+    # Execute the patched launch method on CPU: request 0 owns the microbatch,
+    # while request 1 has supervision regardless of request 0's final canvas.
+    _, tree = _patched_residual_rms()
+    adapter_class = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                         and n.name == "DFlashDrafterAdapter")
+    launch = next(n for n in adapter_class.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "maybe_launch")
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    runtime_source = patch.read_text().split(
+        "+++ b/python/sglang/srt/speculative/online_adaptation_runtime.py\n", 1
+    )[1].split("diff --git ", 1)[0]
+    runtime_tree = ast.parse("\n".join(line[1:] for line in runtime_source.splitlines()
+                                      if line.startswith("+")))
+    runtime_class = next(n for n in runtime_tree.body if isinstance(n, ast.ClassDef)
+                         and n.name == "OnlineCohortRuntime")
+    diagnose = next(n for n in runtime_class.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "_record_invalid_candidate")
+    optimizer_type = _patched_online_optimizer()
+    optimizer = optimizer_type((torch.zeros(2, 3, 2),), _online_config("onlinespec_ogd"))
+    initial = tuple(value.clone() for value in optimizer.state_tensors)
+    masks = []
+    submissions = []
+    def loss(logits, target, mask):
+        masks.append(mask)
+        return (logits.square().sum(-1) * mask).sum()
+
+    namespace = {
+        "torch": torch, "UpdateTrace": object,
+        "OnlineSpecOptimizer": optimizer_type,
+        "_logit_reconstruction_gate": _patched_logit_reconstruction_gate(),
+        "anchor_forward_value": lambda surrogate, actual: surrogate + (actual - surrogate).detach(),
+        "loss_and_grad": lambda parameters, objective: (
+            objective(parameters), tuple(torch.zeros_like(p) for p in parameters)
+        ),
+    }
+    exec(compile(ast.Module([launch, diagnose], []), str(patch), "exec"), namespace)
+    runtime = SimpleNamespace(
+        round=740, active_version=73, disabled_reason=None, pending=None,
+        counters=dict.fromkeys(("updates_discarded", "updates_skipped_no_supervision",
+                                "nonfinite_updates", "exactness_violations", "fallbacks"), 0),
+        update_due=lambda: True, side_update=lambda tensors: nullcontext(),
+        timing=lambda name: nullcontext(),
+    )
+    def submit(**candidate):
+        submissions.append(candidate)
+        valid = candidate["finite"] & candidate["reconstruction_ok"] & candidate["supervision_nonempty"]
+        optimizer.commit(candidate["proposal"], valid=valid)
+        if valid:
+            runtime.active_version += 1
+        else:
+            trace = SimpleNamespace(diagnosed=False, buffer_index=0, published_version=None)
+            namespace["_record_invalid_candidate"](
+                runtime, trace, finite_ok=bool(candidate["finite"]),
+                reconstruction_ok=bool(candidate["reconstruction_ok"]),
+                supervision_ok=bool(candidate["supervision_nonempty"]),
+            )
+            runtime.trace = trace
+    runtime.submit = submit
+    adapter = SimpleNamespace(
+        request_slots=None, runtime=runtime, optimizer=optimizer, names=("weight",),
+        config=SimpleNamespace(adaptation_microbatch_size=1, optimizer=SimpleNamespace(name="sgd")),
+        worker=SimpleNamespace(block_size=3), _captured_input=torch.zeros(2, 3, 2),
+        _captured_positions=torch.zeros(6), _captured_prefix_lens=torch.tensor([527, 379]),
+        _captured_request_ids=("ending", "continuing"),
+        _captured_history=SimpleNamespace(locations=torch.zeros(2), valid_mask=torch.ones(2)),
+        _active_inference_parameters=lambda: {"weight": optimizer.master[0] + (8 if mismatch else 0)},
+        _effective_parameters=lambda parameters: {"weight": parameters[0]},
+        _surrogate_hidden=lambda values, *args: values["weight"],
+        _full_vocab_logits=lambda logits, size: logits, _distillation_loss=loss,
+        inference=SimpleNamespace(stage=lambda values: None),
+    )
+    owned = torch.tensor([[selected_valid, selected_valid], [True, True]])
+    namespace["maybe_launch"](
+        adapter, draft_hidden=torch.zeros(2, 3, 2), target_logits=torch.zeros(2, 3, 2),
+        valid_mask=owned, lm_head_weight=torch.eye(2),
+    )
+    candidate = submissions[0]
+    assert bool(candidate["supervision_nonempty"]) == selected_valid
+    assert len(masks) == 2 and all(torch.equal(mask, owned[:1]) for mask in masks)
+    if selected_valid and not mismatch:
+        assert runtime.active_version == 74
+        assert runtime.disabled_reason is None
+    else:
+        assert runtime.active_version == 73
+        assert all(torch.equal(a, b) for a, b in zip(initial, optimizer.state_tensors, strict=True))
+        if not selected_valid:
+            assert runtime.trace.status == "no_supervision"
+            assert runtime.counters["updates_skipped_no_supervision"] == 1
+            assert runtime.counters["fallbacks"] == 0
+            assert runtime.disabled_reason is None
+        else:
+            assert runtime.disabled_reason == "logit_reconstruction_mismatch"
+            assert runtime.counters["fallbacks"] == 1
 
 
 def test_logit_reconstruction_replays_published_model_dtype_source():
