@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1407 @@
+@@ -0,0 +1,1429 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -267,6 +267,22 @@ index 00000000..20e93274
 +        * weight.to(torch.float32)
 +    )
 +    return normalized.to(hidden.dtype)
++
++
++def _residual_rms(
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Replay fused add/RMSNorm without rounding its normalization input.
++
++    FlashInfer normalizes the fp32 sum and separately stores a model-dtype
++    residual. Rounding that sum before RMSNorm changes the replay operator.
++    """
++    summed = hidden.to(torch.float32) + residual.to(torch.float32)
++    output = _rms(summed, weight, epsilon).to(hidden.dtype)
++    return output, summed.to(residual.dtype)
 +
 +
 +def _linear(
@@ -920,13 +936,13 @@ index 00000000..20e93274
 +                float(layer.input_layernorm.variance_epsilon),
 +            )
 +        else:
-+            residual = residual + hidden
 +            norm_weight = self._parameter(
 +                values,
 +                f"{prefix}.input_layernorm.weight",
 +                layer.input_layernorm.weight,
 +            )
-+            hidden = _rms(
++            hidden, residual = _residual_rms(
++                hidden,
 +                residual,
 +                norm_weight.to(residual.dtype),
 +                float(layer.input_layernorm.variance_epsilon),
@@ -1036,13 +1052,13 @@ index 00000000..20e93274
 +            attention_output = _TensorParallelSum.apply(
 +                attention_output, self.tp_group.device_group
 +            )
-+        residual = residual + attention_output
 +        post_weight = self._parameter(
 +            values,
 +            f"{prefix}.post_attention_layernorm.weight",
 +            layer.post_attention_layernorm.weight,
 +        )
-+        mlp_input = _rms(
++        mlp_input, residual = _residual_rms(
++            attention_output,
 +            residual,
 +            post_weight.to(residual.dtype),
 +            float(layer.post_attention_layernorm.variance_epsilon),
@@ -1107,9 +1123,15 @@ index 00000000..20e93274
 +                history_locations=history.locations,
 +                history_valid=history.valid_mask,
 +            )
-+        if residual is not None:
-+            hidden = hidden + residual
 +        norm = self._parameter(values, "norm.weight", self.model.norm.weight)
++        if residual is not None:
++            hidden, _ = _residual_rms(
++                hidden,
++                residual,
++                norm.to(hidden.dtype),
++                float(self.model.norm.variance_epsilon),
++            )
++            return hidden
 +        return _rms(
 +            hidden,
 +            norm.to(hidden.dtype),
@@ -1837,7 +1859,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2583 @@
+@@ -0,0 +1,2594 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations

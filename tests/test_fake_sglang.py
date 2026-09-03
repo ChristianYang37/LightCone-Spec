@@ -376,6 +376,79 @@ def _patched_logit_reconstruction_gate():
     return namespace["_logit_reconstruction_gate"]
 
 
+def _patched_residual_rms():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "dflash_online_adaptation.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_rms", "_residual_rms"}
+    ]
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(functions, []), str(patch), "exec"), namespace)
+    return namespace["_residual_rms"], tree
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_residual_rms_preserves_fused_fp32_sum_and_gradients(dtype):
+    replay, tree = _patched_residual_rms()
+    generator = torch.Generator().manual_seed(0)
+    hidden = torch.randn(16, 128, generator=generator).to(dtype).requires_grad_()
+    residual = torch.randn(16, 128, generator=generator).to(dtype).requires_grad_()
+    weight = torch.randn(128, generator=generator).to(dtype).requires_grad_()
+    summed = hidden.float() + residual.float()
+    expected = (
+        summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + 1e-6)
+        * weight.float()
+    ).to(dtype)
+    output, stored = replay(hidden, residual, weight, 1e-6)
+    assert torch.equal(output, expected)
+    assert torch.equal(stored, summed.to(dtype))
+    objective = output.float().square().mean() + stored.float().square().mean()
+    expected_objective = expected.float().square().mean() + summed.to(dtype).float().square().mean()
+    gradients = torch.autograd.grad(objective, (hidden, residual, weight), retain_graph=True)
+    reference = torch.autograd.grad(expected_objective, (hidden, residual, weight))
+    for actual, wanted in zip(gradients, reference, strict=True):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+    if dtype == torch.bfloat16:
+        rounded = (hidden + residual).float()
+        previous = (
+            rounded * torch.rsqrt(rounded.square().mean(-1, keepdim=True) + 1e-6)
+            * weight.float()
+        ).to(dtype)
+        assert not torch.equal(previous, expected)
+    adapter = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DFlashDrafterAdapter")
+    for name, expected_calls in (("_layer_forward", 2), ("_surrogate_hidden", 1)):
+        method = next(n for n in adapter.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        calls = [n for n in ast.walk(method) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_residual_rms"]
+        assert len(calls) == expected_calls
+
+
+def test_residual_rms_repeated_weight_changes_and_fresh_request():
+    replay, _ = _patched_residual_rms()
+    generator = torch.Generator().manual_seed(42)
+    hidden = torch.randn(4, 64, generator=generator).bfloat16()
+    residual = torch.randn(4, 64, generator=generator).bfloat16()
+    initial = torch.randn(64, generator=generator)
+    first = replay(hidden, residual, initial.bfloat16(), 1e-6)
+    for step in range(300):
+        weight = (initial + step * 1e-4).bfloat16()
+        output, stored = replay(hidden, residual, weight, 1e-6)
+        summed = hidden.float() + residual.float()
+        expected = (summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + 1e-6) * weight.float()).bfloat16()
+        assert torch.equal(output, expected)
+        assert torch.equal(stored, summed.bfloat16())
+    reset = replay(hidden, residual, initial.bfloat16(), 1e-6)
+    assert all(torch.equal(x, y) for x, y in zip(first, reset, strict=True))
+
+
 def test_logit_reconstruction_ignores_only_masked_canvas_positions():
     gate = _patched_logit_reconstruction_gate()
     inference = torch.tensor([[[8.0, 0.0], [8.0, 0.0]]], dtype=torch.bfloat16)
