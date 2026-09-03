@@ -713,6 +713,11 @@ def _stimulus_id(job: Job) -> str:
 
 
 def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int:
+    frozen = job.parameters.get("execution_request_count")
+    if frozen is not None:
+        if type(frozen) is not int or frozen < 1:
+            raise ValueError("execution_request_count must be a positive integer")
+        return frozen
     if job.node == "TTS-Cal" or job.parameters.get("workload") == "tts_stride10_confirmation":
         return 19
     concurrency = 1
@@ -1326,12 +1331,26 @@ def _execute_cell(
     selection: dict[str, Any] | None,
     server: ServerProcess,
 ) -> None:
+    # Freeze the ORIGINAL input job, not its resolved load. In particular,
+    # common_slo_load and BurstGPT retain their historical prompt-pool size.
+    execution_request_count = _request_count(config, state, job)
+    input_job = replace(job, parameters={
+        **job.parameters, "execution_request_count": execution_request_count,
+    })
+    execution_resources = {
+        "declared_gpu_count": job.gpu_count,
+        "execution_gpu_ids": list(gpus),
+        "execution_gpu_count": len(gpus),
+        "execution_request_count": execution_request_count,
+    }
     while True:
         next_attempt = state.next_attempt(job.job_id)
         output_dir = config.run_dir / "jobs" / job.job_id / f"attempt-{next_attempt:02d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         attempt = state.start(job, gpus, output_dir)
-        _write_json(output_dir / "config.json", job.to_dict())
+        _write_json(output_dir / "config.json", replace(
+            input_job, parameters={**input_job.parameters, **execution_resources},
+        ).to_dict())
         _write_jsonl(output_dir / "requests.jsonl.gz", ())
         session_files = {
             "server.log": server.output_dir / "server.log",
@@ -1360,6 +1379,7 @@ def _execute_cell(
                 runtime_job,
                 parameters={
                     **runtime_job.parameters,
+                    **execution_resources,
                     "declared_concurrency": declared_concurrency,
                     "dispatcher_concurrency": dispatcher_concurrency,
                     "effective_load": f"c{dispatcher_concurrency}",
@@ -1372,7 +1392,7 @@ def _execute_cell(
             _write_json(output_dir / "config.json", raw_config)
             bootstrap_job = _exactness_bootstrap(runtime_job)
             client = server.configure(bootstrap_job, selection)
-            prompts, max_new_tokens, workload = _cell_inputs(config, state, client, job)
+            prompts, max_new_tokens, workload = _cell_inputs(config, state, client, input_job)
             offered = len(prompts)
             exactness_rows: list[dict[str, object]] = []
             exactness_evidence: dict[str, object] | None = None
@@ -1776,6 +1796,7 @@ def _execute_cell(
             ):
                 raise ScientificFailure("patched runtime did not report native p99 ITL")
             metrics: dict[str, Any] = {
+                **execution_resources,
                 "committed_tokens": committed,
                 "duration_seconds": elapsed,
                 "goodput": committed_goodput(committed, elapsed),
@@ -2265,6 +2286,78 @@ def _job_gpus(config: ExperimentConfig, job: Job) -> tuple[int, ...]:
     if job.gpu_count == 2:
         return _assigned_pair(config, job)
     return (_assigned_gpu(config, job),)
+
+
+def _tp1_resource_eligible(job: Job) -> bool:
+    """Only ordinary single-server E0/E5 work may shed its declared pair."""
+    return (
+        job.node in {"E0-tune", "E0-pilot", "E0-final", "E5-pilot", "E5-final"}
+        and job.gpu_count == 2
+        and job.parameters.get("topology", "tp1_dp1") == "tp1_dp1"
+        and not any(job.parameters.get(name) for name in (
+            "profiler", "failure", "controlled_replay", "controlled_pair_baseline",
+            "requires_isolation",
+        ))
+    )
+
+
+def _execution_allocations(
+    config: ExperimentConfig, state: StateStore, node: str, jobs: tuple[Job, ...],
+) -> dict[str, tuple[int, ...]]:
+    """Resolve execution resources without rewriting registered job configs.
+
+    A started paired block keeps its recorded allocation (including an old
+    two-device reservation). Missing or conflicting provenance keeps isolation.
+    """
+    allocations = {job.job_id: _job_gpus(config, job) for job in jobs}
+    if not state.selection("tp1_resource_parallel_v1", {}).get("enabled"):
+        return allocations
+    pins: dict[int, set[tuple[int, ...]]] = {}
+    with state.connect() as connection:
+        rows = connection.execute(
+            "SELECT j.config_json,j.assigned_gpus,a.output_dir FROM jobs j "
+            "LEFT JOIN attempts a ON a.job_id=j.job_id AND a.attempt=j.attempt_count "
+            "WHERE j.node IN (?,?) AND j.attempt_count>0", (node, f"{node}-segments"),
+        ).fetchall()
+    for row in rows:
+        previous = Job(**json.loads(row["config_json"]))
+        if previous.block is None or isinstance(previous.parameters.get("segments"), list):
+            continue
+        assigned = tuple(int(value) for value in (row["assigned_gpus"] or "").split(",") if value)
+        if not assigned and row["output_dir"]:
+            saved = Path(row["output_dir"]) / "config.json"
+            if saved.is_file():
+                assigned = tuple(json.loads(saved.read_text()).get("parameters", {}).get(
+                    "execution_gpu_ids", (),
+                ))
+        pins.setdefault(previous.block, set()).add(assigned or _job_gpus(config, previous))
+    # A mixed-topology/isolation block cannot be split across resource classes.
+    protected = {job.block for job in jobs if job.block is not None
+                 and not _tp1_resource_eligible(job)}
+    for job in jobs:
+        if not _tp1_resource_eligible(job) or job.block in protected:
+            continue
+        prior = pins.get(job.block, set())
+        if len(prior) > 1:
+            continue
+        assigned = next(iter(prior)) if prior else (_assigned_gpu(config, job),)
+        if all(gpu in config.gpu_ids for gpu in assigned):
+            allocations[job.job_id] = assigned
+    return allocations
+
+
+def _session_order(
+    config: ExperimentConfig, node: str, gpus: tuple[int, ...],
+    keys: Iterable[tuple[object, ...]],
+) -> list[tuple[object, ...]]:
+    unique = list(dict.fromkeys(keys))
+    ordered = []
+    for block in sorted({key[0] for key in unique}, key=lambda value: -1 if value is None else value):
+        block_keys = [key for key in unique if key[0] == block]
+        rng = np.random.default_rng(config.protocol.seed + sum(gpus) + len(node) + int(block or 0))
+        rng.shuffle(block_keys)
+        ordered.extend(block_keys)
+    return ordered
 
 
 def _single_gpu_queues(
@@ -3230,7 +3323,16 @@ def _complete_segment_parent(
     attempt_number = state.next_attempt(parent.job_id)
     output_dir = config.run_dir / "jobs" / parent.job_id / f"attempt-{attempt_number:02d}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    attempt = state.start(parent, _job_gpus(config, parent), output_dir)
+    with state.connect() as connection:
+        actual = connection.execute(
+            "SELECT job_id,assigned_gpus FROM jobs WHERE node=?",
+            (f"{parent.node}-segments",),
+        ).fetchall()
+    child_ids = {child.job_id for child in children}
+    used = {int(gpu) for row in actual if row["job_id"] in child_ids
+            for gpu in (row["assigned_gpus"] or "").split(",") if gpu}
+    parent_gpus = tuple(gpu for gpu in config.gpu_ids if gpu in used)
+    attempt = state.start(parent, parent_gpus or _job_gpus(config, parent), output_dir)
     outcomes = Counter()
     for row in rows:
         outcomes.update(row["metrics"].get("request_outcomes", {}))
@@ -3297,13 +3399,27 @@ def _run_pending_jobs(
         pending = tuple(job for job in pending if job not in bundled)
         if not pending:
             return
-    exclusive = tuple(job for job in pending if job.gpu_count == 2)
-    singles = tuple(job for job in pending if job.gpu_count == 1)
+    allocations = _execution_allocations(config, state, node, pending)
+    exclusive = tuple(job for job in pending if len(allocations[job.job_id]) == 2)
+    singles = tuple(job for job in pending if len(allocations[job.job_id]) == 1)
+    # Shuffle the original declared queue once, then filter it per worker. A
+    # changed GPU mapping must not reseed or reshuffle a subset of sessions.
+    remapped = any(allocations[job.job_id] != _job_gpus(config, job) for job in pending)
+    legacy_keys: dict[tuple[int, ...], list[tuple[object, ...]]] = {}
+    if remapped:
+        for job in pending:
+            runtime = _exactness_bootstrap(_runtime_job(config, state, job))
+            probe = job.job_id if job.parameters.get("adaptive_probe") else None
+            key = (job.block, probe, *server_session_key(runtime, _selection_for_job(state, job)))
+            legacy_keys.setdefault(_job_gpus(config, job), []).append(key)
+        legacy_keys = {gpus: _session_order(config, node, gpus, keys)
+                       for gpus, keys in legacy_keys.items()}
     node_failed = threading.Event()
     pooled_singles = tuple(job for job in singles if _session_pool_eligible(job))
     singles = tuple(job for job in singles if job not in pooled_singles)
 
     def run_sessions(jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str) -> None:
+        jobs = tuple(jobs)
         grouped: dict[tuple[object, ...], list[tuple[Job, Job, dict[str, Any] | None]]] = {}
         for job in jobs:
             runtime_job = _runtime_job(config, state, job)
@@ -3312,17 +3428,12 @@ def _run_pending_jobs(
             process_job = _exactness_bootstrap(runtime_job)
             key = (job.block, probe, *server_session_key(process_job, selection))
             grouped.setdefault(key, []).append((job, runtime_job, selection))
-        keys = []
-        blocks = sorted(
-            {key[0] for key in grouped}, key=lambda value: -1 if value is None else value
-        )
-        for block in blocks:
-            block_keys = [key for key in grouped if key[0] == block]
-            rng = np.random.default_rng(
-                config.protocol.seed + sum(gpus) + len(node) + int(block or 0)
-            )
-            rng.shuffle(block_keys)
-            keys.extend(block_keys)
+        if remapped:
+            declared = tuple(dict.fromkeys(_job_gpus(config, job) for job in jobs))
+            keys = list(dict.fromkeys(key for pair in declared for key in legacy_keys[pair]
+                                      if key in grouped))
+        else:
+            keys = _session_order(config, node, gpus, grouped)
         for key in keys:
             if stop_event.is_set() or node_failed.is_set():
                 return
@@ -3407,7 +3518,7 @@ def _run_pending_jobs(
     headline = node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
     calibration = state.selection("headline_parallel", {"enabled": False})
     exclusive_queues = {
-        pair: tuple(job for job in exclusive if _assigned_pair(config, job) == pair)
+        pair: tuple(job for job in exclusive if allocations[job.job_id] == pair)
         for pair in _gpu_pairs(config)
     }
     exclusive_queues = {pair: jobs for pair, jobs in exclusive_queues.items() if jobs}
@@ -3473,7 +3584,12 @@ def _run_pending_jobs(
         )
         if stop_event.is_set() or node_failed.is_set():
             return
-    queues = _single_gpu_queues(config, singles)
+    if remapped:
+        queues = {gpu: tuple(job for job in singles if allocations[job.job_id] == (gpu,))
+                  for gpu in config.gpu_ids}
+        queues = {gpu: jobs for gpu, jobs in queues.items() if jobs}
+    else:
+        queues = _single_gpu_queues(config, singles)
 
     def worker(gpu: int, jobs: Iterable[Job]) -> None:
         port = _resource_port(config, (gpu,))

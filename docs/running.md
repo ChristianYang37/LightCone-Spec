@@ -50,3 +50,30 @@ overlaps a diff, resolve that ordinary patch conflict before running again.
 `protocol.start_stage` and `protocol.end_stage` are optional debugging bounds.
 They do not fabricate upstream selections; starting at a dependent stage still
 requires its selections to exist in the same run database.
+
+## Execution resources and fixed request budgets
+
+Registered `gpu_count` remains immutable. After excluded TP1 interference
+acceptance enables the internal `tp1_resource_parallel_v1` selection, ordinary
+single-server TP1/DP1 E0/E5 jobs reserve one device. TP2, two-replica DP2,
+profilers and isolated controlled pairs retain their pair. Paired blocks stay
+on one allocation; an already started block retains its recorded devices.
+Missing/failed acceptance retains the original isolation policy. Session order
+uses the original resource queue's seed, not the newly assigned GPU ID.
+
+New attempts record `declared_gpu_count`, `execution_gpu_ids`,
+`execution_gpu_count`, `execution_request_count`, and dispatcher concurrency.
+The input budget is frozen from the original job before runtime load resolution
+and process retries. Dispatcher capacity cannot expand the prompt sample;
+TTS confirmation retains 19 prompts, explicit c128 retains 128, and E5 timed
+windows/trace cycling retain their existing rules. `execution_request_count`
+is the seed input-pool size for timed serving, not the total requests offered
+during the window. Registered request counts and cosine horizons are unchanged.
+Old attempts without these fields retain their original read-only interpretation.
+
+Monitoring reports actual allocations separately from declared resources,
+fixed input budget separately from dispatcher concurrency, and remaining leaf
+cells separately from parent jobs. Only independent admitted units can overlap;
+a single paired block's tail is not split to fill an idle GPU. Evaluate speedup
+by completed valid cells per hour, not instantaneous GPU utilization (which is
+not a measurement of model FLOP utilization).

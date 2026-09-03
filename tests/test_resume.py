@@ -17,6 +17,7 @@ from lightcone_spec.runner import (
     _e2_keep_count,
     _e2_missing_dependency_jobs,
     _exclude_redundant_e2_dependency_jobs,
+    _execution_allocations,
     _ncu_permission_block_reason,
     _records_scientific_rejection,
     _reduce_node,
@@ -33,6 +34,7 @@ from lightcone_spec.runner import (
     _segment_jobs,
     _select_e0_recipes,
     _selection_for_job,
+    _session_order,
     _set_e2_expected_evidence,
     _skip_satisfied_e2_dependency_jobs,
     _soft_gate_width_replacements,
@@ -163,6 +165,155 @@ def test_headline_workers_obey_admission_and_keep_whole_blocks(monkeypatch, tmp_
     assert peak == (2 if enabled else 1)
     assert seen == {job.job_id: (job.block,) for job in jobs}
     assert state.status_counts("E3b-final") == {"completed": 4}
+
+
+@pytest.mark.parametrize("node", ["E0-tune", "E0-final", "E5-final"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_tp1_resource_workers_preserve_declaration_and_claims(monkeypatch, tmp_path, node, enabled):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("headline_parallel", {"enabled": True})
+    state.set_selection("tp1_resource_parallel_v1", {"enabled": enabled})
+    jobs = tuple(Job(
+        job_id=f"tp1-{block}-{i}", node=node, ordinal=block * 2 + i,
+        method="static", model="Qwen/Qwen3-8B", backend="DFLASH",
+        task="controlled_baseline", context=4096, load="c16", width=16,
+        block=block if node.endswith("final") else None, gpu_count=2,
+    ) for block in (0, 1) for i in (0, 1))
+    state.add_jobs(node, jobs)
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = peak = 0
+    seen = {}
+    ports = {}
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            ports[kwargs["gpus"]] = kwargs["port"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def execute(config, state, job, *, gpus, **kwargs):
+        nonlocal active, peak
+        attempt = state.start(job, gpus, tmp_path / job.job_id)
+        with lock:
+            assert job.job_id not in seen
+            seen[job.job_id] = gpus
+            active += 1
+            peak = max(peak, active)
+        if enabled:
+            barrier.wait(timeout=5)
+        state.complete(job.job_id, attempt)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", FakeServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    _run_pending_jobs(config, state, node, threading.Event(), jobs)
+    assert peak == (2 if enabled else 1)
+    assert len(seen) == 4
+    assert all(gpus == ((job.block if job.block is not None else job.ordinal % 2,)
+                        if enabled else (0, 1)) for job in jobs for gpus in [seen[job.job_id]])
+    assert len(set(ports.values())) == (2 if enabled else 1)
+    assert all(job.gpu_count == 2 for job in state.jobs(node))
+    _run_pending_jobs(config, state, node, threading.Event(), state.pending_jobs(node))
+    assert all(state.next_attempt(job.job_id) == 2 for job in jobs)
+
+
+def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("tp1_resource_parallel_v1", {"enabled": True})
+    base = Job(job_id="base", node="E5-final", ordinal=0, method="static",
+               gpu_count=2, block=0, model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500")
+    jobs = tuple(replace(base, job_id=f"j-{i}", ordinal=i, block=i // 2)
+                 for i in range(6))
+    state.add_jobs(base.node, jobs)
+    for job, gpus in ((jobs[0], (0, 1)), (jobs[2], (1,))):
+        directory = tmp_path / job.job_id
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps({
+            "parameters": {"execution_gpu_ids": list(gpus)},
+        }))
+        attempt = state.start(job, gpus, directory)
+        if job == jobs[2]:
+            state.interrupt(job.job_id, attempt, "interruption")
+        else:
+            state.complete(job.job_id, attempt)
+    allocations = _execution_allocations(config, state, base.node, state.pending_jobs(base.node))
+    assert allocations[jobs[1].job_id] == (0, 1)  # Old block remains isolated.
+    assert allocations[jobs[2].job_id] == allocations[jobs[3].job_id] == (1,)
+    assert allocations[jobs[4].job_id] == allocations[jobs[5].job_id] == (0,)
+    for params in ({"topology": "tp2_dp1"}, {"topology": "two_replica_tp1_dp2"},
+                   {"profiler": "nsys"}, {"failure": "kill"},
+                   {"controlled_pair_baseline": True}, {"requires_isolation": True}):
+        special = replace(base, block=None, parameters=params)
+        assert _execution_allocations(config, state, base.node, (special,))["base"] == (0, 1)
+    special = replace(base, node="E6-final", block=None)
+    assert _execution_allocations(config, state, special.node, (special,))["base"] == (0, 1)
+
+
+def test_session_order_filter_uses_original_pair_seed(tmp_path):
+    config = _config(tmp_path)
+    keys = [(block, None, method) for block in (0, 1)
+            for method in ("static", "lightcone", "tts")]
+    original = _session_order(config, "E0-final", (0, 1), keys)
+    assert len(original) == len(set(original)) == 6
+    for block in (0, 1):
+        assert [key for key in original if key[0] == block] == _session_order(
+            config, "E0-final", (0, 1), [key for key in keys if key[0] == block],
+        )
+
+
+def test_remapped_sessions_keep_relative_order_and_stop_before_new_claim(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    jobs = tuple(Job(
+        job_id=f"session-{block}-{i}", node="E0-final", ordinal=block * 10 + i,
+        method=method, model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500",
+        context=4096, load="c1", width=16, block=block, gpu_count=2,
+    ) for block in (0, 1) for i, method in enumerate(("static", "lightcone", "tts")))
+    observed = []
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", FakeServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    for enabled in (False, True):
+        state = StateStore(tmp_path / str(enabled))
+        state.add_jobs("E0-final", jobs)
+        state.set_selection("tp1_resource_parallel_v1", {"enabled": enabled})
+        # Serialize workers so the assertion compares session order, not timing.
+        state.set_selection("headline_parallel", {"enabled": False})
+        stop = threading.Event()
+        seen = []
+
+        def execute(config, state, job, *, gpus, **kwargs):
+            attempt = state.start(job, gpus, tmp_path / job.job_id)
+            state.complete(job.job_id, attempt)
+            seen.append(job.job_id)
+            if len(seen) == 2:
+                stop.set()
+
+        monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+        _run_pending_jobs(config, state, "E0-final", stop, state.pending_jobs("E0-final"))
+        assert state.status_counts("E0-final") == {"completed": 2, "pending": 4}
+        observed.append(seen[:])
+    assert observed[0] == observed[1]
 
 
 def test_interrupted_server_cleanup_reads_proc_without_spawning_ps(

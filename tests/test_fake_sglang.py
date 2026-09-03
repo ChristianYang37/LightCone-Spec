@@ -36,6 +36,7 @@ from lightcone_spec.nextn import (
 )
 from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import (
+    _cell_inputs,
     _check_greedy_trajectories,
     _dispatcher_concurrency,
     _exactness_bootstrap,
@@ -43,6 +44,7 @@ from lightcone_spec.runner import (
     _fit_prompt,
     _read_jsonl,
     _records_scientific_rejection,
+    _request_count,
     _request_metrics,
     _request_scope_released,
     _run_multi_turn,
@@ -61,6 +63,51 @@ from lightcone_spec.server import (
     server_command,
     server_session_key,
 )
+from lightcone_spec.state import StateStore
+
+
+@pytest.mark.parametrize("load,method,workload,node,count", [
+    ("c1", "static", "ordinary", "E0-final", 16),
+    ("c16", "lightcone", "ordinary", "E0-final", 16),
+    ("c128", "static", "ordinary", "E0-final", 128),
+    ("c16", "tts", "ordinary", "E0-final", 16),
+    ("c1", "tts", "tts_stride10_confirmation", "TTS-S10-confirmation", 19),
+    ("c1", "tts", "ordinary", "TTS-Cal", 19),
+    ("closed_loop_c128", "static", "ordinary", "E5-final", 128),
+    ("burstgpt_shape", "static", "ordinary", "E5-final", 16),
+    ("common_slo_load", "lightcone", "ordinary", "E2-r0", 16),
+])
+def test_execution_budget_preserves_inputs_independent_of_dispatcher(
+    tmp_path, monkeypatch, load, method, workload, node, count,
+):
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml", run_name="test", sglang_root=tmp_path,
+        results_root=tmp_path, models={}, drafts={}, datasets={"CalibrationMix": tmp_path},
+        gpu_ids=(0, 1), server=ServerConfig(python=tmp_path / "python"),
+        protocol=ProtocolConfig(),
+    )
+    state = StateStore(config.run_dir)
+    job = Job(job_id="budget", ordinal=0, node=node, method=method, load=load,
+              model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500",
+              context=4096, parameters={"workload": workload, "generation_tokens": 256})
+    monkeypatch.setattr("lightcone_spec.runner._task_for_data", lambda *_: "CalibrationMix")
+    monkeypatch.setattr("lightcone_spec.runner.load_calibration_mix",
+                        lambda *_: tuple(str(i) for i in range(76)))
+    monkeypatch.setattr("lightcone_spec.runner.load_prompt_records",
+                        lambda *args, limit, selection_seed, **kwargs:
+                        tuple({"prompt": str(selection_seed + i)} for i in range(limit)))
+    monkeypatch.setattr("lightcone_spec.runner.load_prompt_pool", lambda *_: ({"prompt": "pool"},))
+    config = replace(config, datasets={**config.datasets, "BurstGPT": tmp_path / "trace"})
+    monkeypatch.setattr("lightcone_spec.runner.load_arrival_trace", lambda *args, limit, **kwargs:
+                        (tuple(range(limit)), tuple((128 + i, 64 + i) for i in range(limit))))
+    client = SimpleNamespace(tokenize=lambda prompt: tuple(prompt.encode()))
+    frozen = replace(job, parameters={**job.parameters, "execution_request_count": count})
+    assert _request_count(config, state, job) == count
+    assert _cell_inputs(config, state, client, frozen) == _cell_inputs(config, state, client, job)
+    assert _request_count(config, state, replace(frozen, load="c256")) == count
+    assert "execution_request_count" not in job.parameters
+    if method == "tts":
+        assert _dispatcher_concurrency(job) == 1
 
 
 def _nextn_acceptance_job(model: str) -> Job:
