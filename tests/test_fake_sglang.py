@@ -1622,6 +1622,8 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     latency_payload = adaptation_payload(latency_segment)
     assert latency_payload["max_in_flight"] == 128
     assert latency_payload["fixed_total_token_budget"] == 256
+    assert latency_segment.parameters["regime"] == "long_input_short_output"
+    assert latency_segment.parameters["generation_tokens"] == 256
     replacement = calibration.__class__(
         **{
             **calibration.to_dict(),

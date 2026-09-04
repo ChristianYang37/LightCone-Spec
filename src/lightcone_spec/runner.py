@@ -6490,6 +6490,72 @@ def _requeue_dspark_dynamic_batch_budget_failures(state: StateStore) -> dict[str
     return audit
 
 
+def _run_e1a_latency_protocol_repair_v3(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+    legacy_parent: Job,
+) -> None:
+    """Replace the latency panel that inherited the long-generation regime.
+
+    The source latency panel varies prompt context at a fixed 256-token decode.
+    In v2 it accidentally inherited E1a's 128-token-input/8192-token-generation
+    capture regime, so the nominal context axis changed the decode budget rather
+    than the prompt length and c128 rows could hit the generic 120-second request
+    deadline.  Keep every raw attempt, exclude the contaminated logical rows,
+    and execute a corrected, resumable bundle under new job identities.
+    """
+
+    selection_name = "formal_e1a_latency_protocol_repair_v3"
+    audit = state.selection(selection_name, None)
+    corrected = next(
+        job
+        for job in _e1a_source_transfer_jobs()
+        if job.parameters.get("workload") == "dspark_source_latency_panel"
+    )
+    replacement = replace(
+        corrected,
+        job_id=f"e1a-latency-v3__{corrected.job_id}",
+        node="E1a-source-latency-v3",
+        parameters={
+            **corrected.parameters,
+            "replaces_job_id": legacy_parent.job_id,
+            "reconciliation_kind": "e1a_latency_regime_and_budget",
+        },
+    )
+    legacy_children = _segment_jobs(legacy_parent)
+    exclusions = set(state.selection("formal_evidence_exclusions", []))
+    exclusions.add(legacy_parent.job_id)
+    exclusions.update(child.job_id for child in legacy_children)
+    state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+    state.supersede_jobs(
+        (legacy_parent.job_id, *(child.job_id for child in legacy_children)),
+        "superseded: E1a latency panel inherited long-generation regime",
+        stage_node="E1a-source-transfer-v2",
+    )
+    if not isinstance(audit, dict):
+        audit = {
+            "version": 3,
+            "status": "running",
+            "replacement_cells": 16,
+            "old_regime": legacy_parent.parameters.get("regime"),
+            "old_generation_tokens": legacy_parent.parameters.get("generation_tokens"),
+            "new_regime": "long_input_short_output",
+            "new_generation_tokens": 256,
+        }
+        state.set_selection(selection_name, audit)
+    state.add_internal_jobs((replacement,), storage_node="E1a-source-latency-v3")
+    _run_node_jobs(config, state, "E1a-source-latency-v3", stop_event)
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "E1a-source-latency-v3")
+    final = {**audit, "status": "completed"}
+    path = config.run_dir / "stages" / "E1a-source-latency-v3" / "audit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, final)
+    state.set_selection(selection_name, final)
+
+
 def _run_e1a_source_transfer_v2(
     config: ExperimentConfig,
     state: StateStore,
@@ -6527,7 +6593,28 @@ def _run_e1a_source_transfer_v2(
             "status": "running",
         }
         state.set_selection("formal_e1a_source_transfer_v2", audit)
-    state.add_internal_jobs(jobs, storage_node="E1a-source-transfer-v2")
+    stored = state.jobs("E1a-source-transfer-v2")
+    if not stored:
+        state.add_internal_jobs(jobs, storage_node="E1a-source-transfer-v2")
+        stored = jobs
+    legacy_latency = next(
+        (
+            job
+            for job in stored
+            if job.parameters.get("workload") == "dspark_source_latency_panel"
+            and (
+                job.parameters.get("regime") != "long_input_short_output"
+                or int(job.parameters.get("generation_tokens", 0)) != 256
+            )
+        ),
+        None,
+    )
+    if legacy_latency is not None:
+        _run_e1a_latency_protocol_repair_v3(
+            config, state, stop_event, legacy_latency
+        )
+        if stop_event.is_set():
+            return
     _requeue_dspark_dynamic_batch_budget_failures(state)
     _run_node_jobs(config, state, "E1a-source-transfer-v2", stop_event)
     if stop_event.is_set():

@@ -757,6 +757,8 @@ def _e1a() -> Iterator[dict[str, Any]]:
                     "batch_size": 128,
                     "context": context,
                     "latency_context": context,
+                    "regime": "long_input_short_output",
+                    "generation_tokens": 256,
                     "execution_request_count": 128,
                 }
                 for budget, context in itertools.product(

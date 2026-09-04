@@ -32,6 +32,7 @@ from lightcone_spec.runner import (
     _requeue_dspark_dynamic_batch_budget_failures,
     _restore_soft_gate_width_selection,
     _resume_materialization,
+    _run_e1a_latency_protocol_repair_v3,
     _run_node_jobs,
     _run_pending_jobs,
     _run_tp1_interference_v2,
@@ -171,6 +172,73 @@ def test_dspark_dynamic_batch_budget_repair_requeues_only_latency_cells(tmp_path
 
     assert _requeue_dspark_dynamic_batch_budget_failures(state) == audit
     assert state.status_counts("E1a-source-transfer-v2-segments") == {"pending": 16}
+
+
+def test_e1a_latency_protocol_repair_replaces_legacy_regime(
+    monkeypatch, tmp_path: Path
+):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    corrected = next(
+        job
+        for job in _e1a_source_transfer_jobs()
+        if job.parameters.get("workload") == "dspark_source_latency_panel"
+    )
+    legacy_segments = [
+        {
+            key: value
+            for key, value in segment.items()
+            if key not in {"regime", "generation_tokens"}
+        }
+        for segment in corrected.parameters["segments"]
+    ]
+    legacy = replace(
+        corrected,
+        parameters={
+            **corrected.parameters,
+            "regime": "short_input_long_generation",
+            "generation_tokens": 8192,
+            "segments": legacy_segments,
+        },
+    )
+    children = _segment_jobs(legacy)
+    state.add_internal_jobs((legacy,), storage_node="E1a-source-transfer-v2")
+    state.add_internal_jobs(children, storage_node="E1a-source-transfer-v2-segments")
+    completed_dir = config.run_dir / "legacy-completed"
+    completed_dir.mkdir()
+    attempt = state.start(children[0], (0,), completed_dir)
+    state.complete(children[0].job_id, attempt)
+    failed_dir = config.run_dir / "legacy-failed"
+    failed_dir.mkdir()
+    attempt = state.start(children[1], (1,), failed_dir)
+    state.fail(children[1].job_id, attempt, "legacy timeout", retry=False)
+
+    def complete_replacement(config, state, node, stop_event):
+        del stop_event
+        for job in state.pending_jobs(node):
+            output = config.run_dir / "replacement" / job.job_id
+            output.mkdir(parents=True)
+            attempt = state.start(job, (0, 1), output)
+            state.complete(job.job_id, attempt)
+
+    monkeypatch.setattr("lightcone_spec.runner._run_node_jobs", complete_replacement)
+    _run_e1a_latency_protocol_repair_v3(
+        config, state, threading.Event(), legacy
+    )
+
+    replacement = state.jobs("E1a-source-latency-v3")[0]
+    assert replacement.parameters["regime"] == "short_input_long_generation"
+    assert all(
+        segment["regime"] == "long_input_short_output"
+        and segment["generation_tokens"] == 256
+        for segment in replacement.parameters["segments"]
+    )
+    excluded = set(state.selection("formal_evidence_exclusions"))
+    assert {child.job_id for child in children} <= excluded
+    assert state.job_status(legacy.job_id) == "skipped"
+    assert state.job_status(children[0].job_id) == "completed"
+    assert state.job_status(children[1].job_id) == "skipped"
+    assert state.selection("formal_e1a_latency_protocol_repair_v3")["status"] == "completed"
 
 
 def test_bundled_pool_stops_claiming_after_child_runtime_failure(monkeypatch, tmp_path: Path):
