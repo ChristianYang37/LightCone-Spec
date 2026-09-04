@@ -15,6 +15,7 @@ from lightcone_spec.runner import (
     ScientificFailure,
     _cleanup_interrupted_servers,
     _complete_blocked_profiler,
+    _complete_infeasible_startup,
     _e1a_source_transfer_jobs,
     _e2_keep_count,
     _e2_missing_dependency_jobs,
@@ -47,6 +48,7 @@ from lightcone_spec.runner import (
     _set_e2_expected_evidence,
     _skip_satisfied_e2_dependency_jobs,
     _soft_gate_width_replacements,
+    _terminalize_pending_session_rows,
     _tp1_interference_v2_jobs,
     _upgrade_legacy_e0_materialization,
 )
@@ -652,6 +654,52 @@ def test_e0_pair_calibration_capacity_failure_is_terminal_infeasible(
     assert metrics["scientific_outcome"] == "infeasible"
     assert metrics["capacity_feasible"] is False
     assert metrics["hard_feasible"] is False
+
+
+def test_session_startup_terminalization_skips_rows_already_completed(tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    jobs = tuple(
+        Job(
+            job_id=f"e0-mixed-session-{index}",
+            node="E0-tune",
+            ordinal=index,
+            method=method,
+            model="Qwen/Qwen3-14B",
+            backend="DSPARK",
+            task="CalibrationMix",
+            gpu_count=2,
+            parameters={"pair_calibration": True},
+        )
+        for index, method in enumerate(("static", "lightcone"))
+    )
+    state.add_jobs("E0-tune", jobs)
+    completed_dir = config.run_dir / "jobs" / jobs[0].job_id / "attempt-01"
+    completed_dir.mkdir(parents=True)
+    first_attempt = state.start(jobs[0], (0,), completed_dir)
+    state.complete(jobs[0].job_id, first_attempt)
+
+    error = RuntimeError(
+        "Loaded weights and the 51.824 GiB unallocated adaptation headroom "
+        "leave no GPU memory for the KV cache"
+    )
+    rows = tuple((job, job, None) for job in jobs)
+    _terminalize_pending_session_rows(
+        state,
+        rows,
+        lambda job: _complete_infeasible_startup(
+            state, job, config.run_dir, (0,), error
+        ),
+    )
+
+    assert state.status_counts("E0-tune") == {"completed": 2}
+    assert state.next_attempt(jobs[0].job_id) == 2
+    assert state.next_attempt(jobs[1].job_id) == 2
+    metrics = json.loads(
+        (state.completed_attempt_dir(jobs[1].job_id) / "metrics.json").read_text()
+    )
+    assert metrics["scientific_outcome"] == "infeasible"
+    assert metrics["capacity_feasible"] is False
 
 
 def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):

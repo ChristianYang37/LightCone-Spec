@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.error
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -2840,6 +2840,35 @@ def _complete_compatibility_startup(
     state.complete(job.job_id, attempt)
 
 
+def _terminalize_pending_session_rows(
+    state: StateStore,
+    rows: Iterable[tuple[Job, Job, dict[str, Any] | None]],
+    complete: Callable[[Job], None],
+) -> None:
+    """Terminalize only work that remains pending in a partly-run session.
+
+    A server can fail while it is being reconfigured for a later row after an
+    earlier row in the same grouped session has already completed.  Session
+    error handling must not attempt to claim that completed row again.  Keep
+    ``StateStore.start`` as the atomic claim gate and tolerate only the narrow
+    race in which another worker changed this exact job away from ``pending``
+    after the status check.
+    """
+
+    for job, _, _ in rows:
+        if state.job_status(job.job_id) != "pending":
+            continue
+        try:
+            complete(job)
+        except RuntimeError as error:
+            if state.job_status(job.job_id) != "pending" and str(error) in {
+                f"job {job.job_id} is not pending",
+                f"job {job.job_id} was claimed concurrently",
+            }:
+                continue
+            raise
+
+
 def _ncu_permission_block_reason(
     executable: Path, python: Path, gpu: int
 ) -> str | None:
@@ -3674,10 +3703,13 @@ def _run_pending_jobs(
                     config.profiler_tools["ncu"], config.server.python, gpus[0]
                 )
                 if reason is not None:
-                    for job, _, _ in rows:
-                        _complete_blocked_profiler(
+                    _terminalize_pending_session_rows(
+                        state,
+                        rows,
+                        lambda job: _complete_blocked_profiler(
                             state, job, config.run_dir, gpus, reason
-                        )
+                        ),
+                    )
                     continue
             first_process_job = _exactness_bootstrap(first_runtime)
             block = "none" if first_job.block is None else f"{first_job.block:02d}"
@@ -3736,14 +3768,22 @@ def _run_pending_jobs(
                     if compatibility_scope and _adaptive_probe_incompatible(
                         error, session_dir / "server.log"
                     ):
-                        for job, _, _ in rows:
-                            _complete_compatibility_startup(
-                                state, job, config.run_dir, gpus, error
-                            )
+                        _terminalize_pending_session_rows(
+                            state,
+                            rows,
+                            lambda job, failure=error: _complete_compatibility_startup(
+                                state, job, config.run_dir, gpus, failure
+                            ),
+                        )
                         break
                     if _screening_job(first_job) and _capacity_infeasible(error):
-                        for job, _, _ in rows:
-                            _complete_infeasible_startup(state, job, config.run_dir, gpus, error)
+                        _terminalize_pending_session_rows(
+                            state,
+                            rows,
+                            lambda job, failure=error: _complete_infeasible_startup(
+                                state, job, config.run_dir, gpus, failure
+                            ),
+                        )
                         break
                     retry = (
                         _retryable_process_error(error)
