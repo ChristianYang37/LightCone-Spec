@@ -411,15 +411,20 @@ def server_command(
             "--speculative-num-draft-tokens",
             str(_speculative_canvas(job)),
             "--speculative-num-steps",
-            str(_speculative_canvas(job) - 1 if job.backend == "NEXTN" else 1),
+            str(
+                _speculative_canvas(job) - 1
+                if job.backend in {"EAGLE3", "NEXTN"}
+                else 1
+            ),
             "--speculative-draft-window-size",
             str(_speculative_canvas(job)),
             "--speculative-use-rejection-sampling",
         ]
     )
     # SGLang's EAGLE-family parser requires an explicit single branch whenever
-    # rejection sampling is enabled.  NEXTN already used the flag, while the
-    # E0 EAGLE3 compatibility probe previously failed before model loading.
+    # rejection sampling is enabled.  With topk=1 it also canonicalizes the
+    # proposal count to ``num_steps + 1``.  Keep that count equal to the
+    # registered canvas for both native EAGLE3 and the NEXTN alias.
     if job.backend in {"EAGLE3", "NEXTN"}:
         argv.extend(["--speculative-eagle-topk", "1"])
     if job.backend == "DSPARK":

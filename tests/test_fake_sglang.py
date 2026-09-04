@@ -2252,6 +2252,26 @@ def test_eagle3_rejection_sampling_uses_single_branch(tmp_path: Path):
     assert "--speculative-use-rejection-sampling" in command
     index = command.index("--speculative-eagle-topk")
     assert command[index + 1] == "1"
+    steps = command.index("--speculative-num-steps")
+    draft_tokens = command.index("--speculative-num-draft-tokens")
+    assert command[steps + 1] == "15"
+    assert command[draft_tokens + 1] == "16"
+
+    adaptive = next(
+        item
+        for item in materialize("E0-tune")
+        if item.backend == "EAGLE3" and item.method == "tts"
+    )
+    adaptive_command = server_command(
+        config,
+        adaptive,
+        port=30000,
+        output_dir=tmp_path,
+        adaptation=adaptation_payload(adaptive),
+    )
+    steps = adaptive_command.index("--speculative-num-steps")
+    assert adaptive_command[steps + 1] == "15"
+    assert adaptation_payload(adaptive)["canvas_tokens"] == 16
 
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
     class State:
