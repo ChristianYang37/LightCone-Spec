@@ -64,7 +64,8 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 -> E0-tune -> E0-pilot -> E0-final
 ```
 
-The `paper-v2` preset registers 1,822 static jobs and about 1,917 unique runner
+The `paper-v2` preset registers 1,878 static jobs (7,366 logical leaf cells)
+and about 1,973 unique runner
 jobs after bounded finalist, load-selection, and existing formal-S=10
 reconciliation work. The one-time KL64/activity reconciliation can add seven
 replacement cells and one unprivileged profile proxy without changing the
@@ -74,9 +75,17 @@ materialized job. A job is one
 registered contexts, loads, traces, or workload pools without reloading the
 same model. The per-node job counts are 10, 140, 72 (at most 108 after TTS
 finalist confirmation), 68 (at most 100 after Pareto confirmation), 424, 109,
-31, 25, 52, 168, 3, 20, 132, 3, 11, 66, 22, 60, 54, 88, and 264.
+31, 25, 52, 168, 3, 20, 132, 3, 19, 114, 22, 60, 54, 88, and 264.
 Primary E3b/E5 conclusions use 12 clean-server blocks; E4/E6/E0 secondary
 evidence uses six. There is no global power-selected repeat count.
+
+The public dependency tuple remains fixed, but resumable priority window v2
+runs E1a then the 54 E0-tune cells first, finishes the remaining non-E5 work,
+and leaves E5 as the final execution tail. E0-tune alone may place two
+independent exploratory TP1 cells on the two GPUs before the NUMA interference
+gate. E5 additionally contains a secondary DFlash/DSpark transfer across
+TP2/DP1 and two-replica TP1/DP2; its concurrency is system-wide and those rows
+are excluded from the TP1 H3 frontier.
 
 The runner preserves the paper gates that matter scientifically: proposal
 version consistency, controlled TTS/L0 candidate replay, finite optimization
@@ -118,7 +127,9 @@ results/run-name/
 └── stages/<node>/
     ├── summary.csv
     ├── summary.parquet
-    └── statistics.json   # final nodes
+    ├── statistics.json   # final nodes
+    ├── topology_transfer.json  # E5 TP2/DP2 rows and paired statistics
+    └── topology_transfer.csv   # flat E5 TP2/DP2 measurements
 ```
 
 Each independent statistical block starts a fresh server, waits for health,
@@ -126,10 +137,10 @@ warms up, measures, and shuts it down. Layout-compatible cells in that block
 reuse the model process through an idle-only configure/reset endpoint; a layout,
 parallelism, model, backend, width, profiler, or fault-device change starts a new
 process. Paired methods stay ordered on the same GPU. Two independent single-GPU
-queues may overlap; TP2, DP2, E5, and E6 cells reserve both devices. Preflight
+queues may overlap after the interference gate; TP2, DP2, and E6 cells reserve
+both devices, while eligible TP1 E0/E5 cells use their actual single GPU. Preflight
 measures paired goodput and scheduler-commit ITL interference with relative BCa intervals.
-Headline blocks overlap only when both mean effects are within 1% and both
-intervals include zero.
+Headline blocks overlap only when both full intervals lie within $\pm1\%$.
 
 ## Development checks
 

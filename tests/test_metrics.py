@@ -514,6 +514,10 @@ def test_e5_frontier_rejects_nominal_concurrency_speed_fallback(monkeypatch):
                     "backend": "DFLASH",
                     "block": 0,
                     "load": "closed_loop_c2",
+                    "parameters": {
+                        "workload": "primary_serving_frontier",
+                        "topology": "tp1_dp1",
+                    },
                 },
                 {"goodput": 200.0},
             )
@@ -521,6 +525,83 @@ def test_e5_frontier_rejects_nominal_concurrency_speed_fallback(monkeypatch):
     )
     with pytest.raises(runner.ScientificFailure, match="native per-request"):
         runner._e5_frontier_statistic(State())
+
+
+def test_e5_frontier_ignores_multigpu_transfer_rows(monkeypatch):
+    class State:
+        def selection(self, name, default=None):
+            return "static" if name == "e5_operational_baseline" else default
+
+    monkeypatch.setattr(
+        runner,
+        "_metric_rows",
+        lambda state, node: [
+            (
+                {
+                    "method": "static",
+                    "backend": "DFLASH",
+                    "block": 0,
+                    "load": "closed_loop_c32",
+                    "parameters": {
+                        "workload": "multigpu_serving_transfer",
+                        "topology": "tp2_dp1",
+                    },
+                },
+                {"goodput": 100.0},
+            )
+        ],
+    )
+    assert runner._e5_frontier_statistic(State()) is None
+
+
+def test_e5_topology_transfer_is_paired_within_backend_topology_and_load(monkeypatch):
+    rows = []
+    for backend in ("DFLASH", "DSPARK"):
+        for topology in ("tp2_dp1", "two_replica_tp1_dp2"):
+            for block in range(6):
+                for method, scale in (("static", 1.0), ("lightcone", 1.1)):
+                    rows.append(
+                        (
+                            {
+                                "job_id": f"{backend}-{topology}-{block}-{method}",
+                                "method": method,
+                                "backend": backend,
+                                "block": block,
+                                "load": "closed_loop_c32",
+                                "parameters": {
+                                    "workload": "multigpu_serving_transfer",
+                                    "topology": topology,
+                                    "registered_load": "closed_loop_c32",
+                                    "registered_concurrency_scope": "system",
+                                },
+                            },
+                            {
+                                "hard_feasible": True,
+                                "goodput": 100.0 * scale,
+                                "per_user_generation_speed": 10.0 * scale,
+                                "accepted_drafts": 50.0 * scale,
+                                "verified_drafts": 100.0,
+                                "verification_waste": 5.0 / scale,
+                                "ttft_p50_ms": 20.0 / scale,
+                                "itl_p99_ms": 30.0 / scale,
+                                "peak_hbm_bytes": 1000.0,
+                                "kv_capacity": 100.0,
+                                "execution_gpu_count": 2,
+                            },
+                        )
+                    )
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+    reduced = runner._e5_topology_transfer(object(), "E5-final")
+    assert len(reduced["rows"]) == 48
+    assert {
+        (row["backend"], row["topology"], row["load"])
+        for row in reduced["paired_statistics"]
+    } == {
+        (backend, topology, "closed_loop_c32")
+        for backend in ("DFLASH", "DSPARK")
+        for topology in ("tp2_dp1", "two_replica_tp1_dp2")
+    }
+    assert all(row["blocks"] == list(range(6)) for row in reduced["paired_statistics"])
 
 
 def test_final_stage_requires_completed_pilot():

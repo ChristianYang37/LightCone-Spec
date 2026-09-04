@@ -66,8 +66,8 @@ EXPECTED = {
     "E3b-pilot": 20,
     "E3b-final": 132,
     "E1a": 3,
-    "E5-pilot": 11,
-    "E5-final": 66,
+    "E5-pilot": 19,
+    "E5-final": 114,
     "E6-pilot": 22,
     "E6-final": 60,
     "E0-tune": 54,
@@ -79,7 +79,7 @@ EXPECTED = {
 def test_paper_v2_node_order_counts_and_plan():
     assert len(PAPER_NODES) == 21
     assert default_row_counts() == EXPECTED
-    assert sum(EXPECTED.values()) == 1822
+    assert sum(EXPECTED.values()) == 1878
     assert len(paper_plan()) == 21
     assert [row.rows for row in paper_plan() if row.name == "TTS-Cal"] == ["<=108"]
 
@@ -280,8 +280,10 @@ def test_e1a_domain_fit_validation_split_is_deterministic_and_disjoint(tmp_path:
 def test_e5_source_aligned_methods_and_curves():
     pilot = materialize("E5-pilot")
     final = materialize("E5-final")
-    assert len(pilot) == 11
-    assert len(final) == 66
+    assert len(pilot) == 19
+    assert len(final) == 114
+    assert sum(segment_count(job) for job in pilot) == 98
+    assert sum(segment_count(job) for job in final) == 708
     assert sum(job.parameters["workload"] == "topology_compatibility" for job in pilot) == 4
     assert {job.method for job in final if job.block in range(12)} >= {
         "target_only",
@@ -299,6 +301,50 @@ def test_e5_source_aligned_methods_and_curves():
         "closed_loop_c1",
         "burstgpt_shape",
     }
+    transfer_pilot = [
+        job for job in pilot if job.parameters["workload"] == "multigpu_serving_transfer"
+    ]
+    transfer_final = [
+        job for job in final if job.parameters["workload"] == "multigpu_serving_transfer"
+    ]
+    assert len(transfer_pilot) == 8
+    assert len(transfer_final) == 48
+    assert {
+        (job.backend, job.method, job.parameters["topology"])
+        for job in transfer_pilot
+    } == {
+        (backend, method, topology)
+        for backend in ("DFLASH", "DSPARK")
+        for method in ("static", "lightcone")
+        for topology in ("tp2_dp1", "two_replica_tp1_dp2")
+    }
+    assert {job.block for job in transfer_final} == set(range(6))
+    assert all(
+        segment["registered_concurrency_scope"] == "system"
+        for job in (*transfer_pilot, *transfer_final)
+        for segment in job.parameters["segments"]
+    )
+    assert {
+        segment["load"] for job in transfer_pilot for segment in job.parameters["segments"]
+    } == {"closed_loop_c1", "closed_loop_c32", "closed_loop_c128", "burstgpt_shape"}
+    assert {
+        segment["load"] for job in transfer_final for segment in job.parameters["segments"]
+    } == {"closed_loop_c32", "closed_loop_c128", "burstgpt_shape"}
+
+
+def test_e5_extension_is_append_only_for_registered_parent_identity():
+    pilot = materialize("E5-pilot")
+    final = materialize("E5-final")
+    assert [job.ordinal for job in pilot[:11]] == list(range(11))
+    assert [job.ordinal for job in final[:66]] == list(range(66))
+    assert all(
+        job.parameters["workload"] != "multigpu_serving_transfer"
+        for job in (*pilot[:11], *final[:66])
+    )
+    assert all(
+        job.parameters["workload"] == "multigpu_serving_transfer"
+        for job in (*pilot[11:], *final[66:])
+    )
 
 
 def test_e0_method_scope_is_deliberately_sparse():
@@ -331,13 +377,13 @@ def test_e0_uses_frozen_source_transfer_recipes_without_mapping_chunk_to_stride(
     assert len({server_session_key(job) for job in validations}) == 3
 
 
-def test_e5_burstgpt_segment_count_is_unchanged():
+def test_e5_burstgpt_segment_count_includes_topology_transfer():
     assert sum(
         segment.get("load") == "burstgpt_shape"
         for node in ("E5-pilot", "E5-final")
         for job in materialize(node)
         for segment in job.parameters.get("segments", ())
-    ) == 73
+    ) == 129
 
 
 def test_server_reuse_and_eight_gpu_block_affinity(tmp_path: Path):

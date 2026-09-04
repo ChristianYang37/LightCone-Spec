@@ -111,6 +111,39 @@ def test_execution_budget_preserves_inputs_independent_of_dispatcher(
         assert _dispatcher_concurrency(job) == 1
 
 
+def test_dp2_system_concurrency_does_not_double_request_budget(tmp_path):
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="test",
+        sglang_root=tmp_path,
+        results_root=tmp_path,
+        models={},
+        drafts={},
+        datasets={},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"),
+        protocol=ProtocolConfig(),
+    )
+    state = StateStore(config.run_dir)
+    job = Job(
+        job_id="dp2-system-budget",
+        ordinal=0,
+        node="E5-final",
+        method="lightcone",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="LiveCodeBench",
+        context=40928,
+        load="closed_loop_c128",
+        gpu_count=2,
+        parameters={
+            "topology": "two_replica_tp1_dp2",
+            "registered_concurrency_scope": "system",
+        },
+    )
+    assert _request_count(config, state, job) == 128
+
+
 def _nextn_acceptance_job(model: str) -> Job:
     return Job(
         job_id="gpu-acceptance-000-lightcone",

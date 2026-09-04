@@ -76,6 +76,13 @@ is the seed input-pool size for timed serving, not the total requests offered
 during the window. Registered request counts and cosine horizons are unchanged.
 Old attempts without these fields retain their original read-only interpretation.
 
+E0-tune is the sole unconditional exception to the confirmation interference
+gate: its 54 compatibility/recipe cells are exploratory, independent TP1 units
+and may occupy one GPU each. E0-pilot/final still require the existing NUMA
+paired-BCa acceptance before two TP1 blocks overlap. In E5 topology-transfer
+rows, `closed_loop_cN` always means system concurrency; the DP2 router divides
+that offered work across replicas without doubling the fixed request budget.
+
 Monitoring reports actual allocations separately from declared resources,
 fixed input budget separately from dispatcher concurrency, and remaining leaf
 cells separately from parent jobs. Only independent admitted units can overlap;
@@ -83,8 +90,11 @@ a single paired block's tail is not split to fill an idle GPU. Evaluate speedup
 by completed valid cells per hour, not instantaneous GPU utilization (which is
 not a measurement of model FLOP utilization).
 
-After the source-transfer migration is present, the one-time resumable priority
-window runs compact E1a, full E5-pilot, and E0-tune before returning to the
-normal paper-node order. It never substitutes default DSpark confidence
+After the source-transfer migration is present, priority window v2 runs compact
+E1a and E0-tune, writes a stratified 10,000-draw discrete-scheduler ETA, then
+finishes every non-E5 node before resuming E5-pilot/final as the isolated tail.
+It preserves the v1 audit and never substitutes default DSpark confidence
 temperatures: an unavailable seven-position STS recipe disables only
-DSpark-LightCone work, while independent E5 methods remain runnable.
+DSpark-LightCone work, while independent methods remain runnable. ETA output is
+stored under `stages/priority-window-v2/eta.json` and reports remaining parent
+jobs, logical leaf cells, P50/P90 total time, and the E5-only tail.

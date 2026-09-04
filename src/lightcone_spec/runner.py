@@ -66,6 +66,7 @@ from .protocol import (
     MAX_E2_GEOMETRIES,
     PAPER_NODES,
     PRIMARY_BLOCKS,
+    SECONDARY_BLOCKS,
     Job,
     e2_candidates,
     materialize,
@@ -112,6 +113,11 @@ def _resume_materialization(
     """
     existing = state.jobs(node)
     if existing and state.stage_status(node) == "completed":
+        if node in {"E5-pilot", "E5-final"} and len(planned) > len(existing):
+            prefix = tuple(job.to_dict() for job in planned[: len(existing)])
+            if prefix != tuple(job.to_dict() for job in existing):
+                raise RuntimeError(f"completed {node} prefix changed during topology extension")
+            return planned
         return existing
     if not existing:
         return planned
@@ -886,6 +892,25 @@ def _cell_inputs(
 
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_csv_rows(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: json.dumps(value, sort_keys=True)
+                    if isinstance(value, (dict, list, tuple))
+                    else value
+                    for key, value in row.items()
+                }
+            )
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, object]]) -> None:
@@ -2368,7 +2393,11 @@ def _execution_allocations(
     allocations = {job.job_id: _job_gpus(config, job) for job in jobs}
     parallel_v1 = state.selection("tp1_resource_parallel_v1", {}).get("enabled")
     parallel_v2 = state.selection("tp1_resource_parallel_v2", {}).get("enabled")
-    if not (parallel_v1 or parallel_v2):
+    # E0-tune is an exploratory compatibility/recipe screen.  It has no paired
+    # timing claim, so two independent TP1 workers may execute it even when the
+    # stricter NUMA interference gate keeps confirmation blocks isolated.
+    e0_tune_exemption = node == "E0-tune"
+    if not (parallel_v1 or parallel_v2 or e0_tune_exemption):
         return allocations
     pins: dict[int, set[tuple[int, ...]]] = {}
     with state.connect() as connection:
@@ -2394,6 +2423,8 @@ def _execution_allocations(
                  and not _tp1_resource_eligible(job)}
     for job in jobs:
         if not _tp1_resource_eligible(job) or job.block in protected:
+            continue
+        if e0_tune_exemption and job.node != "E0-tune":
             continue
         prior = pins.get(job.block, set())
         if len(prior) > 1:
@@ -4862,10 +4893,10 @@ def _context_crossover_statistics(
 
 
 def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]:
-    grouped: dict[tuple[str, str, str], dict[int, list[float]]] = {}
-    offered_counts: Counter[tuple[str, str, str]] = Counter()
-    completed_counts: Counter[tuple[str, str, str]] = Counter()
-    sources: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    grouped: dict[tuple[str, str, str, str, str], dict[int, list[float]]] = {}
+    offered_counts: Counter[tuple[str, str, str, str, str]] = Counter()
+    completed_counts: Counter[tuple[str, str, str, str, str]] = Counter()
+    sources: dict[tuple[str, str, str, str, str], list[dict[str, object]]] = {}
     directories = list(state.completed_attempt_dirs(node))
     for directory in directories:
         config_path = directory / "config.json"
@@ -4876,7 +4907,9 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
         config = json.loads(config_path.read_text(encoding="utf-8"))
         parameters = config.get("parameters", {})
         load = parameters.get("registered_load", config.get("load"))
-        key = (config["method"], config["backend"], str(load))
+        topology = str(parameters.get("topology", "tp1_dp1"))
+        workload = str(parameters.get("workload", "unspecified"))
+        key = (config["method"], config["backend"], str(load), topology, workload)
         outcome_rows = _read_jsonl(outcomes_path)
         offered_counts[key] += len(outcome_rows)
         completed_counts[key] += sum(row.get("status") == "completed" for row in outcome_rows)
@@ -4894,9 +4927,10 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
                 time_block = int(stamps[0]) // 10_000_000_000
                 grouped.setdefault(key, {}).setdefault(time_block, []).extend(intervals)
     result = []
-    for (method, backend, load), blocks in grouped.items():
-        offered = offered_counts[(method, backend, load)]
-        completed = completed_counts[(method, backend, load)]
+    for (method, backend, load, topology, workload), blocks in grouped.items():
+        key = (method, backend, load, topology, workload)
+        offered = offered_counts[key]
+        completed = completed_counts[key]
         values = [float(np.quantile(rows, 0.99)) for rows in blocks.values() if rows]
         resolved = len(values) >= 3
         estimate = block_bootstrap_interval(values) if resolved else (None, None, None)
@@ -4905,16 +4939,24 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
                 "method": method,
                 "backend": backend,
                 "load": load,
+                "topology": topology,
+                "workload": workload,
                 "offered_requests": offered,
                 "completed_requests": completed,
                 "time_block_count": len(values),
                 "resolved": resolved,
                 "request_count": completed,
                 "pairing_key": json.dumps(
-                    {"method": method, "backend": backend, "load": load},
+                    {
+                        "method": method,
+                        "backend": backend,
+                        "load": load,
+                        "topology": topology,
+                        "workload": workload,
+                    },
                     sort_keys=True,
                 ),
-                "source_attempts": sources[(method, backend, load)],
+                "source_attempts": sources[key],
                 "reducer": "time_block_p99_bootstrap",
                 "p99_point_ms": estimate[0],
                 "p99_ci95_low_ms": estimate[1],
@@ -4945,9 +4987,14 @@ def _e5_frontier_statistic(state: StateStore) -> dict[str, object] | None:
         return None
     points: dict[tuple[int, str], list[tuple[float, float]]] = {}
     for config, metrics in _metric_rows(state, "E5-final"):
+        parameters = config.get("parameters", {})
         if not _hard_feasible(metrics):
             continue
         if config.get("backend") not in {"NONE", "DFLASH"}:
+            continue
+        if parameters.get("workload") != "primary_serving_frontier":
+            continue
+        if parameters.get("topology", "tp1_dp1") != "tp1_dp1":
             continue
         block = config.get("block")
         method = config.get("method")
@@ -4987,6 +5034,145 @@ def _e5_frontier_statistic(state: StateStore) -> dict[str, object] | None:
         "p_value": _exact_sign_flip(log_ratios),
         "reducer": "paired_log_log_frontier_auc_bca",
     }
+
+
+_E5_TOPOLOGY_METRICS = (
+    "goodput",
+    "per_user_generation_speed",
+    "accepted_drafts",
+    "verified_drafts",
+    "verification_waste",
+    "ttft_p50_ms",
+    "itl_p99_ms",
+    "peak_hbm_bytes",
+    "kv_capacity",
+    "collective_time_ms",
+)
+
+
+def _e5_topology_transfer(state: StateStore, node: str) -> dict[str, object]:
+    """Keep the two-GPU transfer panel separate from the TP1 serving claim."""
+    rows: list[dict[str, object]] = []
+    paired: dict[tuple[str, str, str, int], dict[str, dict[str, float]]] = {}
+    for config, metrics in _metric_rows(state, node):
+        parameters = config.get("parameters", {})
+        if parameters.get("workload") != "multigpu_serving_transfer":
+            continue
+        topology = str(parameters.get("topology"))
+        load = str(parameters.get("registered_load", config.get("load")))
+        block = config.get("block")
+        method = str(config.get("method"))
+        gpu_count = int(metrics.get("execution_gpu_count", 2))
+        goodput = metrics.get("goodput")
+        row: dict[str, object] = {
+            "job_id": config.get("job_id"),
+            "attempt": metrics.get("source_attempt"),
+            "backend": config.get("backend"),
+            "method": method,
+            "topology": topology,
+            "load": load,
+            "block": block,
+            "registered_concurrency_scope": parameters.get(
+                "registered_concurrency_scope", "system"
+            ),
+            "hard_feasible": _hard_feasible(metrics),
+            "capacity_feasible": metrics.get("capacity_feasible", "N/A"),
+            "execution_gpu_count": gpu_count,
+            "aggregate_throughput": goodput if isinstance(goodput, (int, float)) else "N/A",
+            "throughput_per_gpu": (
+                float(goodput) / gpu_count
+                if isinstance(goodput, (int, float)) and gpu_count > 0
+                else "N/A"
+            ),
+        }
+        for name in _E5_TOPOLOGY_METRICS:
+            row[name] = metrics.get(name, "N/A")
+        verified = metrics.get("verified_drafts")
+        accepted = metrics.get("accepted_drafts")
+        row["accepted_verified_ratio"] = (
+            float(accepted) / float(verified)
+            if isinstance(accepted, (int, float))
+            and isinstance(verified, (int, float))
+            and verified > 0
+            else "N/A"
+        )
+        row["rank_aggregates_after"] = metrics.get("rank_aggregates_after", "N/A")
+        row["tp2_communication_time_ms"] = (
+            metrics.get("collective_time_ms", "N/A")
+            if topology == "tp2_dp1"
+            else "N/A"
+        )
+        rank_local = metrics.get("rank_local_after")
+        committed_by_replica = (
+            [float(item.get("committed_tokens", 0.0)) for item in rank_local]
+            if topology == "two_replica_tp1_dp2"
+            and isinstance(rank_local, list)
+            and all(isinstance(item, dict) for item in rank_local)
+            else []
+        )
+        replica_total = sum(committed_by_replica)
+        row["replica_utilization"] = (
+            [value / replica_total for value in committed_by_replica]
+            if replica_total > 0
+            else "N/A"
+        )
+        rows.append(row)
+        if (
+            node == "E5-final"
+            and isinstance(block, int)
+            and method in {"static", "lightcone"}
+            and _hard_feasible(metrics)
+        ):
+            values = {
+                name: float(value)
+                for name in (*_E5_TOPOLOGY_METRICS, "throughput_per_gpu")
+                if isinstance((value := row.get(name)), (int, float)) and value > 0
+            }
+            paired.setdefault(
+                (str(config.get("backend")), topology, load, block), {}
+            )[method] = values
+    statistics: list[dict[str, object]] = []
+    conditions = sorted({key[:3] for key in paired})
+    for backend, topology, load in conditions:
+        pairs = [
+            paired[(backend, topology, load, block)]
+            for block in SECONDARY_BLOCKS
+            if (backend, topology, load, block) in paired
+        ]
+        if len(pairs) != len(SECONDARY_BLOCKS) or any(
+            set(pair) != {"static", "lightcone"} for pair in pairs
+        ):
+            continue
+        metric_names = sorted(
+            set.intersection(
+                *(set(pair["static"]) & set(pair["lightcone"]) for pair in pairs)
+            )
+        )
+        for metric in metric_names:
+            log_ratios = np.log(
+                [pair["lightcone"][metric] for pair in pairs]
+            ) - np.log([pair["static"][metric] for pair in pairs])
+            point, low, high = paired_bca_interval(
+                log_ratios, np.zeros_like(log_ratios)
+            )
+            statistics.append(
+                {
+                    "backend": backend,
+                    "topology": topology,
+                    "load": load,
+                    "metric": metric,
+                    "blocks": list(SECONDARY_BLOCKS),
+                    "candidate": "lightcone",
+                    "baseline": "static",
+                    "mean_log_ratio": point,
+                    "relative_effect": math.exp(point) - 1.0,
+                    "ci95_relative_low": math.exp(low) - 1.0,
+                    "ci95_relative_high": math.exp(high) - 1.0,
+                    "p_value": _exact_sign_flip(log_ratios),
+                    "reducer": "paired_log_ratio_bca_sign_flip",
+                }
+            )
+    return {"rows": rows, "paired_statistics": statistics}
 
 
 def _confirmatory_holm(
@@ -5156,6 +5342,9 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         )
     if node in {"E5-pilot", "E5-final"}:
         _write_json(summary_dir / "tail_latency.json", _e5_tail_statistics(state, node))
+        transfer = _e5_topology_transfer(state, node)
+        _write_json(summary_dir / "topology_transfer.json", transfer)
+        _write_csv_rows(summary_dir / "topology_transfer.csv", transfer["rows"])
     if node == "E5-final":
         frontier = _e5_frontier_statistic(state)
         _write_json(summary_dir / "serving_frontier.json", frontier)
@@ -5318,8 +5507,13 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
     elif node == "E5-pilot":
         scores: dict[str, float] = {}
         for config, metrics in _metric_rows(state, node):
+            parameters = config.get("parameters", {})
             method = str(config["method"])
             if method not in {"target_only", "static"}:
+                continue
+            if parameters.get("workload") != "serving_pilot":
+                continue
+            if parameters.get("topology", "tp1_dp1") != "tp1_dp1":
                 continue
             if str(config.get("load", "")).startswith("closed_loop_c"):
                 scores.setdefault(method, 0.0)
@@ -6691,6 +6885,34 @@ def _run_priority_window_v1(
     )
 
 
+def _run_priority_window_v2(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    """Run source calibration and E0 screening before the deferred E5 tail."""
+    audit = state.selection("formal_priority_window_v2", None)
+    if isinstance(audit, dict) and audit.get("status") == "completed":
+        return
+    if state.selection("formal_soft_gate_resume_version", None) is None:
+        return
+    running = {
+        "version": 2,
+        "order": ["E1a", "E0-tune", "all_non_E5", "E5-pilot", "E5-final"],
+        "status": "running",
+        "preserved_v1_audit": state.selection("formal_priority_window_v1", None),
+        "deferred_nodes": ["E5-pilot", "E5-final"],
+    }
+    state.set_selection("formal_priority_window_v2", running)
+    _run_e1a_source_transfer_v2(config, state, stop_event)
+    if stop_event.is_set():
+        return
+    _run_priority_paper_node(config, state, "E0-tune", stop_event)
+    if stop_event.is_set():
+        return
+    state.set_selection("formal_priority_window_v2", {**running, "status": "completed"})
+
+
 def _tp1_interference_v2_jobs() -> tuple[Job, ...]:
     rows = []
     for mode in ("isolated", "concurrent"):
@@ -6882,6 +7104,247 @@ def _write_priority_eta_v1(config: ExperimentConfig, state: StateStore) -> None:
     state.set_selection("formal_priority_eta_v1", audit)
 
 
+def _eta_planned_jobs(state: StateStore, node: str) -> tuple[Job, ...]:
+    kwargs: dict[str, object] = {
+        "valid_e0": state.selection("valid_e0", None),
+        "e0_recipes": state.selection("e0_recipes", None),
+        "e4_neighborhoods": state.selection("e4_neighborhoods", None),
+    }
+    if node == "E2-r0":
+        kwargs["e2_rows"] = e2_candidates(state.selection("e1_geometries", None))
+    elif node.startswith("E2-r"):
+        kwargs["e2_rows"] = state.selection(f"e2_round_{int(node[-1]) - 1}", None)
+    try:
+        return materialize(node, **kwargs)
+    except (RuntimeError, TypeError, ValueError):
+        return ()
+
+
+def _eta_remaining_jobs(state: StateStore) -> tuple[tuple[Job, ...], int]:
+    """Return logical pending leaves plus pending or not-yet-registered parents."""
+    with state.connect() as connection:
+        raw = connection.execute(
+            "SELECT node,status,config_json FROM jobs ORDER BY rowid"
+        ).fetchall()
+    stored: dict[str, tuple[str, str, Job]] = {}
+    children: dict[str, dict[str, tuple[str, Job]]] = {}
+    for row in raw:
+        job = Job(**json.loads(row["config_json"]))
+        stored[job.job_id] = (str(row["node"]), str(row["status"]), job)
+        parent = job.parameters.get("parent_job_id")
+        if isinstance(parent, str):
+            children.setdefault(parent, {})[job.job_id] = (str(row["status"]), job)
+    leaves: dict[str, Job] = {}
+    pending_parents = 0
+    for node in PAPER_NODES:
+        for planned in _eta_planned_jobs(state, node):
+            record = stored.get(planned.job_id)
+            if record is None:
+                pending_parents += 1
+                segments = _segment_jobs(planned)
+                if segments:
+                    leaves.update((job.job_id, job) for job in segments)
+                else:
+                    leaves[planned.job_id] = planned
+                continue
+            _, status, existing = record
+            if status not in {"pending", "running"}:
+                continue
+            pending_parents += 1
+            segments = _segment_jobs(existing)
+            if not segments:
+                leaves[existing.job_id] = existing
+                continue
+            child_rows = children.get(existing.job_id, {})
+            if child_rows:
+                for child_status, child in child_rows.values():
+                    if child_status in {"pending", "running"}:
+                        leaves[child.job_id] = child
+            else:
+                leaves.update((job.job_id, job) for job in segments)
+    return tuple(leaves.values()), pending_parents
+
+
+def _eta_stratum(config: dict[str, Any] | Job) -> tuple[str, ...]:
+    if isinstance(config, Job):
+        parameters = config.parameters
+        return (
+            config.model,
+            config.backend,
+            config.method,
+            str(parameters.get("workload", "unspecified")),
+            str(parameters.get("topology", "tp1_dp1")),
+        )
+    parameters = config.get("parameters", {})
+    return (
+        str(config.get("model")),
+        str(config.get("backend")),
+        str(config.get("method")),
+        str(parameters.get("workload", "unspecified")),
+        str(parameters.get("topology", "tp1_dp1")),
+    )
+
+
+def _eta_resource_count(state: StateStore, job: Job) -> int:
+    topology = job.parameters.get("topology", "tp1_dp1")
+    if topology != "tp1_dp1":
+        return 2
+    if job.node == "E0-tune":
+        return 1
+    parallel = bool(
+        state.selection("tp1_resource_parallel_v2", {}).get("enabled")
+        or state.selection("tp1_resource_parallel_v1", {}).get("enabled")
+    )
+    return 1 if parallel and _tp1_resource_eligible(job) else job.gpu_count
+
+
+def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
+    if state.selection("formal_priority_eta_v2", None) is not None:
+        return
+    remaining, parent_count = _eta_remaining_jobs(state)
+    if not remaining:
+        return
+    duration_samples: dict[tuple[str, ...], list[float]] = {}
+    startup_samples: dict[tuple[str, ...], list[float]] = {}
+    all_durations: list[float] = []
+    all_startups: list[float] = []
+    for node in PAPER_NODES:
+        for attempt_config, metrics in _metric_rows(state, node):
+            duration = metrics.get("duration_seconds")
+            startup = metrics.get("session_startup_seconds")
+            if not _hard_feasible(metrics) or not isinstance(duration, (int, float)):
+                continue
+            if duration <= 0:
+                continue
+            key = _eta_stratum(attempt_config)
+            duration_samples.setdefault(key, []).append(float(duration))
+            all_durations.append(float(duration))
+            if isinstance(startup, (int, float)) and startup >= 0:
+                startup_samples.setdefault(key, []).append(float(startup))
+                all_startups.append(float(startup))
+    if not all_durations:
+        return
+    fallback_counts: Counter[str] = Counter()
+    cells: list[dict[str, object]] = []
+    global_duration = np.asarray(all_durations, dtype=np.float64)
+    global_startup = np.asarray(all_startups or [0.0], dtype=np.float64)
+    for job in remaining:
+        exact = _eta_stratum(job)
+        coarser = (exact[1], exact[2], exact[4])
+        duration_pool = duration_samples.get(exact)
+        startup_pool = startup_samples.get(exact)
+        if duration_pool is None:
+            pooled = [
+                value
+                for key, values in duration_samples.items()
+                if (key[1], key[2], key[4]) == coarser
+                for value in values
+            ]
+            duration_pool = pooled or list(global_duration)
+            fallback_counts["backend_method_topology" if pooled else "global"] += 1
+        else:
+            fallback_counts["exact"] += 1
+        if startup_pool is None:
+            pooled_startup = [
+                value
+                for key, values in startup_samples.items()
+                if (key[1], key[2], key[4]) == coarser
+                for value in values
+            ]
+            startup_pool = pooled_startup or list(global_startup)
+        affinity = (
+            (job.node, job.block)
+            if job.block is not None
+            and job.node in {"E3b-final", "E6-final", "E0-final", "E5-final"}
+            else None
+        )
+        cells.append(
+            {
+                "node": job.node,
+                "session": exact,
+                "resource_count": _eta_resource_count(state, job),
+                "affinity": affinity,
+                "durations": np.asarray(duration_pool, dtype=np.float64),
+                "startups": np.asarray(startup_pool, dtype=np.float64),
+            }
+        )
+    order_index = {
+        node: index
+        for index, node in enumerate(
+            [row for row in PAPER_NODES if not row.startswith("E5")]
+            + ["E5-pilot", "E5-final"]
+        )
+    }
+    cells.sort(
+        key=lambda row: (
+            order_index.get(str(row["node"]), len(order_index)),
+            -float(np.median(row["durations"])),
+            str(row["session"]),
+        )
+    )
+    rng = np.random.default_rng(config.protocol.seed)
+    total_outcomes = np.empty(10_000, dtype=np.float64)
+    e5_outcomes = np.empty(10_000, dtype=np.float64)
+    for repetition in range(10_000):
+        clocks = [0.0, 0.0]
+        sessions: list[tuple[str, ...] | None] = [None, None]
+        affinity_gpu: dict[tuple[str, int], int] = {}
+        e5_start: float | None = None
+        for row in cells:
+            node = str(row["node"])
+            if node.startswith("E5") and e5_start is None:
+                e5_start = max(clocks)
+            duration = float(rng.choice(row["durations"]))
+            startup = float(rng.choice(row["startups"]))
+            session = row["session"]
+            if row["resource_count"] == 2:
+                start = max(clocks)
+                if sessions[0] != session or sessions[1] != session:
+                    duration += startup
+                clocks[:] = [start + duration, start + duration]
+                sessions[:] = [session, session]
+                continue
+            affinity = row["affinity"]
+            if isinstance(affinity, tuple):
+                gpu = affinity_gpu.setdefault(affinity, min(range(2), key=clocks.__getitem__))
+            else:
+                gpu = min(range(2), key=clocks.__getitem__)
+            if sessions[gpu] != session:
+                duration += startup
+            clocks[gpu] += duration
+            sessions[gpu] = session
+        total_outcomes[repetition] = max(clocks)
+        e5_outcomes[repetition] = max(clocks) - (
+            e5_start if e5_start is not None else max(clocks)
+        )
+    audit = {
+        "version": 2,
+        "remaining_parent_jobs": parent_count,
+        "remaining_leaf_cells": len(remaining),
+        "valid_runtime_attempts": len(all_durations),
+        "valid_startup_attempts": len(all_startups),
+        "fallback_strata": dict(fallback_counts),
+        "tp1_parallel_enabled": bool(
+            state.selection("tp1_resource_parallel_v2", {}).get("enabled")
+        ),
+        "e0_tune_single_gpu_exemption": True,
+        "e5_last": True,
+        "p50_seconds": float(np.quantile(total_outcomes, 0.5)),
+        "p90_seconds": float(np.quantile(total_outcomes, 0.9)),
+        "e5_tail_p50_seconds": float(np.quantile(e5_outcomes, 0.5)),
+        "e5_tail_p90_seconds": float(np.quantile(e5_outcomes, 0.9)),
+        "bootstrap_repetitions": 10_000,
+        "cost_basis": (
+            "stratified cell runtime plus session-switch startup; discrete two-GPU "
+            "scheduler with exclusive-pair, block-affinity, E0 pruning, and E5-last constraints"
+        ),
+    }
+    path = config.run_dir / "stages" / "priority-window-v2" / "eta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, audit)
+    state.set_selection("formal_priority_eta_v2", audit)
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -6910,6 +7373,12 @@ class PaperRunner:
                 nodes = nodes[nodes.index(self.config.protocol.start_stage) :]
             if self.config.protocol.end_stage:
                 nodes = nodes[: nodes.index(self.config.protocol.end_stage) + 1]
+            # Execution priority is operational only: the public 21-node DAG and
+            # dependency semantics stay unchanged, while E5 occupies the final
+            # isolated tail after all selected non-E5 work.
+            nodes = [node for node in nodes if not node.startswith("E5")] + [
+                node for node in nodes if node.startswith("E5")
+            ]
             for node in nodes:
                 if self.stop_event.is_set():
                     break
@@ -6932,19 +7401,19 @@ class PaperRunner:
                     self.stop_event,
                 )
                 _repair_e3b_scientific_rejections(self.state)
-                _run_priority_window_v1(
+                _run_priority_window_v2(
                     self.config,
                     self.state,
                     self.stop_event,
                 )
-                if self.state.selection("formal_priority_window_v1", {}).get("status") == "completed":
+                if self.state.selection("formal_priority_window_v2", {}).get("status") == "completed":
                     _run_tp1_interference_v2(
                         self.config,
                         self.state,
                         self.stop_event,
                     )
                     if not self.stop_event.is_set():
-                        _write_priority_eta_v1(self.config, self.state)
+                        _write_priority_eta_v2(self.config, self.state)
                 if self.stop_event.is_set():
                     break
                 if (

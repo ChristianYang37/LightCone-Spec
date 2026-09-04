@@ -11,9 +11,11 @@ Empirical status: **PAPER-V2 RUN ACTIVE AFTER ONLINESPEC V19 DEPLOYMENT**.
   20 feasible r2 candidates rather than inventing an unavailable 21st row and
   reopened only ten missing r3 dependency cells. Original attempts remain
   immutable and excluded replacements are recorded explicitly.
-- `paper-v2` keeps the 21-node order and now has 1,822 static jobs by running compatible conditions as measured segments on one
-  resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
-  evidence uses six.
+- `paper-v2` keeps the 21-node dependency tuple and now has 1,878 static
+  parents / 7,366 logical leaves. Priority window v2 runs E1a and E0-tune
+  first, completes all remaining non-E5 work, then resumes E5 as the final
+  tail. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0 and E5
+  topology transfer use six.
 - The next deployed SGLang semantic marker is `paper-v1-nextn-shadow-v20`.
   It raises only the DFlash BF16 reconstruction KL envelope from 32 to 64
   numerical units; finite, valid-token masking, relative-RMS, and publication
@@ -45,3 +47,6 @@ Empirical status: **PAPER-V2 RUN ACTIVE AFTER ONLINESPEC V19 DEPLOYMENT**.
   calibrated native-scheduler validation. It fixes the public confidence loss
   weight at 1.0 and fits seven sequential position temperatures; the old
   geometry/weight-search attempts remain auditable but are superseded.
+- E5 keeps its TP1 H3 frontier and appends DFlash/DSpark Static--LightCone
+  transfer under TP2/DP1 and two-replica TP1/DP2. The new rows use system-wide
+  concurrency, add 176 leaves, and remain `UNMEASURED` until deployed.

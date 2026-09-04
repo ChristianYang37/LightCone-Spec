@@ -16,13 +16,13 @@ every segment keeps separate requests, timing, and metrics.
 | E4-screen/local/profile | 52/168/3 | systems factors, TTS update steps, six-block ablation, profiling |
 | E3b-pilot/final | 20/132 | excluded pilots, 12-block primary and six-block secondary curves |
 | E1a | 3 | DSpark confidence capture, source latency, native-scheduler validation (22 segments) |
-| E5-pilot/final | 11/66 | concurrency curves and 12/6-block confirmation |
+| E5-pilot/final | 19/114 | TP1 concurrency curves plus six-block DFlash/DSpark TP2/DP2 transfer |
 | E6-pilot/final | 22/60 | interface/fit and six-block two-model transfer |
 | E0-tune/pilot/final | 54/88/264 | compatibility, frozen OnlineSPEC validation, bundled breadth |
 
-The static materialization is 1,822 jobs; bounded confirmation, E1 load,
+The static materialization is 1,878 jobs and 7,366 logical leaf cells; bounded confirmation, E1 load,
 width, batching calibration, E6 load, eight TTS-S10 confirmation jobs, and 19
-replacement jobs bring the maximum to about 1,917 unique runner jobs. The registered
+replacement jobs bring the maximum to about 1,973 unique runner jobs. The registered
 E4-profile retry is a new attempt of an existing job. The one-time KL64
 reconciliation adds seven replacement cells and one unprivileged activity
 proxy to the current run without adding public DAG nodes. There is no
@@ -40,6 +40,12 @@ global `N` or `final_blocks` setting.
   at `c1` because its source protocol is per-request Full adaptation.
 - E5 secondary: DSpark Static/LightCone and the explicitly separate
   TTS-LoRA-Batched engineering variant, six blocks.
+- E5 dual-GPU transfer: DFlash and DSpark Static/LightCone under TP2/DP1 and
+  two-replica TP1/DP2. The pilot adds `c1`, `c32`, `c128`, and one shared
+  BurstGPT trace; six final blocks use `c32`, `c128`, and BurstGPT. Concurrency
+  is system-wide, so DP2 does not multiply the request budget per replica.
+  These rows report throughput/GPU and distributed telemetry but never enter
+  the TP1 H3 frontier.
 - E4/E6/E0 transfer uses six blocks.
 - L0-naive is the publication-policy ablation. OnlineSPEC OGD, Opt, and Ens use
   frozen public-source hyperparameters and are validated and reported only for
@@ -87,9 +93,12 @@ offline for accepted/rejected tokens, acceptance, Brier, ECE, and ROC-AUC only;
 they do not select a production threshold. Fixed-budget source panels use
 sampling temperature 1 and chain drafting.
 
-The one-time priority window runs compact E1a, complete E5-pilot, and E0-tune
-before returning to E3b-final. It is resumable and does not change `PAPER_NODES`.
-TP1 E0/E5 jobs may share the two GPUs only after an excluded Qwen3-8B+DFlash
+The v2 priority window runs compact E1a and E0-tune before returning to all
+remaining non-E5 work; E5-pilot/final form the final execution tail. It is
+resumable, preserves the v1 audit, and does not change `PAPER_NODES`. E0-tune
+is an exploratory exception: its independent TP1 cells may use both GPUs
+without supporting a paired timing claim. TP1 E0-pilot/final and E5 jobs may
+share the two GPUs only after an excluded Qwen3-8B+DFlash
 interference validation places both goodput and p99-ITL paired BCa intervals
 entirely inside `[-1%,+1%]`; CPU/NUMA bindings and observed affinities are saved.
 
@@ -100,7 +109,10 @@ E3b LightCone–the faster frozen Target-only/Static baseline, and E5
 LightCone–operational-baseline throughput–interactivity frontier area. E3b/E5 use paired log
 ratios, BCa 95% intervals, and exact sign-flip tests over 12 blocks. E4/E6/E0
 use block→request hierarchical bootstrap over six blocks. E5 p99 uses a
-time-block bootstrap. E0 workload-family
+time-block bootstrap with workload and topology in its pairing key. The
+dual-GPU transfer uses within-backend/topology/load paired log ratios, BCa 95%
+intervals, and exact sign-flip tests over six blocks; capacity-infeasible rows
+remain terminal observations. E0 workload-family
 results are exploratory and use BH-FDR.
 
 Aggregate committed-token throughput and per-user generation speed are distinct

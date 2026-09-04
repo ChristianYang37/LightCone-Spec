@@ -19,6 +19,7 @@ from lightcone_spec.runner import (
     _e2_keep_count,
     _e2_missing_dependency_jobs,
     _e5_reference,
+    _eta_resource_count,
     _exclude_redundant_e2_dependency_jobs,
     _execution_allocations,
     _ncu_permission_block_reason,
@@ -35,6 +36,7 @@ from lightcone_spec.runner import (
     _run_e1a_latency_protocol_repair_v3,
     _run_node_jobs,
     _run_pending_jobs,
+    _run_priority_window_v2,
     _run_tp1_interference_v2,
     _save_or_validate_run_config,
     _seed_e3a_static_deployment_width,
@@ -391,6 +393,7 @@ def test_tp1_resource_workers_preserve_declaration_and_claims(monkeypatch, tmp_p
     active = peak = 0
     seen = {}
     ports = {}
+    expected_parallel = enabled or node == "E0-tune"
 
     class FakeServer:
         def __init__(self, *args, **kwargs):
@@ -410,7 +413,7 @@ def test_tp1_resource_workers_preserve_declaration_and_claims(monkeypatch, tmp_p
             seen[job.job_id] = gpus
             active += 1
             peak = max(peak, active)
-        if enabled:
+        if expected_parallel:
             barrier.wait(timeout=5)
         state.complete(job.job_id, attempt)
         with lock:
@@ -421,11 +424,12 @@ def test_tp1_resource_workers_preserve_declaration_and_claims(monkeypatch, tmp_p
     monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
     monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
     _run_pending_jobs(config, state, node, threading.Event(), jobs)
-    assert peak == (2 if enabled else 1)
+    assert peak == (2 if expected_parallel else 1)
     assert len(seen) == 4
     assert all(gpus == ((job.block if job.block is not None else job.ordinal % 2,)
-                        if enabled else (0, 1)) for job in jobs for gpus in [seen[job.job_id]])
-    assert len(set(ports.values())) == (2 if enabled else 1)
+                        if expected_parallel else (0, 1))
+               for job in jobs for gpus in [seen[job.job_id]])
+    assert len(set(ports.values())) == (2 if expected_parallel else 1)
     assert all(job.gpu_count == 2 for job in state.jobs(node))
     _run_pending_jobs(config, state, node, threading.Event(), state.pending_jobs(node))
     assert all(state.next_attempt(job.job_id) == 2 for job in jobs)
@@ -496,6 +500,98 @@ def test_tp1_v2_gate_uses_exact_excluded_interference_matrix(tmp_path):
     assert all(row.parameters["execution_request_count"] == 16 for row in validation)
     assert all(row.parameters["generation_tokens"] == 256 for row in validation)
     assert all(row.parameters["requires_isolation"] is True for row in validation)
+
+
+def test_e0_tune_is_the_only_unconditional_single_gpu_exemption(tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    base = Job(
+        job_id="e0-resource",
+        node="E0-tune",
+        ordinal=1,
+        method="static",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="controlled_baseline",
+        gpu_count=2,
+    )
+    assert _execution_allocations(config, state, "E0-tune", (base,))[base.job_id] == (1,)
+    confirmation = replace(base, node="E0-final")
+    assert _execution_allocations(
+        config, state, "E0-final", (confirmation,)
+    )[base.job_id] == (0, 1)
+
+
+def test_priority_window_v2_migrates_without_overwriting_v1(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("formal_soft_gate_resume_version", 1)
+    state.set_selection(
+        "formal_priority_window_v1",
+        {"version": 1, "status": "completed", "order": ["E1a", "E5-pilot", "E0-tune"]},
+    )
+    calls = []
+    monkeypatch.setattr(
+        "lightcone_spec.runner._run_e1a_source_transfer_v2",
+        lambda config, state, stop: calls.append("E1a"),
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.runner._run_priority_paper_node",
+        lambda config, state, node, stop: calls.append(node),
+    )
+    _run_priority_window_v2(config, state, threading.Event())
+    _run_priority_window_v2(config, state, threading.Event())
+    assert calls == ["E1a", "E0-tune"]
+    assert state.selection("formal_priority_window_v1")["order"][1] == "E5-pilot"
+    migrated = state.selection("formal_priority_window_v2")
+    assert migrated["status"] == "completed"
+    assert migrated["order"] == [
+        "E1a", "E0-tune", "all_non_E5", "E5-pilot", "E5-final"
+    ]
+    assert migrated["preserved_v1_audit"]["version"] == 1
+
+
+def test_completed_e5_prefix_reopens_only_for_appended_topology_parents(tmp_path):
+    state = StateStore(tmp_path)
+    expanded = materialize("E5-pilot")
+    legacy = expanded[:11]
+    state.add_jobs("E5-pilot", legacy)
+    state.set_stage_status("E5-pilot", "completed", row_count=len(legacy))
+    resumed = _resume_materialization(state, "E5-pilot", expanded)
+    assert resumed[:11] == legacy
+    assert resumed[11:] == expanded[11:]
+    state.add_jobs("E5-pilot", resumed)
+    assert state.stage_status("E5-pilot") == "pending"
+    assert len(state.jobs("E5-pilot")) == 19
+
+
+def test_eta_resource_model_includes_e0_exemption_and_dual_gpu_topologies(tmp_path):
+    state = StateStore(tmp_path)
+    e0 = Job(
+        job_id="e0",
+        node="E0-tune",
+        ordinal=0,
+        method="static",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="LiveCodeBench",
+        gpu_count=2,
+    )
+    tp2 = replace(
+        e0,
+        job_id="tp2",
+        node="E5-final",
+        parameters={"topology": "tp2_dp1"},
+    )
+    dp2 = replace(
+        e0,
+        job_id="dp2",
+        node="E5-final",
+        parameters={"topology": "two_replica_tp1_dp2"},
+    )
+    assert _eta_resource_count(state, e0) == 1
+    assert _eta_resource_count(state, tp2) == 2
+    assert _eta_resource_count(state, dp2) == 2
 
 
 def test_tp1_v2_gate_stays_disabled_when_numa_binding_is_unavailable(

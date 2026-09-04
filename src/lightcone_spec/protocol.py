@@ -259,8 +259,18 @@ def paper_plan(
         NodePlan("E3b-pilot", "20", 1, "excluded bundled trajectory pilots"),
         NodePlan("E3b-final", "132", 1, "12-block primary and six-block secondary confirmation"),
         NodePlan("E1a", "3", 1, "DSpark source capture, latency, and native-scheduler validation"),
-        NodePlan("E5-pilot", "11", 2, "serving curve pilot and TP/DP compatibility"),
-        NodePlan("E5-final", "66", 2, "12-block primary and six-block secondary serving curves"),
+        NodePlan(
+            "E5-pilot",
+            "19",
+            2,
+            "serving curve pilot plus DFlash/DSpark TP2 and DP2 transfer",
+        ),
+        NodePlan(
+            "E5-final",
+            "114",
+            2,
+            "12-block TP1 primary and six-block dual-GPU secondary transfer",
+        ),
         NodePlan("E6-pilot", "22", 2, "interface, fit, and bundled pilots"),
         NodePlan("E6-final", "60", 2, "six-block native-MTP transfer"),
         NodePlan("E0-tune", "54", 2, "compatibility and frozen OnlineSPEC validation"),
@@ -814,6 +824,46 @@ def _e5_method_segments(method: str) -> list[dict[str, Any]]:
     return _e5_serving_segments()
 
 
+def _e5_topology_pilot_segments() -> list[dict[str, Any]]:
+    """Small dual-GPU transfer panel; concurrency is system-wide."""
+    return _segments(
+        *(
+            {
+                "load": f"closed_loop_c{value}",
+                "registered_load": f"closed_loop_c{value}",
+                "registered_concurrency_scope": "system",
+            }
+            for value in (1, 32, 128)
+        ),
+        {
+            "load": "burstgpt_shape",
+            "registered_load": "burstgpt_shape",
+            "arrival_trace": "BurstGPT",
+            "registered_concurrency_scope": "system",
+        },
+    )
+
+
+def _e5_topology_final_segments() -> list[dict[str, Any]]:
+    """Confirmatory dual-GPU transfer loads after the pilot."""
+    return _segments(
+        *(
+            {
+                "load": f"closed_loop_c{value}",
+                "registered_load": f"closed_loop_c{value}",
+                "registered_concurrency_scope": "system",
+            }
+            for value in (32, 128)
+        ),
+        {
+            "load": "burstgpt_shape",
+            "registered_load": "burstgpt_shape",
+            "arrival_trace": "BurstGPT",
+            "registered_concurrency_scope": "system",
+        },
+    )
+
+
 def _e5_pilot() -> Iterator[dict[str, Any]]:
     methods = (
         ("NONE", "target_only"),
@@ -852,6 +902,29 @@ def _e5_pilot() -> Iterator[dict[str, Any]]:
             topology=topology,
             workload="topology_compatibility",
         )
+    # Append-only: the first eleven registered parents above retain their
+    # historical identities and configurations on resume.
+    for backend, role, topology in itertools.product(
+        ("DFLASH", "DSPARK"),
+        ("static", "lightcone"),
+        ("tp2_dp1", "two_replica_tp1_dp2"),
+    ):
+        yield dict(
+            method=role,
+            model="Qwen/Qwen3-8B",
+            backend=backend,
+            task="LiveCodeBench",
+            context=40928,
+            load="closed_loop_c1",
+            block=0,
+            gpu_count=2,
+            topology=topology,
+            registered_concurrency_scope="system",
+            comparison_backend=backend,
+            segments=_e5_topology_pilot_segments(),
+            workload="multigpu_serving_transfer",
+            _job_label=f"topology-transfer-{topology}",
+        )
 
 
 def _e5_final() -> Iterator[dict[str, Any]]:
@@ -885,6 +958,30 @@ def _e5_final() -> Iterator[dict[str, Any]]:
             segments=_e5_method_segments(role),
             workload="secondary_serving_frontier",
             )
+    # Secondary six-block transfer. These rows never enter the TP1 H3
+    # frontier and use system-wide concurrency for both TP2 and DP2.
+    for backend, role, topology, block in itertools.product(
+        ("DFLASH", "DSPARK"),
+        ("static", "lightcone"),
+        ("tp2_dp1", "two_replica_tp1_dp2"),
+        SECONDARY_BLOCKS,
+    ):
+        yield dict(
+            method=role,
+            model="Qwen/Qwen3-8B",
+            backend=backend,
+            task="LiveCodeBench",
+            context=40928,
+            load="closed_loop_c32",
+            block=block,
+            gpu_count=2,
+            topology=topology,
+            registered_concurrency_scope="system",
+            comparison_backend=backend,
+            segments=_e5_topology_final_segments(),
+            workload="multigpu_serving_transfer",
+            _job_label=f"topology-transfer-{topology}",
+        )
 
 
 def _e6_segments() -> list[dict[str, Any]]:
