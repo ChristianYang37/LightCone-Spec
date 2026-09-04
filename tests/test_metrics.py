@@ -633,6 +633,12 @@ def test_explicit_adaptive_support_boundary_is_compatibility_infeasible(tmp_path
         "specialized variants fail closed\n"
     )
     assert runner._adaptive_probe_incompatible(RuntimeError("startup failed"), log)
+    assert runner._adaptive_probe_incompatible(
+        RuntimeError(
+            "Cannot find model module. 'Qwen3Eagle3Model' is not a registered model "
+            "and 'AutoModel' is not present in the model config's 'auto_map'"
+        )
+    )
     assert not runner._adaptive_probe_incompatible(ConnectionError("connection refused"))
 
 

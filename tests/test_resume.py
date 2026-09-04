@@ -496,6 +496,57 @@ def test_tp1_worker_startup_failure_stops_sibling_after_active_cell(monkeypatch,
     assert state.status_counts("E0-tune") == {"completed": 1, "pending": 3}
 
 
+def test_e0_probe_unsupported_architecture_is_terminal_compatibility_outcome(
+    monkeypatch, tmp_path
+):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    job = Job(
+        job_id="e0-eagle3-probe",
+        node="E0-tune",
+        ordinal=0,
+        method="static",
+        model="Qwen/Qwen3-4B",
+        backend="EAGLE3",
+        task="CalibrationMix",
+        gpu_count=2,
+        parameters={"probe": True, "adaptive_probe": True},
+    )
+    state.add_jobs("E0-tune", (job,))
+
+    class UnsupportedServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            raise RuntimeError(
+                "Cannot find model module. 'Qwen3Eagle3Model' is not a registered "
+                "model and 'AutoModel' is not present in auto_map"
+            )
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", UnsupportedServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    _run_pending_jobs(
+        config,
+        state,
+        "E0-tune",
+        threading.Event(),
+        state.pending_jobs("E0-tune"),
+    )
+    assert state.status_counts("E0-tune") == {"completed": 1}
+    metrics = json.loads(
+        (state.completed_attempt_dir(job.job_id) / "metrics.json").read_text()
+    )
+    assert metrics["scientific_outcome"] == "infeasible"
+    assert metrics["compatible"] is False
+    assert metrics["capacity_feasible"] == "N/A"
+    assert metrics["compatibility_reason"] == "unsupported_model_architecture"
+
+
 def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
     config = _config(tmp_path)
     state = StateStore(config.run_dir)

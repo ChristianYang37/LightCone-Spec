@@ -285,6 +285,11 @@ def _adaptive_probe_incompatible(
     return (
         "specialized variants fail closed" in message
         or "updates currently require the base DFlashDraftModel" in message
+        or (
+            "Cannot find model module" in message
+            and "is not a registered model" in message
+            and "AutoModel" in message
+        )
     )
 
 
@@ -2793,6 +2798,47 @@ def _complete_infeasible_startup(
     state.complete(job.job_id, attempt)
 
 
+def _complete_compatibility_startup(
+    state: StateStore,
+    job: Job,
+    run_dir: Path,
+    gpus: tuple[int, ...],
+    error: Exception,
+) -> None:
+    """Record an unsupported model/backend pair without calling it capacity loss."""
+
+    attempt_number = state.next_attempt(job.job_id)
+    output_dir = run_dir / "jobs" / job.job_id / f"attempt-{attempt_number:02d}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempt = state.start(job, gpus, output_dir)
+    _write_json(output_dir / "config.json", job.to_dict())
+    _write_json(
+        output_dir / "metrics.json",
+        {
+            "scientific_outcome": "infeasible",
+            "feasible": False,
+            "hard_feasible": False,
+            "capacity_feasible": "N/A",
+            "compatible": False,
+            "static_interface_passed": False,
+            "adaptive_interface_passed": False,
+            "compatibility_reason": "unsupported_model_architecture",
+            "slo_semantics": "report_only_v2",
+            "error": f"{type(error).__name__}: {error}",
+            "request_outcomes": {
+                "offered": 0,
+                "admitted": 0,
+                "completed": 0,
+                "error": 0,
+                "timed_out": 0,
+                "cancelled": 0,
+                "unfinished": 0,
+            },
+        },
+    )
+    state.complete(job.job_id, attempt)
+
+
 def _ncu_permission_block_reason(
     executable: Path, python: Path, gpu: int
 ) -> str | None:
@@ -3676,6 +3722,14 @@ def _run_pending_jobs(
                                 return
                     break
                 except Exception as error:
+                    if first_job.parameters.get("probe") and _adaptive_probe_incompatible(
+                        error, session_dir / "server.log"
+                    ):
+                        for job, _, _ in rows:
+                            _complete_compatibility_startup(
+                                state, job, config.run_dir, gpus, error
+                            )
+                        break
                     if _screening_job(first_job) and _capacity_infeasible(error):
                         for job, _, _ in rows:
                             _complete_infeasible_startup(state, job, config.run_dir, gpus, error)
