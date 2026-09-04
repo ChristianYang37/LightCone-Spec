@@ -1569,6 +1569,21 @@ def test_gpu_acceptance_uses_frozen_online_spec_recipes():
     assert ens.parameters["hedge_learning_rate"] == pytest.approx(1.0)
 
 
+def test_gpu_acceptance_requires_confidence_only_for_adaptive_dspark():
+    import importlib.util
+
+    path = Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py"
+    spec = importlib.util.spec_from_file_location("gpu_acceptance_confidence", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    static = module._job(0, "static", "DSPARK", block=0, tp2=True)
+    adaptive = module._job(1, "lightcone", "DSPARK", block=0, tp2=True)
+    assert not module._requires_confidence_metrics(static)
+    assert module._requires_confidence_metrics(adaptive)
+
+
 def test_onlinespec_ensemble_experts_and_hedge_weights_remain_independent():
     optimizer_type = _patched_online_optimizer()
     optimizer = optimizer_type((torch.tensor([0.0]),), _online_config("onlinespec_ens"))

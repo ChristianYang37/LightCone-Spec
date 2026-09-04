@@ -306,7 +306,11 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         payload["fixed_total_token_budget"] = int(
             chosen.get("proposal_budget", 8)
         ) * _concurrency(job)
-    if scientific_node == "E1a":
+    # E1a fits the seven-position STS vector, but every downstream adaptive
+    # DSpark deployment must consume that frozen calibration as well.  Static
+    # DSpark has no online adapter/config and continues to use its source SPS
+    # scheduler unchanged.
+    if job.backend == "DSPARK":
         payload["confidence_loss_weight"] = float(chosen.get("confidence_loss_weight", 0.1))
         payload["save_confidence_outcomes"] = bool(
             chosen.get("save_confidence_outcomes", False)

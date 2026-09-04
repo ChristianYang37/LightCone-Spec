@@ -167,6 +167,33 @@ def test_tts_and_dspark_registered_fidelity():
         2.0,
         3.0,
     ]
+    downstream_dspark = next(
+        job
+        for job in materialize("E5-pilot")
+        if job.backend == "DSPARK"
+        and job.method == "lightcone"
+        and job.parameters.get("topology") == "tp2_dp1"
+    )
+    downstream_payload = adaptation_payload(
+        downstream_dspark,
+        {
+            "scope": "last1",
+            "parameterization": "lora",
+            "rank": 8,
+            "confidence_loss_weight": 1.0,
+            "confidence_temperatures": [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0],
+        },
+    )
+    assert downstream_payload["confidence_loss_weight"] == 1.0
+    assert downstream_payload["confidence_temperatures"] == [
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5,
+        2.0,
+        3.0,
+    ]
     assert {
         job.parameters["update_steps"]
         for job in materialize("E4-screen")

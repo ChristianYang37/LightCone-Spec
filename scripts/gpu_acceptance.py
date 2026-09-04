@@ -219,6 +219,11 @@ def _needs_publication_witness(job: Job, metrics: dict[str, object]) -> bool:
     )
 
 
+def _requires_confidence_metrics(job: Job) -> bool:
+    """Only adaptive DSpark acceptance must expose online confidence metrics."""
+    return job.backend == "DSPARK" and job.method != "static"
+
+
 def _job(
     ordinal: int,
     method: str,
@@ -609,7 +614,7 @@ def _measure(
         raise RuntimeError(f"{job.method} reported nonzero safety counters: {counters}")
     if job.method not in {"target_only", "static"} and int(after["updates_published"]) < 1:
         raise RuntimeError(f"{job.method} did not publish an update")
-    if job.backend == "DSPARK":
+    if _requires_confidence_metrics(job):
         for name in ("confidence_brier", "confidence_ece"):
             value = after.get(name)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
