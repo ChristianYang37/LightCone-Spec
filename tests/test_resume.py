@@ -547,6 +547,62 @@ def test_e0_probe_unsupported_architecture_is_terminal_compatibility_outcome(
     assert metrics["compatibility_reason"] == "unsupported_model_architecture"
 
 
+def test_e0_pair_calibration_inherits_terminal_session_compatibility(
+    monkeypatch, tmp_path
+):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    jobs = tuple(
+        Job(
+            job_id=f"e0-gemma-dspark-{method}",
+            node="E0-tune",
+            ordinal=51 + index,
+            method=method,
+            model="Gemma4-12B",
+            backend="DSPARK",
+            task="CalibrationMix",
+            gpu_count=2,
+            parameters={"pair_calibration": True},
+        )
+        for index, method in enumerate(("static", "tts", "lightcone"))
+    )
+    state.add_jobs("E0-tune", jobs)
+
+    class UnsupportedServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            raise RuntimeError(
+                "Cannot find model module. 'Gemma4DSparkModel' is not a registered "
+                "model and 'AutoModel' is not present in auto_map"
+            )
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", UnsupportedServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    _run_pending_jobs(
+        config,
+        state,
+        "E0-tune",
+        threading.Event(),
+        state.pending_jobs("E0-tune"),
+    )
+
+    assert state.status_counts("E0-tune") == {"completed": 3}
+    for job in jobs:
+        metrics = json.loads(
+            (state.completed_attempt_dir(job.job_id) / "metrics.json").read_text()
+        )
+        assert metrics["scientific_outcome"] == "infeasible"
+        assert metrics["compatible"] is False
+        assert metrics["capacity_feasible"] == "N/A"
+        assert metrics["compatibility_reason"] == "unsupported_model_architecture"
+
+
 def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
     config = _config(tmp_path)
     state = StateStore(config.run_dir)

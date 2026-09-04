@@ -3722,7 +3722,17 @@ def _run_pending_jobs(
                                 return
                     break
                 except Exception as error:
-                    if first_job.parameters.get("probe") and _adaptive_probe_incompatible(
+                    # E0-tune groups jobs by server session.  The explicit probe can
+                    # already be terminal when a later pair-calibration row is the
+                    # first pending job for that same unsupported model/backend pair.
+                    # Keep the classifier narrow to explicit architecture/support
+                    # errors, but apply it to every E0-tune session rather than only
+                    # rows carrying the original ``probe`` flag.
+                    compatibility_scope = (
+                        first_job.node == "E0-tune"
+                        or first_job.parameters.get("probe")
+                    )
+                    if compatibility_scope and _adaptive_probe_incompatible(
                         error, session_dir / "server.log"
                     ):
                         for job, _, _ in rows:

@@ -639,6 +639,12 @@ def test_explicit_adaptive_support_boundary_is_compatibility_infeasible(tmp_path
             "and 'AutoModel' is not present in the model config's 'auto_map'"
         )
     )
+    assert runner._adaptive_probe_incompatible(
+        RuntimeError(
+            "Cannot find model module. 'Gemma4DSparkModel' is not a registered model "
+            "and 'AutoModel' is not present in the model config's 'auto_map'"
+        )
+    )
     assert not runner._adaptive_probe_incompatible(ConnectionError("connection refused"))
 
 
