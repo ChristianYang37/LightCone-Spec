@@ -173,6 +173,44 @@ def test_dspark_dynamic_batch_budget_repair_requeues_only_latency_cells(tmp_path
     assert state.status_counts("E1a-source-transfer-v2-segments") == {"pending": 16}
 
 
+def test_bundled_pool_stops_claiming_after_child_runtime_failure(monkeypatch, tmp_path: Path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    parent = _e1a_source_transfer_jobs()[1]
+    children = _segment_jobs(parent)
+    state.add_internal_jobs((parent,), storage_node="E1a-source-transfer-v2")
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            self.session_key = ("same",)
+
+        def stop(self):
+            pass
+
+    def fail_cell(config, state, job, *, gpus, **kwargs):
+        attempt_dir = config.run_dir / "failed-pool" / job.job_id
+        attempt_dir.mkdir(parents=True)
+        attempt = state.start(job, gpus, attempt_dir)
+        state.fail(job.job_id, attempt, "synthetic server crash", retry=False)
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", FakeServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", fail_cell)
+
+    _run_pending_jobs(
+        config,
+        state,
+        "E1a-source-transfer-v2",
+        threading.Event(),
+        (parent,),
+    )
+    counts = state.status_counts("E1a-source-transfer-v2-segments")
+    assert 1 <= counts["failed"] <= 2
+    assert counts["pending"] >= len(children) - 2
+    assert state.job_status(parent.job_id) == "pending"
+
+
 def test_preflight_resume_rederives_parallelism_without_new_attempts(monkeypatch, tmp_path: Path):
     config = _config(tmp_path)
     state = StateStore(config.run_dir)

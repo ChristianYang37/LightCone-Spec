@@ -799,6 +799,13 @@ def test_dspark_fixed_budget_scales_to_the_exact_dynamic_batch():
         )
 
 
+def test_online_adaptation_config_retains_registered_batch_size():
+    patch = Path("patches/sglang/0001-arguments-config-and-memory.diff").read_text()
+    assert "+    max_in_flight: int" in patch
+    assert '+        max_in_flight = int(value.get("max_in_flight", 1))' in patch
+    assert "+            max_in_flight=max_in_flight," in patch
+
+
 def test_unified_dspark_model_accepts_markovless_dflash_checkpoint():
     patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
     assert "+        return None" in patch

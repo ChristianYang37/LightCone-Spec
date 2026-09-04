@@ -2610,7 +2610,7 @@ def _run_session_cell_pool(
                     selection=selection,
                     server=process,
                 )
-                if state.status_counts(node).get("failed"):
+                if state.job_status(job.job_id) == "failed":
                     node_failed.set()
                     return
                 if stop_event.is_set() or node_failed.is_set():
@@ -3525,6 +3525,8 @@ def _run_pending_jobs(
         if child_pending and not stop_event.is_set():
             _run_pending_jobs(config, state, node, stop_event, child_pending)
         if stop_event.is_set():
+            return
+        if any(state.job_status(child.job_id) != "completed" for child in children):
             return
         for parent in bundled:
             _complete_segment_parent(config, state, parent, children_by_parent[parent.job_id])
@@ -6461,7 +6463,7 @@ def _e1a_source_transfer_jobs() -> tuple[Job, ...]:
 def _requeue_dspark_dynamic_batch_budget_failures(state: StateStore) -> dict[str, Any]:
     """Reopen only the source-latency cells affected by registered-total scaling."""
 
-    name = "formal_dspark_dynamic_batch_budget_repair_version"
+    name = "formal_dspark_dynamic_batch_budget_repair_v2"
     existing = state.selection(name, None)
     if isinstance(existing, dict):
         return existing
@@ -6475,10 +6477,10 @@ def _requeue_dspark_dynamic_batch_budget_failures(state: StateStore) -> dict[str
         raise RuntimeError(
             f"DSpark dynamic-batch repair expected 16 latency cells, found {len(job_ids)}"
         )
-    reason = "requeued after DSpark registered-total dynamic-batch scaling repair"
+    reason = "requeued after DSpark dynamic-batch config and pool-stop repair"
     reopened = state.retry_failed_job_ids(job_ids, reason=reason)
     audit = {
-        "version": 1,
+        "version": 2,
         "expected_cells": len(job_ids),
         "reopened_failed_cells": reopened,
         "job_ids": list(job_ids),

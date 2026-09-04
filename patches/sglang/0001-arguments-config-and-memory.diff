@@ -151,7 +151,7 @@ new file mode 100644
 index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,293 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -244,6 +244,7 @@ index 00000000..8ec8b2c7
 +    controlled_candidate_role: str | None
 +    reset_scope: str
 +    fixed_total_token_budget: int | None
++    max_in_flight: int
 +    telemetry_round_items: int
 +    adaptation_microbatch_size: int = 1
 +    update_coalescing: int = 1
@@ -364,6 +365,9 @@ index 00000000..8ec8b2c7
 +            not isinstance(fixed_budget, int) or fixed_budget < 1
 +        ):
 +            raise ValueError("fixed_total_token_budget must be a positive integer")
++        max_in_flight = int(value.get("max_in_flight", 1))
++        if max_in_flight < 1:
++            raise ValueError("max_in_flight must be positive")
 +        telemetry_round_items = int(value.get("telemetry_round_items", 3_000_000))
 +        if telemetry_round_items < 1:
 +            raise ValueError("telemetry_round_items must be positive")
@@ -395,6 +399,7 @@ index 00000000..8ec8b2c7
 +            controlled_candidate_role=controlled_role,
 +            reset_scope=reset_scope,
 +            fixed_total_token_budget=fixed_budget,
++            max_in_flight=max_in_flight,
 +            telemetry_round_items=telemetry_round_items,
 +            adaptation_microbatch_size=microbatch,
 +            update_coalescing=coalescing,

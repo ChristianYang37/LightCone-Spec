@@ -150,6 +150,13 @@ class StateStore:
             ).fetchall()
         return tuple(Job(**json.loads(row["config_json"])) for row in rows)
 
+    def job_status(self, job_id: str) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        return None if row is None else str(row["status"])
+
     def start(self, job: Job, gpus: tuple[int, ...], output_dir: Path) -> int:
         with self.connect() as connection:
             row = connection.execute(
