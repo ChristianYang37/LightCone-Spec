@@ -1,3 +1,4 @@
+import json
 import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -7,7 +8,7 @@ import pytest
 
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import (
-    CONFIDENCE_WEIGHTS,
+    DSPARK_CONFIDENCE_LOSS_WEIGHT,
     E0_ONLINESPEC_RECIPES,
     FORMAL_ADAPTATION_STRIDE,
     PAPER_NODES,
@@ -25,6 +26,7 @@ from lightcone_spec.runner import (
     _assigned_gpu,
     _assigned_pair,
     _capacity_infeasible,
+    _cell_inputs,
     _gpu_pairs,
     _incomplete_scientific_outcome,
     _interference_within_tolerance,
@@ -39,7 +41,15 @@ from lightcone_spec.runner import (
     _single_gpu_queues,
     _validate_measured_metrics,
 )
-from lightcone_spec.server import adaptation_payload, server_session_key
+from lightcone_spec.server import (
+    _parse_lscpu_rows,
+    _plan_cpu_affinity,
+    _sysfs_pci_bdf,
+    adaptation_payload,
+    apply_runner_affinity,
+    server_session_key,
+)
+from lightcone_spec.state import StateStore
 
 EXPECTED = {
     "preflight": 10,
@@ -55,7 +65,7 @@ EXPECTED = {
     "E4-profile": 3,
     "E3b-pilot": 20,
     "E3b-final": 132,
-    "E1a": 141,
+    "E1a": 3,
     "E5-pilot": 11,
     "E5-final": 66,
     "E6-pilot": 22,
@@ -69,7 +79,7 @@ EXPECTED = {
 def test_paper_v2_node_order_counts_and_plan():
     assert len(PAPER_NODES) == 21
     assert default_row_counts() == EXPECTED
-    assert sum(EXPECTED.values()) == 1960
+    assert sum(EXPECTED.values()) == 1822
     assert len(paper_plan()) == 21
     assert [row.rows for row in paper_plan() if row.name == "TTS-Cal"] == ["<=108"]
 
@@ -129,12 +139,34 @@ def test_tts_and_dspark_registered_fidelity():
     assert adaptation_payload(sgdm)["optimizer"]["momentum"] == 0.9
     assert payload["teacher_row_policy"] == "latest_update_round_only"
     assert payload["loss_position_decay"] == pytest.approx(math.exp(-1 / 7))
-    confidence = [
-        job.parameters["confidence_loss_weight"]
-        for job in materialize("E1a")
-        if job.parameters.get("workload") == "confidence_calibration"
+    e1a = materialize("E1a")
+    assert len(e1a) == 3
+    assert sum(segment_count(job) for job in e1a) == 22
+    assert {job.parameters["confidence_loss_weight"] for job in e1a} == {
+        DSPARK_CONFIDENCE_LOSS_WEIGHT
+    }
+    assert {job.parameters["source_transfer_recipe"] for job in e1a} == {
+        "dflash_lightcone_recipe"
+    }
+    assert {job.parameters["temperature"] for job in e1a} == {1.0}
+    capture_payload = adaptation_payload(
+        e1a[0],
+        {
+            "scope": "last3",
+            "parameterization": "lora",
+            "rank": 8,
+            "confidence_temperatures": [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0],
+        },
+    )
+    assert capture_payload["confidence_temperatures"] == [
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5,
+        2.0,
+        3.0,
     ]
-    assert tuple(confidence) == CONFIDENCE_WEIGHTS
     assert {
         job.parameters["update_steps"]
         for job in materialize("E4-screen")
@@ -192,6 +224,57 @@ def test_e2_uses_selected_recipe_without_inheriting_e1_runtime_fields():
     assert row.load == "c2"
     assert "registered_load" not in row.parameters
     assert "stimulus_id" not in row.parameters
+
+
+def test_e1a_domain_fit_validation_split_is_deterministic_and_disjoint(tmp_path: Path):
+    dataset = tmp_path / "calibration.jsonl"
+    rows = []
+    for source in ("APPS", "OpenR1-Math", "UltraChat"):
+        rows.extend(
+            {
+                "problem_id": f"{source}-{index}",
+                "prompt": f"{source} prompt {index}",
+                "source": source,
+            }
+            for index in range(24)
+        )
+    rows.extend(
+        {
+            "problem_id": f"synthetic-{index}",
+            "prompt": f"synthetic prompt {index}",
+            "source": "controlled_synthetic",
+        }
+        for index in range(4)
+    )
+    dataset.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="split-test",
+        sglang_root=tmp_path / "sglang",
+        results_root=tmp_path,
+        models={},
+        drafts={},
+        datasets={"CalibrationMix": dataset},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"),
+        protocol=ProtocolConfig(),
+    )
+
+    class Client:
+        @staticmethod
+        def tokenize(prompt):
+            return tuple(range(max(1, len(prompt.split()))))
+
+    fit = _segment_jobs(materialize("E1a")[0])[0]
+    validation = _segment_jobs(materialize("E1a")[2])[0]
+    state = StateStore(config.run_dir)
+    _, _, fit_meta = _cell_inputs(config, state, Client(), fit)
+    _, _, validation_meta = _cell_inputs(config, state, Client(), validation)
+    fit_ids = {row["problem_id"] for row in fit_meta["examples"]}
+    validation_ids = {row["problem_id"] for row in validation_meta["examples"]}
+    assert len(fit_ids) == len(validation_ids) == 12
+    assert fit_ids.isdisjoint(validation_ids)
+    assert fit_ids | validation_ids == {f"OpenR1-Math-{index}" for index in range(24)}
 
 
 def test_e5_source_aligned_methods_and_curves():
@@ -427,14 +510,10 @@ def test_final_bundled_blocks_keep_gpu_affinity_on_partial_resume(tmp_path: Path
 
 
 def test_session_cell_pool_splits_only_independent_segments():
-    parents = tuple(
-        job
-        for job in materialize("E1a")
-        if job.parameters.get("workload") == "confidence_calibration"
-    )
+    parents = materialize("E1a")
     children = tuple(child for parent in parents for child in _segment_jobs(parent))
-    assert len(parents) == len(CONFIDENCE_WEIGHTS)
-    assert len(children) == 50
+    assert len(parents) == 3
+    assert len(children) == 22
     assert all(_session_pool_eligible(job) for job in children)
 
     pool = _SessionCellPool((job, ("e1a",), 8192.0) for job in children)
@@ -444,9 +523,10 @@ def test_session_cell_pool_splits_only_independent_segments():
             job = pool.claim(("e1a",))
             if job is not None:
                 assignments[gpu].append(job.job_id)
-    assert {gpu: len(rows) for gpu, rows in assignments.items()} == {0: 25, 1: 25}
+    assert sum(len(rows) for rows in assignments.values()) == 22
+    assert abs(len(assignments[0]) - len(assignments[1])) <= 1
 
-    remaining = _segment_jobs(parents[-1])[2:]
+    remaining = _segment_jobs(parents[1])[8:]
     pool = _SessionCellPool((job, ("e1a",), 8192.0) for job in remaining)
     resumed = {0: [], 1: []}
     while len(pool):
@@ -469,7 +549,7 @@ def test_session_cell_pool_splits_only_independent_segments():
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(drain) for _ in range(2)]
         claimed = sum((future.result() for future in futures), [])
-    assert len(claimed) == len(set(claimed)) == 50
+    assert len(claimed) == len(set(claimed)) == 22
 
     blocked = replace(children[0], block=0)
     tp2 = replace(
@@ -499,6 +579,40 @@ def test_session_cell_pool_splits_only_independent_segments():
     )
     assert _session_pool_eligible(width)
     assert _session_pool_eligible(runtime_repair)
+
+
+def test_numa_plan_reserves_os_cores_and_assigns_disjoint_gpu_siblings():
+    rows = _parse_lscpu_rows(
+        "# CPU,Core,Socket,Node\n"
+        + "\n".join(
+            f"{cpu},{cpu % 8},0,{0 if cpu % 8 < 4 else 1}"
+            for cpu in range(16)
+        )
+    )
+    plan = _plan_cpu_affinity({0: 0, 1: 1}, rows)
+    runner = set(plan["runner_cpus"])
+    gpu0 = set(plan["gpus"]["0"]["cpus"])
+    gpu1 = set(plan["gpus"]["1"]["cpus"])
+    assert runner and gpu0 and gpu1
+    assert runner.isdisjoint(gpu0 | gpu1)
+    assert gpu0.isdisjoint(gpu1)
+    assert plan["gpus"]["0"]["numa_node"] == 0
+    assert plan["gpus"]["1"]["numa_node"] == 1
+
+
+def test_numa_bdf_normalization_and_safe_discovery_fallback(monkeypatch, tmp_path):
+    assert _sysfs_pci_bdf("00000000:3B:00.0") == "0000:3b:00.0"
+    assert _sysfs_pci_bdf("0000:af:00.0") == "0000:af:00.0"
+    monkeypatch.setenv("LIGHTCONE_NUMA_ISOLATION", "1")
+    monkeypatch.setattr(
+        "lightcone_spec.server.discover_numa_affinity",
+        lambda gpu_ids: (_ for _ in ()).throw(RuntimeError("topology unavailable")),
+    )
+    output = tmp_path / "numa-affinity.json"
+    plan = apply_runner_affinity((0, 1), output)
+    assert plan["enabled"] is False
+    assert plan["fallback"] == "original_process_affinity_and_isolated_gpu_execution"
+    assert json.loads(output.read_text())["enabled"] is False
 
 
 def test_screening_capacity_detects_zero_kv_after_adaptation_headroom():

@@ -53,8 +53,13 @@ requires its selections to exist in the same run database.
 
 ## Execution resources and fixed request budgets
 
-Registered `gpu_count` remains immutable. After excluded TP1 interference
-acceptance enables the internal `tp1_resource_parallel_v1` selection, ordinary
+Registered `gpu_count` remains immutable. With `LIGHTCONE_NUMA_ISOLATION=1`,
+the runner records GPU PCI/NUMA topology, reserves at least four physical cores
+or ten percent of the host for itself and the OS, and launches each SGLang
+server on a disjoint physical-core set (including its SMT siblings). Memory
+placement uses a preferred local node when `numactl` is available; CPU affinity
+remains active when NUMA placement is unavailable. After excluded TP1 interference
+acceptance enables the internal `tp1_resource_parallel_v2` selection, ordinary
 single-server TP1/DP1 E0/E5 jobs reserve one device. TP2, two-replica DP2,
 profilers and isolated controlled pairs retain their pair. Paired blocks stay
 on one allocation; an already started block retains its recorded devices.
@@ -77,3 +82,9 @@ cells separately from parent jobs. Only independent admitted units can overlap;
 a single paired block's tail is not split to fill an idle GPU. Evaluate speedup
 by completed valid cells per hour, not instantaneous GPU utilization (which is
 not a measurement of model FLOP utilization).
+
+After the source-transfer migration is present, the one-time resumable priority
+window runs compact E1a, full E5-pilot, and E0-tune before returning to the
+normal paper-node order. It never substitutes default DSpark confidence
+temperatures: an unavailable seven-position STS recipe disables only
+DSpark-LightCone work, while independent E5 methods remain runnable.

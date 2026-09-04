@@ -11,7 +11,7 @@ Empirical status: **PAPER-V2 RUN ACTIVE AFTER ONLINESPEC V19 DEPLOYMENT**.
   20 feasible r2 candidates rather than inventing an unavailable 21st row and
   reopened only ten missing r3 dependency cells. Original attempts remain
   immutable and excluded replacements are recorded explicitly.
-- `paper-v2` keeps the 21-node order and now has 1,960 static jobs by running compatible conditions as measured segments on one
+- `paper-v2` keeps the 21-node order and now has 1,822 static jobs by running compatible conditions as measured segments on one
   resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
   evidence uses six.
 - The next deployed SGLang semantic marker is `paper-v1-nextn-shadow-v20`.
@@ -40,3 +40,8 @@ Empirical status: **PAPER-V2 RUN ACTIVE AFTER ONLINESPEC V19 DEPLOYMENT**.
   ensemble. Their public chunk/epoch settings are recorded as provenance and
   are not reinterpreted as adaptation stride. All three passed the v19 GPU
   smoke with finite publications and zero safety-counter increments.
+- E1a now uses three source-aligned parents and 22 leaves: per-domain
+  confidence capture, a 16-cell fixed-budget latency panel, and per-domain
+  calibrated native-scheduler validation. It fixes the public confidence loss
+  weight at 1.0 and fits seven sequential position temperatures; the old
+  geometry/weight-search attempts remain auditable but are superseded.

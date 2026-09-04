@@ -1863,7 +1863,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2594 @@
+@@ -0,0 +1,2601 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -3192,6 +3192,7 @@ index 00000000..7b2cb5db
 +        self.confidence_bin_survival = torch.zeros(10, device=device)
 +        self.confidence_probabilities: list[float] = []
 +        self.confidence_outcomes: list[float] = []
++        self.confidence_positions: list[int] = []
 +
 +    @property
 +    def telemetry_tensors(self) -> tuple[torch.Tensor, ...]:
@@ -3226,8 +3227,12 @@ index 00000000..7b2cb5db
 +        self.confidence_bin_prediction.scatter_add_(0, indexes, prediction[valid_mask])
 +        self.confidence_bin_survival.scatter_add_(0, indexes, survival[valid_mask])
 +        if self.config.save_confidence_outcomes:
++            positions = torch.arange(
++                prediction.shape[-1], device=prediction.device
++            ).view(*((1,) * (prediction.ndim - 1)), -1).expand_as(prediction)
 +            self.confidence_probabilities.extend(prediction[valid_mask].cpu().tolist())
 +            self.confidence_outcomes.extend(survival[valid_mask].cpu().tolist())
++            self.confidence_positions.extend(positions[valid_mask].cpu().tolist())
 +
 +    def _confidence_ece(self) -> float | None:
 +        total = float(self.confidence_count.item())
@@ -4019,6 +4024,7 @@ index 00000000..7b2cb5db
 +        self.confidence_bin_survival.zero_()
 +        self.confidence_probabilities.clear()
 +        self.confidence_outcomes.clear()
++        self.confidence_positions.clear()
 +
 +    def reload_config(self, config: OnlineAdaptationConfig) -> None:
 +        if config.stream_priority != self.config.stream_priority:
@@ -4296,6 +4302,7 @@ index 00000000..7b2cb5db
 +            "confidence_ece": self._confidence_ece(),
 +            "confidence_probabilities": list(self.confidence_probabilities),
 +            "confidence_outcomes": list(self.confidence_outcomes),
++            "confidence_positions": list(self.confidence_positions),
 +            "cohort_epoch": self.epoch,
 +            "slot_generation": self.slot_generation,
 +            "active_version": self.active_version,

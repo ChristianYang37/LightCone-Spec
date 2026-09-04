@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -31,6 +32,143 @@ ADAPTIVE_METHODS = {
 
 E2_MINIMUM_UPDATES = (2, 4, 8, 16)
 COHORT_TELEMETRY_ROUND_ITEMS = 3_000_000
+
+
+def _parse_lscpu_rows(text: str) -> tuple[tuple[int, int, int, int], ...]:
+    rows = []
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(",")
+        if len(fields) != 4 or any(value == "-" for value in fields):
+            continue
+        rows.append(tuple(int(value) for value in fields))
+    return tuple(rows)
+
+
+def _sysfs_pci_bdf(value: str) -> str:
+    """Normalize NVIDIA's eight-digit PCI domain to Linux sysfs form."""
+
+    parts = value.strip().lower().split(":")
+    if len(parts) == 3 and len(parts[0]) > 4:
+        parts[0] = parts[0][-4:]
+    return ":".join(parts)
+
+
+def _plan_cpu_affinity(
+    gpu_nodes: dict[int, int],
+    cpu_rows: tuple[tuple[int, int, int, int], ...],
+) -> dict[str, Any]:
+    siblings: dict[tuple[int, int, int], list[int]] = {}
+    for cpu, core, socket, node in cpu_rows:
+        siblings.setdefault((node, socket, core), []).append(cpu)
+    physical = sorted(siblings)
+    if len(physical) < 6:
+        raise RuntimeError("NUMA isolation requires at least six physical CPU cores")
+    reserve_count = max(4, math.ceil(len(physical) * 0.10))
+    by_node: dict[int, list[tuple[int, int, int]]] = {}
+    for key in physical:
+        by_node.setdefault(key[0], []).append(key)
+    reserve_order = [
+        rows[index]
+        for index in range(max(len(rows) for rows in by_node.values()))
+        for _, rows in sorted(by_node.items())
+        if index < len(rows)
+    ]
+    reserved_keys = set(reserve_order[:reserve_count])
+    available = [key for key in physical if key not in reserved_keys]
+    assignments: dict[int, list[tuple[int, int, int]]] = {gpu: [] for gpu in gpu_nodes}
+    distinct_local_nodes = len({node for node in gpu_nodes.values() if node >= 0}) == len(gpu_nodes)
+    if distinct_local_nodes:
+        leftovers = []
+        for key in available:
+            local = [gpu for gpu, node in gpu_nodes.items() if node == key[0]]
+            if local:
+                assignments[local[0]].append(key)
+            else:
+                leftovers.append(key)
+        for index, key in enumerate(leftovers):
+            assignments[sorted(gpu_nodes)[index % len(gpu_nodes)]].append(key)
+    else:
+        for index, key in enumerate(available):
+            assignments[sorted(gpu_nodes)[index % len(gpu_nodes)]].append(key)
+    if any(not values for values in assignments.values()):
+        raise RuntimeError("NUMA isolation could not assign cores to every GPU")
+    return {
+        "runner_cpus": sorted(cpu for key in reserved_keys for cpu in siblings[key]),
+        "gpus": {
+            str(gpu): {
+                "numa_node": gpu_nodes[gpu],
+                "cpus": sorted(cpu for key in keys for cpu in siblings[key]),
+                "memory_policy": "preferred" if gpu_nodes[gpu] >= 0 else "default",
+            }
+            for gpu, keys in assignments.items()
+        },
+    }
+
+
+def discover_numa_affinity(gpu_ids: tuple[int, ...]) -> dict[str, Any]:
+    topo = subprocess.run(
+        ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, check=False
+    )
+    query = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,pci.bus_id",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    lscpu = subprocess.run(
+        ["lscpu", "-p=CPU,CORE,SOCKET,NODE"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if query.returncode or lscpu.returncode:
+        raise RuntimeError("GPU PCI or CPU topology discovery failed")
+    bdfs = {}
+    for line in query.stdout.splitlines():
+        index, bdf = (value.strip() for value in line.split(",", 1))
+        if int(index) in gpu_ids:
+            bdfs[int(index)] = _sysfs_pci_bdf(bdf)
+    if set(bdfs) != set(gpu_ids):
+        raise RuntimeError("GPU topology discovery omitted a configured GPU")
+    nodes = {}
+    for gpu, bdf in bdfs.items():
+        path = Path("/sys/bus/pci/devices") / bdf / "numa_node"
+        nodes[gpu] = int(path.read_text(encoding="utf-8").strip()) if path.is_file() else -1
+    plan = _plan_cpu_affinity(nodes, _parse_lscpu_rows(lscpu.stdout))
+    plan.update(
+        schema_version=1,
+        enabled=True,
+        gpu_bdfs={str(gpu): bdf for gpu, bdf in bdfs.items()},
+        nvidia_topology=topo.stdout if topo.returncode == 0 else "N/A",
+        taskset_available=shutil.which("taskset") is not None,
+        numactl_available=shutil.which("numactl") is not None,
+    )
+    return plan
+
+
+def apply_runner_affinity(gpu_ids: tuple[int, ...], output: Path) -> dict[str, Any] | None:
+    if os.environ.get("LIGHTCONE_NUMA_ISOLATION") != "1":
+        return None
+    try:
+        plan = discover_numa_affinity(gpu_ids)
+        os.sched_setaffinity(0, set(plan["runner_cpus"]))
+        plan["runner_observed_cpus"] = sorted(os.sched_getaffinity(0))
+    except (OSError, RuntimeError, ValueError) as error:
+        plan = {
+            "schema_version": 1,
+            "enabled": False,
+            "fallback": "original_process_affinity_and_isolated_gpu_execution",
+            "reason": f"{type(error).__name__}: {error}",
+        }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return plan
 
 
 def _topology(job: Job) -> tuple[int, int]:
@@ -175,7 +313,12 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         )
         if chosen.get("confidence_threshold") is not None:
             payload["confidence_threshold"] = float(chosen["confidence_threshold"])
-        if chosen.get("confidence_temperature") is not None:
+        temperatures = chosen.get("confidence_temperatures")
+        if temperatures is not None:
+            payload["confidence_temperatures"] = [float(value) for value in temperatures]
+        elif chosen.get("confidence_temperature") is not None:
+            # Historical attempts remain readable, but new DSpark recipes use
+            # the seven-position vector above.
             payload["confidence_temperature"] = float(chosen["confidence_temperature"])
     if method.startswith("onlinespec_"):
         payload["online_spec"] = {
@@ -480,6 +623,9 @@ class ServerProcess:
         self.session_key = server_session_key(job, selection)
         self.process: subprocess.Popen[str] | None = None
         self.log = None
+        self.startup_seconds = 0.0
+        self.last_configure_reused = False
+        self._startup_unreported = True
         self.sampler = GpuSampler(
             gpus,
             output_dir / "gpu.csv",
@@ -503,6 +649,8 @@ class ServerProcess:
             )
         self.job = job
         self.adaptation = adaptation
+        self.last_configure_reused = not self._startup_unreported
+        self._startup_unreported = False
         client = self.client
         client.reset()
         return client
@@ -515,6 +663,7 @@ class ServerProcess:
         )
 
     def start(self) -> SGLangClient:
+        startup_started = time.perf_counter()
         argv = server_command(
             self.config,
             self.job,
@@ -522,6 +671,37 @@ class ServerProcess:
             output_dir=self.output_dir,
             adaptation=self.adaptation,
         )
+        affinity: dict[str, Any] | None = None
+        affinity_path = self.config.run_dir / "numa-affinity.json"
+        if os.environ.get("LIGHTCONE_NUMA_ISOLATION") == "1" and affinity_path.is_file():
+            plan = json.loads(affinity_path.read_text(encoding="utf-8"))
+            bindings = (
+                [plan["gpus"][str(gpu)] for gpu in self.gpus]
+                if plan.get("enabled") is True
+                else []
+            )
+        else:
+            bindings = []
+        if bindings:
+            cpus = sorted({cpu for binding in bindings for cpu in binding["cpus"]})
+            nodes = {int(binding["numa_node"]) for binding in bindings}
+            affinity = {
+                "gpu_ids": list(self.gpus),
+                "cpus": cpus,
+                "numa_nodes": sorted(nodes),
+                "memory_policy": "default",
+            }
+            prefix: list[str] = []
+            if plan.get("taskset_available") and cpus:
+                prefix.extend(("taskset", "-c", ",".join(map(str, cpus))))
+            if plan.get("numactl_available") and len(nodes) == 1 and next(iter(nodes)) >= 0:
+                node = next(iter(nodes))
+                prefix.extend(("numactl", f"--preferred={node}"))
+                affinity["memory_policy"] = f"preferred:{node}"
+            argv = [*prefix, *argv]
+            (self.output_dir / "resource-affinity.json").write_text(
+                json.dumps(affinity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
         (self.output_dir / "server-command.json").write_text(
             json.dumps(argv, indent=2) + "\n", encoding="utf-8"
         )
@@ -555,6 +735,20 @@ class ServerProcess:
             start_new_session=True,
         )
         (self.output_dir / "server.pid").write_text(f"{self.process.pid}\n", encoding="utf-8")
+        if affinity is not None:
+            try:
+                status = Path(f"/proc/{self.process.pid}/status").read_text(encoding="utf-8")
+                allowed = next(
+                    line.split(":", 1)[1].strip()
+                    for line in status.splitlines()
+                    if line.startswith("Cpus_allowed_list:")
+                )
+            except (OSError, StopIteration):
+                allowed = "unavailable"
+            affinity["observed_cpus_allowed_list"] = allowed
+            (self.output_dir / "resource-affinity.json").write_text(
+                json.dumps(affinity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
         self.sampler.start()
         client = self.client
         deadline = time.monotonic() + self.config.server.startup_timeout_seconds
@@ -568,6 +762,8 @@ class ServerProcess:
                     f"SGLang exited during startup with {self.process.returncode}: {tail}"
                 )
             if client.health():
+                self.startup_seconds = time.perf_counter() - startup_started
+                self._startup_unreported = True
                 return client
             time.sleep(1)
         raise TimeoutError("SGLang did not become healthy before the startup timeout")

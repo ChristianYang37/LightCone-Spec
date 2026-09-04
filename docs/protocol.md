@@ -15,14 +15,14 @@ every segment keeps separate requests, timing, and metrics.
 | E2-r0/r1/r2/r3 | 424/109/31/25 | full successive halving and four fixed roles |
 | E4-screen/local/profile | 52/168/3 | systems factors, TTS update steps, six-block ablation, profiling |
 | E3b-pilot/final | 20/132 | excluded pilots, 12-block primary and six-block secondary curves |
-| E1a | 141 | DSpark geometry, five confidence weights, confirmation |
+| E1a | 3 | DSpark confidence capture, source latency, native-scheduler validation (22 segments) |
 | E5-pilot/final | 11/66 | concurrency curves and 12/6-block confirmation |
 | E6-pilot/final | 22/60 | interface/fit and six-block two-model transfer |
 | E0-tune/pilot/final | 54/88/264 | compatibility, frozen OnlineSPEC validation, bundled breadth |
 
-The static materialization is 1,960 jobs; bounded confirmation, E1 load,
+The static materialization is 1,822 jobs; bounded confirmation, E1 load,
 width, batching calibration, E6 load, eight TTS-S10 confirmation jobs, and 19
-replacement jobs bring the maximum to about 2,055 unique runner jobs. The registered
+replacement jobs bring the maximum to about 1,917 unique runner jobs. The registered
 E4-profile retry is a new attempt of an existing job. The one-time KL64
 reconciliation adds seven replacement cells and one unprivileged activity
 proxy to the current run without adding public DAG nodes. There is no
@@ -78,10 +78,20 @@ conversation boundary; zero-publication segments are rejected. The
 source-policy KL is algebraically omitted for the one-step update because its
 gradient is zero at the current source policy.
 
-DSpark keeps its native checkpoint and confidence scheduler. Confidence weights
-`0.05,0.1,0.25,0.5,1.0` are calibration candidates; verification budget,
-Brier score, ECE, ROC-AUC, raw confidence outcomes, and verification waste are
-reported. Fixed-budget source panels use temperature 1 and chain drafting.
+DSpark keeps its native checkpoint and confidence scheduler. Its adaptation
+geometry is copied from the frozen DFlash LightCone recipe, with the public
+confidence loss weight fixed at `1.0`. Seven sequential position temperatures
+are fitted on deterministic per-domain CalibrationMix halves; the other halves
+validate the calibrated native scheduler. Thresholds `0.0..0.9` are replayed
+offline for accepted/rejected tokens, acceptance, Brier, ECE, and ROC-AUC only;
+they do not select a production threshold. Fixed-budget source panels use
+sampling temperature 1 and chain drafting.
+
+The one-time priority window runs compact E1a, complete E5-pilot, and E0-tune
+before returning to E3b-final. It is resumable and does not change `PAPER_NODES`.
+TP1 E0/E5 jobs may share the two GPUs only after an excluded Qwen3-8B+DFlash
+interference validation places both goodput and p99-ITL paired BCa intervals
+entirely inside `[-1%,+1%]`; CPU/NUMA bindings and observed affinities are saved.
 
 ## Statistics
 

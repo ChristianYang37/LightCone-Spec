@@ -51,7 +51,9 @@ from .metrics import (
     validate_scientific_metrics,
 )
 from .protocol import (
-    CONFIDENCE_WEIGHTS,
+    DSPARK_CONFIDENCE_LOSS_WEIGHT,
+    DSPARK_CONFIDENCE_POSITIONS,
+    DSPARK_CONFIDENCE_THRESHOLDS,
     E0_ONLINESPEC_METHODS,
     E0_ONLINESPEC_RECIPES,
     E1_REFERENCE_LOAD,
@@ -73,6 +75,7 @@ from .server import (
     ReplicaServerProcess,
     ServerProcess,
     adaptation_payload,
+    apply_runner_affinity,
     server_session_key,
 )
 from .state import StateStore
@@ -732,6 +735,7 @@ def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int
 def _allow_prompt_repeat(job: Job) -> bool:
     return (
         job.node.startswith("E5")
+        or job.parameters.get("workload") == "dspark_source_latency_panel"
         or job.parameters.get("workload") == "excluded_e6_common_load_probe"
     )
 
@@ -782,7 +786,34 @@ def _cell_inputs(
         job.node == "TTS-Cal"
         or job.parameters.get("workload") == "tts_stride10_confirmation"
     )
-    if tts_calibration_window:
+    domain = job.parameters.get("domain")
+    calibration_split = job.parameters.get("calibration_split")
+    if domain in {"math", "code", "chat"} and calibration_split in {"fit", "validation"}:
+        source = {"math": "OpenR1-Math", "code": "APPS", "chat": "UltraChat"}[str(domain)]
+        domain_records = [
+            dict(row)
+            for row in load_prompt_pool(config.dataset_path(dataset_key))
+            if row.get("source") == source
+        ]
+        random_seed = int(job.parameters.get("calibration_split_seed", 0))
+        rng = np.random.default_rng(random_seed)
+        order = rng.permutation(len(domain_records)).tolist()
+        midpoint = len(order) // 2
+        selected_indexes = order[:midpoint] if calibration_split == "fit" else order[midpoint:]
+        records = tuple(domain_records[index] for index in selected_indexes)
+        if len(records) != count:
+            raise ScientificFailure(
+                f"DSpark {domain} {calibration_split} split supplied {len(records)} prompts; "
+                f"{count} required"
+            )
+        prompts = tuple(str(row["prompt"]) for row in records)
+        metadata.update(
+            examples=records,
+            calibration_domain=domain,
+            calibration_split=calibration_split,
+            calibration_split_seed=random_seed,
+        )
+    elif tts_calibration_window:
         calibration = load_calibration_mix(config.dataset_path(dataset_key))
         start = int(job.block or 0) * 19
         prompts = calibration[start : start + 19]
@@ -1403,6 +1434,10 @@ def _execute_cell(
             _write_json(output_dir / "config.json", raw_config)
             bootstrap_job = _exactness_bootstrap(runtime_job)
             client = server.configure(bootstrap_job, selection)
+            session_startup_seconds = (
+                0.0 if server.last_configure_reused else float(server.startup_seconds)
+            )
+            session_reused = bool(server.last_configure_reused)
             prompts, max_new_tokens, workload = _cell_inputs(config, state, client, input_job)
             offered = len(prompts)
             exactness_rows: list[dict[str, object]] = []
@@ -1818,6 +1853,8 @@ def _execute_cell(
                 "dispatcher_concurrency": dispatcher_concurrency,
                 "effective_load": f"c{dispatcher_concurrency}",
                 "metric_semantics": "per_request_native_v2",
+                "session_startup_seconds": session_startup_seconds,
+                "session_reused": session_reused,
                 "peak_hbm_bytes": peak_hbm,
                 "allocated_peak_hbm_bytes": peak_hbm,
                 "reserved_peak_hbm_bytes": reserved_hbm,
@@ -1907,6 +1944,7 @@ def _execute_cell(
                 "confidence_ece",
                 "confidence_probabilities",
                 "confidence_outcomes",
+                "confidence_positions",
                 "resident_bytes",
                 "peak_bytes",
                 "optimizer_bytes",
@@ -1933,6 +1971,7 @@ def _execute_cell(
                             "confidence_ece",
                             "confidence_probabilities",
                             "confidence_outcomes",
+                            "confidence_positions",
                             "graph_replay_hit_rate",
                             "main_side_overlap_ratio",
                             "memory_ledger",
@@ -2019,14 +2058,21 @@ def _execute_cell(
                 < int(job.parameters.get("minimum_updates", 1))
             ):
                 raise ScientificFailure("adaptive cell did not publish the required updates")
-            if job.parameters.get("workload") == "confidence_calibration":
+            if job.parameters.get("workload") in {
+                "confidence_calibration",
+                "dspark_confidence_capture",
+                "dspark_native_scheduler_validation",
+            }:
                 probabilities = metrics.get("confidence_probabilities")
                 outcomes = metrics.get("confidence_outcomes")
+                positions = metrics.get("confidence_positions")
                 if (
                     not isinstance(probabilities, list)
                     or not probabilities
                     or not isinstance(outcomes, list)
                     or len(probabilities) != len(outcomes)
+                    or not isinstance(positions, list)
+                    or len(positions) != len(outcomes)
                 ):
                     raise ScientificFailure(
                         "confidence calibration produced incomplete probability/outcome telemetry"
@@ -2206,26 +2252,25 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
         return _formalize_recipe(dict(state.selection("tts_recipe", {})))
     if job.method == "tts_lora_batched":
         return _formalize_recipe(dict(state.selection("tts_batched_geometry", {})))
+    scientific_node = str(job.parameters.get("source_node", job.node))
+    if scientific_node == "E1a" and job.backend == "DSPARK":
+        workload = job.parameters.get("workload")
+        if workload == "dspark_native_scheduler_validation":
+            recipe = state.selection("dspark_recipe", None)
+            if not isinstance(recipe, dict):
+                raise ScientificFailure("DSpark native validation lacks fitted STS recipe")
+            return _formalize_recipe(dict(recipe))
+        selected = dict(state.selection("lightcone_recipe", {}))
+        selected.update(
+            confidence_loss_weight=DSPARK_CONFIDENCE_LOSS_WEIGHT,
+            confidence_temperatures=[1.0] * DSPARK_CONFIDENCE_POSITIONS,
+        )
+        return _formalize_recipe(selected)
     if job.method == "lightcone":
         name = "dspark_recipe" if job.backend == "DSPARK" else "lightcone_recipe"
         selected = dict(state.selection(name, {}))
         if job.node.startswith("E6"):
             selected.update(parameterization="lora", rank=8, scope="all")
-        return _formalize_recipe(selected)
-    if job.node.startswith("E1a") and job.method == "lightcone_candidate":
-        finalists = state.selection("e1a_finalists", [])
-        slot = job.parameters.get("finalist_slot")
-        selected = (
-            dict(finalists[int(slot)])
-            if isinstance(slot, int) and slot < len(finalists)
-            else dict(state.selection("lightcone_recipe", {}))
-        )
-        weight = state.selection("dspark_confidence_weight", None)
-        if isinstance(weight, (int, float)):
-            selected["confidence_loss_weight"] = float(weight)
-        temperature = state.selection("dspark_confidence_temperature", None)
-        if isinstance(temperature, (int, float)):
-            selected["confidence_temperature"] = float(temperature)
         return _formalize_recipe(selected)
     if job.method in E0_ONLINESPEC_METHODS:
         if job.parameters.get("recipe_validation"):
@@ -2321,7 +2366,9 @@ def _execution_allocations(
     two-device reservation). Missing or conflicting provenance keeps isolation.
     """
     allocations = {job.job_id: _job_gpus(config, job) for job in jobs}
-    if not state.selection("tp1_resource_parallel_v1", {}).get("enabled"):
+    parallel_v1 = state.selection("tp1_resource_parallel_v1", {}).get("enabled")
+    parallel_v2 = state.selection("tp1_resource_parallel_v2", {}).get("enabled")
+    if not (parallel_v1 or parallel_v2):
         return allocations
     pins: dict[int, set[tuple[int, ...]]] = {}
     with state.connect() as connection:
@@ -2458,7 +2505,13 @@ def _session_pool_eligible(job: Job) -> bool:
         return False
     return (
         job.parameters.get("workload")
-        in {"confidence_calibration", "excluded_deployment_width_tuning"}
+        in {
+            "confidence_calibration",
+            "dspark_confidence_capture",
+            "dspark_source_latency_panel",
+            "dspark_native_scheduler_validation",
+            "excluded_deployment_width_tuning",
+        }
         or job.parameters.get("reconciliation_kind")
         == "screening_runtime_error_classification"
     )
@@ -2844,79 +2897,147 @@ def _safe_screen_row(metrics: dict[str, Any]) -> bool:
     )
 
 
-def _select_confidence_weight(state: StateStore) -> float:
-    grouped: dict[float, list[tuple[float, float, float, int]]] = {}
-    for config, metrics in _metric_rows(state, "E1a"):
-        if config.get("parameters", {}).get("workload") != "confidence_calibration":
+def _confidence_sequences(
+    metrics_rows: Iterable[dict[str, Any]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    sequences: list[tuple[np.ndarray, np.ndarray]] = []
+    for metrics in metrics_rows:
+        probabilities = metrics.get("confidence_probabilities")
+        outcomes = metrics.get("confidence_outcomes")
+        positions = metrics.get("confidence_positions")
+        if not all(isinstance(value, list) for value in (probabilities, outcomes, positions)):
             continue
-        brier = metrics.get("confidence_brier")
-        ece = metrics.get("confidence_ece")
-        required = (
-            brier,
-            ece,
-            metrics.get("goodput"),
-            metrics.get("peak_hbm_bytes"),
-        )
-        if (
-            not _hard_feasible(metrics)
-            or any(metrics.get(counter) != 0 for counter in SAFETY_COUNTERS)
-            or any(
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(float(value))
-                for value in required
-            )
+        if not probabilities or not (len(probabilities) == len(outcomes) == len(positions)):
+            continue
+        current_p: list[float] = []
+        current_y: list[float] = []
+        for probability, outcome, position in zip(
+            probabilities, outcomes, positions, strict=True
         ):
-            continue
-        weight = float(config["parameters"]["confidence_loss_weight"])
-        grouped.setdefault(weight, []).append(
-            (
-                float(brier),
-                float(ece),
-                -float(metrics["goodput"]),
-                int(metrics["peak_hbm_bytes"]),
+            if type(position) is not int or not 0 <= position < DSPARK_CONFIDENCE_POSITIONS:
+                raise ScientificFailure("DSpark confidence telemetry has an invalid position")
+            if position == 0 and current_p:
+                sequences.append(
+                    (np.asarray(current_p, dtype=np.float64), np.asarray(current_y, dtype=np.float64))
+                )
+                current_p, current_y = [], []
+            if position != len(current_p):
+                raise ScientificFailure("DSpark confidence positions are not contiguous prefixes")
+            current_p.append(float(probability))
+            current_y.append(float(outcome))
+        if current_p:
+            sequences.append(
+                (np.asarray(current_p, dtype=np.float64), np.asarray(current_y, dtype=np.float64))
             )
-        )
-    if set(grouped) != set(CONFIDENCE_WEIGHTS) or any(
-        len(rows) != 10 for rows in grouped.values()
-    ):
-        raise ScientificFailure("DSpark confidence calibration is incomplete")
-    candidates = [
-        (
-            float(np.mean([row[0] for row in rows])),
-            float(np.mean([row[1] for row in rows])),
-            float(np.mean([row[2] for row in rows])),
-            max(row[3] for row in rows),
-            weight,
-        )
-        for weight, rows in grouped.items()
-    ]
-    return min(candidates)[-1]
+    return sequences
 
 
-def _select_confidence_temperature(state: StateStore, weight: float) -> float:
-    probabilities: list[float] = []
-    outcomes: list[float] = []
-    for config, metrics in _metric_rows(state, "E1a"):
-        parameters = config.get("parameters", {})
-        if (
-            parameters.get("workload") != "confidence_calibration"
-            or float(parameters.get("confidence_loss_weight", -1)) != weight
-        ):
-            continue
-        probabilities.extend(metrics.get("confidence_probabilities", []))
-        outcomes.extend(metrics.get("confidence_outcomes", []))
-    if not probabilities or len(probabilities) != len(outcomes):
-        raise ScientificFailure("DSpark confidence outcomes are incomplete")
-    probability = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1 - 1e-6)
-    target = np.asarray(outcomes, dtype=np.float64)
-    logits = np.log(probability / (1.0 - probability))
+def _soft_ece(prediction: np.ndarray, target: np.ndarray, bins: int = 20) -> float:
+    if prediction.size == 0 or prediction.shape != target.shape:
+        return math.inf
+    boundaries = np.linspace(0.0, 1.0, bins + 1)
+    indexes = np.minimum(np.searchsorted(boundaries, prediction, side="right") - 1, bins - 1)
+    result = 0.0
+    for index in range(bins):
+        selected = indexes == index
+        if np.any(selected):
+            result += float(np.mean(selected)) * abs(
+                float(np.mean(prediction[selected])) - float(np.mean(target[selected]))
+            )
+    return result
+
+
+def _fit_sequential_confidence_temperatures(
+    sequences: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[float]:
     candidates = np.linspace(0.25, 4.0, 151)
-    losses = []
-    for temperature in candidates:
-        calibrated = 1.0 / (1.0 + np.exp(-logits / temperature))
-        losses.append(float(np.mean((calibrated - target) ** 2)))
-    return float(candidates[int(np.argmin(losses))])
+    temperatures: list[float] = []
+    for position in range(DSPARK_CONFIDENCE_POSITIONS):
+        eligible = [(p, y) for p, y in sequences if len(p) > position]
+        if not eligible:
+            raise ScientificFailure(f"DSpark confidence position {position + 1} has no outcomes")
+        scores = []
+        for candidate in candidates:
+            trial = (*temperatures, float(candidate))
+            predictions = []
+            targets = []
+            for probability, outcome in eligible:
+                raw = np.clip(probability[: position + 1], 1e-6, 1 - 1e-6)
+                logits = np.log(raw / (1.0 - raw))
+                calibrated = 1.0 / (1.0 + np.exp(-logits / np.asarray(trial)))
+                predictions.append(float(np.prod(calibrated)))
+                targets.append(float(np.prod(outcome[: position + 1])))
+            scores.append(_soft_ece(np.asarray(predictions), np.asarray(targets)))
+        temperatures.append(float(candidates[int(np.argmin(scores))]))
+    return temperatures
+
+
+def _threshold_replay(
+    sequences: Sequence[tuple[np.ndarray, np.ndarray]], temperatures: Sequence[float]
+) -> list[dict[str, object]]:
+    rows = []
+    for threshold in DSPARK_CONFIDENCE_THRESHOLDS:
+        probabilities = []
+        outcomes = []
+        accepted = rejected = 0
+        for probability, outcome in sequences:
+            raw = np.clip(probability, 1e-6, 1 - 1e-6)
+            calibrated = 1.0 / (
+                1.0 + np.exp(-np.log(raw / (1.0 - raw)) / np.asarray(temperatures[: len(raw)]))
+            )
+            decision = calibrated >= threshold
+            accepted += int(np.sum(decision))
+            rejected += int(np.sum(~decision))
+            probabilities.extend(calibrated.tolist())
+            outcomes.extend(outcome.tolist())
+        p = np.asarray(probabilities)
+        y = np.asarray(outcomes)
+        positive = y == 1
+        negative = y == 0
+        auc: float | None = None
+        if np.any(positive) and np.any(negative):
+            comparisons = p[positive, None] - p[negative]
+            auc = float(np.mean((comparisons > 0) + 0.5 * (comparisons == 0)))
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "accepted_tokens": float(accepted),
+                "rejected_tokens": float(rejected),
+                "acceptance_rate": float(accepted / max(accepted + rejected, 1)),
+                "brier": float(np.mean((p - y) ** 2)),
+                "ece20": _soft_ece(p, y),
+                "roc_auc": auc,
+            }
+        )
+    return rows
+
+
+def _fit_dspark_recipe(state: StateStore) -> dict[str, Any]:
+    rows = [
+        (config, metrics)
+        for config, metrics in _metric_rows(state, "E1a")
+        if config.get("parameters", {}).get("workload") == "dspark_confidence_capture"
+    ]
+    if len(rows) != 3 or any(not _hard_feasible(metrics) for _, metrics in rows):
+        raise ScientificFailure("DSpark source confidence capture is incomplete")
+    sequences = _confidence_sequences(metrics for _, metrics in rows)
+    temperatures = _fit_sequential_confidence_temperatures(sequences)
+    if len(temperatures) != DSPARK_CONFIDENCE_POSITIONS or any(
+        not math.isfinite(value) or value <= 0 for value in temperatures
+    ):
+        raise ScientificFailure("DSpark STS produced invalid temperatures")
+    recipe = dict(state.selection("lightcone_recipe", {}))
+    if not recipe:
+        raise ScientificFailure("DSpark source transfer lacks the frozen DFlash recipe")
+    recipe.update(
+        confidence_loss_weight=DSPARK_CONFIDENCE_LOSS_WEIGHT,
+        confidence_temperatures=temperatures,
+        verification="native_scheduler",
+        stride=FORMAL_ADAPTATION_STRIDE,
+    )
+    state.set_selection("dspark_threshold_diagnostics", _threshold_replay(sequences, temperatures))
+    state.set_selection("dspark_confidence_temperatures", temperatures)
+    return _formalize_recipe(recipe)
 
 
 def _tts_batched_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
@@ -3528,6 +3649,7 @@ def _run_pending_jobs(
 
     headline = node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
     calibration = state.selection("headline_parallel", {"enabled": False})
+    tp1_parallel = state.selection("tp1_resource_parallel_v2", {"enabled": False})
     exclusive_queues = {
         pair: tuple(job for job in exclusive if allocations[job.job_id] == pair)
         for pair in _gpu_pairs(config)
@@ -3606,7 +3728,11 @@ def _run_pending_jobs(
         port = _resource_port(config, (gpu,))
         run_sessions(jobs, gpus=(gpu,), port=port, label=f"gpu-{gpu}")
 
-    workers = len(queues) if not headline or calibration.get("enabled") else min(1, len(queues))
+    workers = (
+        len(queues)
+        if not headline or calibration.get("enabled") or tp1_parallel.get("enabled")
+        else min(1, len(queues))
+    )
     if workers:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lightcone-gpu") as pool:
             futures = [pool.submit(worker, gpu, jobs) for gpu, jobs in queues.items()]
@@ -3710,48 +3836,31 @@ def _run_node_jobs(
         state.set_selection("deployment_widths", widths)
         state.set_selection("deployment_widths_tuned", True)
         pending = state.pending_jobs(node)
-    if node == "E1a" and state.selection("dspark_confidence_weight", None) is None:
-        calibration = tuple(
-            job for job in pending if job.parameters.get("workload") == "confidence_calibration"
-        )
-        _run_pending_jobs(
-            config,
-            state,
-            node,
-            stop_event,
-            calibration,
-        )
-        if stop_event.is_set():
-            return
-        weight = _select_confidence_weight(state)
-        state.set_selection("dspark_confidence_weight", weight)
-        state.set_selection(
-            "dspark_confidence_temperature",
-            _select_confidence_temperature(state, weight),
-        )
-        pending = state.pending_jobs(node)
-    if node == "E1a" and state.selection("e1a_finalists", None) is None:
-        confirmation = tuple(
-            job for job in pending if isinstance(job.parameters.get("finalist_slot"), int)
-        )
-        screen = tuple(
+    if node in {"E1a", "E1a-source-transfer-v2"}:
+        capture = tuple(
             job
             for job in pending
-            if job not in confirmation
-            and job.parameters.get("workload") != "confidence_calibration"
+            if job.parameters.get("workload") == "dspark_confidence_capture"
         )
-        _run_pending_jobs(config, state, node, stop_event, screen)
-        if stop_event.is_set():
-            return
-        finalists = _rank_candidates(state, node, 4)
-        if len(finalists) != 4:
-            raise ScientificFailure("E1a did not produce four confirmation finalists")
-        state.set_selection("e1a_finalists", finalists)
-        pending = tuple(
-            job
-            for job in state.pending_jobs(node)
-            if isinstance(job.parameters.get("finalist_slot"), int)
-        )
+        if capture:
+            _run_pending_jobs(config, state, node, stop_event, capture)
+            if stop_event.is_set():
+                return
+        if state.selection("dspark_recipe", None) is None:
+            try:
+                state.set_selection("dspark_recipe", _fit_dspark_recipe(state))
+            except ScientificFailure as error:
+                if state.status_counts(node).get("failed"):
+                    raise
+                reason = f"DSpark STS was scientifically unavailable: {error}"
+                state.set_selection("E1a_scientific_unavailable", reason)
+                for job in state.pending_jobs(node):
+                    if (
+                        job.parameters.get("workload")
+                        == "dspark_native_scheduler_validation"
+                    ):
+                        state.skip_job(job.job_id, reason)
+        pending = state.pending_jobs(node)
     if node == "E5-pilot" and state.selection("tts_batched_geometry", None) is None:
         calibration = _tts_batched_calibration_jobs(state)
         if not calibration:
@@ -5192,9 +5301,18 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                 winners[0] if round_index == 3 else winners,
             )
     elif node == "E1a":
-        winners = _rank_candidates(state, node, 1)
-        if winners:
-            state.set_selection("dspark_recipe", winners[0])
+        recipe = state.selection("dspark_recipe", None)
+        validation = [
+            metrics
+            for config_row, metrics in _metric_rows(state, node)
+            if config_row.get("parameters", {}).get("workload")
+            == "dspark_native_scheduler_validation"
+        ]
+        if not isinstance(recipe, dict) or len(validation) != 3 or any(
+            not _hard_feasible(metrics) for metrics in validation
+        ):
+            state.delete_selections(("dspark_recipe",))
+            state.set_selection("E1a_scientific_unavailable", True)
     elif node == "E5-pilot":
         scores: dict[str, float] = {}
         for config, metrics in _metric_rows(state, node):
@@ -6328,6 +6446,322 @@ def _run_soft_gate_resume_v1(
     state.set_selection("formal_soft_gate_resume_version", audit)
 
 
+def _e1a_source_transfer_jobs() -> tuple[Job, ...]:
+    return tuple(
+        replace(
+            job,
+            job_id=f"e1a-source-v2__{job.job_id}",
+            node="E1a-source-transfer-v2",
+            parameters={**job.parameters, "source_node": "E1a"},
+        )
+        for job in materialize("E1a")
+    )
+
+
+def _run_e1a_source_transfer_v2(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    audit = state.selection("formal_e1a_source_transfer_v2", None)
+    jobs = _e1a_source_transfer_jobs()
+    if not isinstance(audit, dict):
+        legacy = state.jobs("E1a")
+        exclusions = set(state.selection("formal_evidence_exclusions", []))
+        exclusions.update(job.job_id for job in legacy)
+        state.set_selection("formal_evidence_exclusions", sorted(exclusions))
+        state.supersede_jobs(
+            tuple(job.job_id for job in legacy),
+            "legacy E1a geometry and confidence-weight search superseded by source transfer v2",
+            stage_node="E1a",
+        )
+        state.delete_selections(
+            (
+                "E1a_failed",
+                "E1a_scientific_unavailable",
+                "dspark_confidence_weight",
+                "dspark_confidence_temperature",
+                "dspark_confidence_temperatures",
+                "dspark_threshold_diagnostics",
+                "dspark_recipe",
+                "e1a_finalists",
+            )
+        )
+        audit = {
+            "version": 2,
+            "parents": 3,
+            "leaves": 22,
+            "legacy_jobs": len(legacy),
+            "status": "running",
+        }
+        state.set_selection("formal_e1a_source_transfer_v2", audit)
+    state.add_internal_jobs(jobs, storage_node="E1a-source-transfer-v2")
+    _run_node_jobs(config, state, "E1a-source-transfer-v2", stop_event)
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "E1a-source-transfer-v2")
+    recipe = state.selection("dspark_recipe", None)
+    validation = [
+        metrics
+        for config_row, metrics in _metric_rows(state, "E1a")
+        if config_row.get("parameters", {}).get("workload")
+        == "dspark_native_scheduler_validation"
+    ]
+    available = isinstance(recipe, dict) and len(validation) == 3 and all(
+        _hard_feasible(metrics) for metrics in validation
+    )
+    if not available:
+        state.delete_selections(("dspark_recipe",))
+        state.set_selection("E1a_scientific_unavailable", True)
+    state.set_stage_status("E1a", "completed", row_count=3)
+    final = {**audit, "status": "completed", "dspark_available": available}
+    path = config.run_dir / "stages" / "E1a-source-transfer-v2" / "audit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, final)
+    state.set_selection("formal_e1a_source_transfer_v2", final)
+
+
+def _run_priority_paper_node(
+    config: ExperimentConfig,
+    state: StateStore,
+    node: str,
+    stop_event: threading.Event,
+) -> None:
+    planned = materialize(node)
+    jobs = _resume_materialization(state, node, planned)
+    upgraded = _upgrade_legacy_e0_materialization(state, jobs) if node == "E0-tune" else None
+    if upgraded is None:
+        state.add_jobs(node, jobs)
+    state.reopen_skipped((node,))
+    dependency = _dependency_reason(config, state, node)
+    if dependency:
+        raise ScientificFailure(f"priority node {node}: {dependency}")
+    _run_node_jobs(config, state, node, stop_event)
+    if stop_event.is_set():
+        return
+    if state.finish_stage(node) != "completed":
+        raise ScientificFailure(f"priority node {node} has terminal failed jobs")
+    _reduce_node(config, state, node)
+
+
+def _run_priority_window_v1(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    audit = state.selection("formal_priority_window_v1", None)
+    if isinstance(audit, dict) and audit.get("status") == "completed":
+        return
+    if state.selection("formal_soft_gate_resume_version", None) is None:
+        return
+    state.set_selection(
+        "formal_priority_window_v1",
+        {"version": 1, "order": ["E1a", "E5-pilot", "E0-tune"], "status": "running"},
+    )
+    _run_e1a_source_transfer_v2(config, state, stop_event)
+    if stop_event.is_set():
+        return
+    for node in ("E5-pilot", "E0-tune"):
+        _run_priority_paper_node(config, state, node, stop_event)
+        if stop_event.is_set():
+            return
+    state.set_selection(
+        "formal_priority_window_v1",
+        {"version": 1, "order": ["E1a", "E5-pilot", "E0-tune"], "status": "completed"},
+    )
+
+
+def _tp1_interference_v2_jobs() -> tuple[Job, ...]:
+    rows = []
+    for mode in ("isolated", "concurrent"):
+        for repetition in range(2):
+            for gpu_index in range(2):
+                rows.append(
+                    Job(
+                        job_id=(
+                            f"TP1-interference-v2__{mode}__rep-{repetition}__gpu-{gpu_index}"
+                        ),
+                        node="TP1-interference-v2",
+                        ordinal=len(rows),
+                        method="static",
+                        model="Qwen/Qwen3-8B",
+                        backend="DFLASH",
+                        task="CalibrationMix",
+                        context=40928,
+                        load="c16",
+                        width=16,
+                        block=2 * repetition + gpu_index,
+                        parameters={
+                            "mode": mode,
+                            "repetition": repetition,
+                            "gpu_index": gpu_index,
+                            "regime": "long_input_short_output",
+                            "generation_tokens": 256,
+                            "execution_request_count": 16,
+                            "workload": "excluded_tp1_numa_interference_v2",
+                            "requires_isolation": True,
+                        },
+                    )
+                )
+    return tuple(rows)
+
+
+def _run_tp1_interference_v2(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    if state.selection("tp1_resource_parallel_v2", None) is not None:
+        return
+    if os.environ.get("LIGHTCONE_NUMA_ISOLATION") != "1":
+        return
+    topology_path = config.run_dir / "numa-affinity.json"
+    topology = (
+        json.loads(topology_path.read_text(encoding="utf-8"))
+        if topology_path.is_file()
+        else {}
+    )
+    if topology.get("enabled") is not True:
+        state.set_selection(
+            "tp1_resource_parallel_v2",
+            {
+                "enabled": False,
+                "criterion": "numa_affinity_unavailable",
+                "topology_evidence": str(topology_path),
+            },
+        )
+        return
+    jobs = _tp1_interference_v2_jobs()
+    state.add_internal_jobs(jobs, storage_node="TP1-interference-v2")
+    for job in state.pending_jobs("TP1-interference-v2"):
+        if job.parameters.get("mode") == "isolated":
+            _run_pending_jobs(config, state, "TP1-interference-v2", stop_event, (job,))
+            if stop_event.is_set():
+                return
+    for repetition in range(2):
+        concurrent = tuple(
+            job
+            for job in state.pending_jobs("TP1-interference-v2")
+            if job.parameters.get("mode") == "concurrent"
+            and job.parameters.get("repetition") == repetition
+        )
+        if concurrent:
+            _run_pending_jobs(config, state, "TP1-interference-v2", stop_event, concurrent)
+        if stop_event.is_set():
+            return
+    _require_internal_jobs(state, "TP1-interference-v2")
+    result = _select_pair_parallelism(state, "TP1-interference-v2")
+    result.update(
+        topology_evidence=str(config.run_dir / "numa-affinity.json"),
+        repetitions_per_gpu=2,
+        request_count=16,
+        context=40928,
+        output_tokens=256,
+    )
+    state.set_selection("tp1_resource_parallel_v2", result)
+    path = config.run_dir / "stages" / "TP1-interference-v2" / "result.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, result)
+
+
+def _remaining_leaf_cells(state: StateStore) -> int:
+    with state.connect() as connection:
+        stored = connection.execute(
+            "SELECT node,status,config_json FROM jobs ORDER BY rowid"
+        ).fetchall()
+    formal_nodes = set(PAPER_NODES)
+    children_by_parent = Counter()
+    for row in stored:
+        job = Job(**json.loads(row["config_json"]))
+        parent = job.parameters.get("parent_job_id")
+        if isinstance(parent, str) and row["status"] in {"pending", "running"}:
+            children_by_parent[parent] += 1
+    total = 0
+    present = Counter(str(row["node"]) for row in stored)
+    for row in stored:
+        node = str(row["node"])
+        if node not in formal_nodes or row["status"] not in {"pending", "running"}:
+            continue
+        job = Job(**json.loads(row["config_json"]))
+        segments = job.parameters.get("segments")
+        if isinstance(segments, list):
+            total += children_by_parent.get(job.job_id, len(segments))
+        else:
+            total += 1
+    valid_e0 = state.selection("valid_e0", None)
+    for node in PAPER_NODES:
+        if present[node]:
+            continue
+        try:
+            planned = materialize(
+                node,
+                valid_e0=valid_e0,
+                e0_recipes=state.selection("e0_recipes", None),
+                e4_neighborhoods=state.selection("e4_neighborhoods", None),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        total += sum(
+            len(job.parameters["segments"])
+            if isinstance(job.parameters.get("segments"), list)
+            else 1
+            for job in planned
+        )
+    return total
+
+
+def _write_priority_eta_v1(config: ExperimentConfig, state: StateStore) -> None:
+    if state.selection("formal_priority_eta_v1", None) is not None:
+        return
+    durations = []
+    for node in PAPER_NODES:
+        for _, metrics in _metric_rows(state, node):
+            duration = metrics.get("duration_seconds")
+            startup = metrics.get("session_startup_seconds", 0.0)
+            if (
+                _hard_feasible(metrics)
+                and isinstance(duration, (int, float))
+                and duration > 0
+                and isinstance(startup, (int, float))
+                and startup >= 0
+            ):
+                durations.append(float(duration) + float(startup))
+    remaining = _remaining_leaf_cells(state)
+    if not durations or remaining < 1:
+        return
+    workers = 2 if (
+        state.selection("headline_parallel", {}).get("enabled")
+        or state.selection("tp1_resource_parallel_v2", {}).get("enabled")
+    ) else 1
+    rng = np.random.default_rng(config.protocol.seed)
+    outcomes = np.empty(10_000, dtype=np.float64)
+    observations = np.asarray(durations, dtype=np.float64)
+    for repetition in range(len(outcomes)):
+        sampled = rng.choice(observations, size=remaining, replace=True)
+        loads = [0.0] * workers
+        for duration in sampled:
+            index = min(range(workers), key=loads.__getitem__)
+            loads[index] += float(duration)
+        outcomes[repetition] = max(loads)
+    audit = {
+        "version": 1,
+        "remaining_leaf_cells": remaining,
+        "valid_attempts": len(durations),
+        "workers": workers,
+        "tp1_parallel_enabled": bool(
+            state.selection("tp1_resource_parallel_v2", {}).get("enabled")
+        ),
+        "p50_seconds": float(np.quantile(outcomes, 0.5)),
+        "p90_seconds": float(np.quantile(outcomes, 0.9)),
+        "bootstrap_repetitions": 10_000,
+        "cost_basis": "cell_runtime_plus_observed_session_startup",
+    }
+    path = config.run_dir / "stages" / "priority-window-v1" / "eta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, audit)
+    state.set_selection("formal_priority_eta_v1", audit)
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -6342,6 +6776,10 @@ class PaperRunner:
         _cleanup_interrupted_servers(self.config.run_dir)
         self.state.recover_interrupted()
         self.config.run_dir.mkdir(parents=True, exist_ok=True)
+        apply_runner_affinity(
+            self.config.gpu_ids,
+            self.config.run_dir / "numa-affinity.json",
+        )
         _save_or_validate_run_config(self.config)
         _save_environment(self.config)
         old_term = signal.signal(signal.SIGTERM, self._signal)
@@ -6374,8 +6812,31 @@ class PaperRunner:
                     self.stop_event,
                 )
                 _repair_e3b_scientific_rejections(self.state)
+                _run_priority_window_v1(
+                    self.config,
+                    self.state,
+                    self.stop_event,
+                )
+                if self.state.selection("formal_priority_window_v1", {}).get("status") == "completed":
+                    _run_tp1_interference_v2(
+                        self.config,
+                        self.state,
+                        self.stop_event,
+                    )
+                    if not self.stop_event.is_set():
+                        _write_priority_eta_v1(self.config, self.state)
                 if self.stop_event.is_set():
                     break
+                if (
+                    node == "E1a"
+                    and isinstance(
+                        self.state.selection("formal_e1a_source_transfer_v2", None),
+                        dict,
+                    )
+                    and self.state.selection("formal_e1a_source_transfer_v2", {}).get("status")
+                    == "completed"
+                ):
+                    continue
                 valid_e0 = self.state.selection("valid_e0", None)
                 e2_rows = None
                 if node == "E2-r0":

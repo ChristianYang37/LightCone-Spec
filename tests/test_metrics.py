@@ -3,6 +3,7 @@ import json
 import math
 from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,7 +24,7 @@ from lightcone_spec.metrics import (
     summarize_attempts,
     validate_scientific_metrics,
 )
-from lightcone_spec.protocol import materialize
+from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
 
@@ -85,37 +86,18 @@ def test_tts_source_policy_kl_has_zero_one_step_gradient():
     )
 
 
-def test_dspark_confidence_selection_aggregates_threshold_segments(monkeypatch):
-    rows = []
-    for weight in (0.05, 0.1, 0.25, 0.5, 1.0):
-        for threshold in range(10):
-            rows.append(
-                (
-                    {
-                        "parameters": {
-                            "workload": "confidence_calibration",
-                            "confidence_loss_weight": weight,
-                            "confidence_threshold": threshold / 10,
-                        }
-                    },
-                    {
-                        "slo_pass": True,
-                        "feasible": True,
-                        **{counter: 0 for counter in SAFETY_COUNTERS},
-                        "confidence_brier": abs(weight - 0.25) + 0.1,
-                        "confidence_ece": abs(weight - 0.25) + 0.05,
-                        "goodput": 100.0,
-                        "peak_hbm_bytes": 10,
-                        "confidence_probabilities": [0.2, 0.8],
-                        "confidence_outcomes": [0.0, 1.0],
-                    },
-                )
-            )
-    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
-    weight = runner._select_confidence_weight(object())
-    temperature = runner._select_confidence_temperature(object(), weight)
-    assert weight == 0.25
-    assert 0.25 <= temperature <= 4.0
+def test_dspark_sequential_temperature_scaling_is_positionwise():
+    sequences = []
+    for offset in range(24):
+        probabilities = np.asarray([0.55 + 0.01 * ((offset + pos) % 4) for pos in range(7)])
+        outcomes = np.asarray([float((offset + pos) % 3 != 0) for pos in range(7)])
+        sequences.append((probabilities, outcomes))
+    temperatures = runner._fit_sequential_confidence_temperatures(sequences)
+    assert len(temperatures) == 7
+    assert all(0.25 <= value <= 4.0 for value in temperatures)
+    diagnostics = runner._threshold_replay(sequences, temperatures)
+    assert [row["threshold"] for row in diagnostics] == [value / 10 for value in range(10)]
+    assert diagnostics[0]["acceptance_rate"] == 1.0
 
 
 def test_tts_recipe_groups_confirmation_stimuli(monkeypatch):
@@ -227,8 +209,28 @@ def test_bugfix_reconciliation_has_exact_152_cell_budget(tmp_path):
         "E2-r0",
         materialize("E2-r0", e2_rows=runner.e2_candidates(geometries)),
     )
-    for node in ("E1a", "TTS-Cal"):
-        state.add_jobs(node, materialize(node))
+    legacy_e1a = tuple(
+        Job(
+            job_id=f"legacy-e1a-{index}",
+            node="E1a",
+            ordinal=index,
+            method="lightcone_candidate",
+            model="Qwen/Qwen3-8B",
+            backend="DSPARK",
+            task="CalibrationMix",
+            parameters={
+                "workload": "confidence_calibration",
+                "confidence_loss_weight": weight,
+                "segments": [
+                    {"confidence_threshold": threshold / 10}
+                    for threshold in range(10)
+                ],
+            },
+        )
+        for index, weight in enumerate((0.05, 0.1, 0.25, 0.5, 1.0))
+    )
+    state.add_jobs("E1a", legacy_e1a)
+    state.add_jobs("TTS-Cal", materialize("TTS-Cal"))
     e3a_parent = materialize("E3a")[111]
     state.add_internal_jobs(
         runner._segment_jobs(e3a_parent),

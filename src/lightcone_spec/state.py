@@ -196,7 +196,13 @@ class StateStore:
                 (reason, job_id),
             )
 
-    def supersede_jobs(self, job_ids: tuple[str, ...], reason: str) -> int:
+    def supersede_jobs(
+        self,
+        job_ids: tuple[str, ...],
+        reason: str,
+        *,
+        stage_node: str = "E0-tune",
+    ) -> int:
         """Retire obsolete pending/failed protocol rows without deleting attempts."""
 
         if not job_ids:
@@ -211,7 +217,8 @@ class StateStore:
             ).rowcount
             connection.execute(
                 "UPDATE stage_state SET status='pending', updated_at=CURRENT_TIMESTAMP "
-                "WHERE node='E0-tune'"
+                "WHERE node=?",
+                (stage_node,),
             )
         return int(changed)
 
@@ -384,6 +391,17 @@ class StateStore:
             connection.execute(
                 "UPDATE stage_state SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE node=?",
                 (node,),
+            )
+
+    def set_stage_status(self, node: str, status: str, *, row_count: int) -> None:
+        if status not in {"pending", "running", "completed", "failed", "skipped"}:
+            raise ValueError(f"invalid stage status {status}")
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO stage_state(node,status,row_count) VALUES(?,?,?) "
+                "ON CONFLICT(node) DO UPDATE SET status=excluded.status, "
+                "row_count=excluded.row_count, updated_at=CURRENT_TIMESTAMP",
+                (node, status, row_count),
             )
 
     def status_counts(self, node: str | None = None) -> dict[str, int]:

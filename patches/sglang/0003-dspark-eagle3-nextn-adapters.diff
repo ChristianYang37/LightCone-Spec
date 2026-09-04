@@ -843,7 +843,7 @@ index ae778ee..eb8fe29 100644
  
          target_model = self.target_worker.model_runner.model
  
-@@ -530,19 +584,51 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -530,19 +584,61 @@ class DSparkWorkerV2(BaseSpecWorker):
                  device=device,
                  target_model=target_model,
                  sampling_info=sampling_info,
@@ -886,22 +886,32 @@ index ae778ee..eb8fe29 100644
 +                    confidence_tap=proposal.confidence_tap,
 +                )
 +                update_confidence = confidence
-+        if (
-+            online_adapter is not None
-+            and confidence is not None
-+            and online_adapter.config.confidence_threshold is not None
-+        ):
-+            probability = torch.sigmoid(
-+                torch.logit(confidence.clamp(1e-6, 1 - 1e-6))
-+                / online_adapter.config.confidence_temperature
++        if online_adapter is not None and confidence is not None:
++            position_temperatures = torch.as_tensor(
++                online_adapter.config.confidence_temperatures,
++                device=confidence.device,
++                dtype=torch.float32,
 +            )
-+            confidence = (
-+                probability >= online_adapter.config.confidence_threshold
-+            ).to(confidence.dtype)
++            if confidence.shape[-1] != position_temperatures.numel():
++                online_adapter.runtime.disable(
++                    "dspark_confidence_temperature_shape_mismatch", exactness=True
++                )
++            else:
++                probability = torch.sigmoid(
++                    torch.logit(confidence.float().clamp(1e-6, 1 - 1e-6))
++                    / position_temperatures
++                ).to(confidence.dtype)
++                confidence = (
++                    (probability >= online_adapter.config.confidence_threshold).to(
++                        confidence.dtype
++                    )
++                    if online_adapter.config.confidence_threshold is not None
++                    else probability
++                )
  
          verify_token_budget = self._verify_planner.resolve_verify_token_budget(
              draft_input=draft_input,
-@@ -550,6 +624,17 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -550,6 +634,17 @@ class DSparkWorkerV2(BaseSpecWorker):
              prefix_lens=prefix_lens,
              req_pool_indices=batch.req_pool_indices,
          )
@@ -919,7 +929,7 @@ index ae778ee..eb8fe29 100644
  
          global_num_reqs = (
              max(batch.global_num_tokens)
-@@ -681,6 +766,120 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -681,6 +776,121 @@ class DSparkWorkerV2(BaseSpecWorker):
              dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
          )
  
@@ -965,10 +975,7 @@ index ae778ee..eb8fe29 100644
 +                                .clone()
 +                            ),
 +                        )
-+                        composite = (
-+                            "native_heads"
-+                            in online_adapter.config.parameter_scope
-+                        )
++                        composite = online_adapter.config.confidence_loss_weight > 0
 +                        confidence_rows = (
 +                            update_confidence[:microbatch]
 +                            if composite and update_confidence is not None
@@ -990,7 +997,11 @@ index ae778ee..eb8fe29 100644
 +                                else None
 +                            ),
 +                            frozen_confidence_temperature=(
-+                                torch.ones(self.gamma, device=device)
++                                torch.as_tensor(
++                                    online_adapter.config.confidence_temperatures,
++                                    device=device,
++                                    dtype=torch.float32,
++                                )
 +                                if confidence_rows is not None
 +                                else None
 +                            ),

@@ -64,7 +64,7 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 -> E0-tune -> E0-pilot -> E0-final
 ```
 
-The `paper-v2` preset registers 1,960 static jobs and about 2,055 unique runner
+The `paper-v2` preset registers 1,822 static jobs and about 1,917 unique runner
 jobs after bounded finalist, load-selection, and existing formal-S=10
 reconciliation work. The one-time KL64/activity reconciliation can add seven
 replacement cells and one unprivileged profile proxy without changing the
@@ -74,7 +74,7 @@ materialized job. A job is one
 registered contexts, loads, traces, or workload pools without reloading the
 same model. The per-node job counts are 10, 140, 72 (at most 108 after TTS
 finalist confirmation), 68 (at most 100 after Pareto confirmation), 424, 109,
-31, 25, 52, 168, 3, 20, 132, 141, 11, 66, 22, 60, 54, 88, and 264.
+31, 25, 52, 168, 3, 20, 132, 3, 11, 66, 22, 60, 54, 88, and 264.
 Primary E3b/E5 conclusions use 12 clean-server blocks; E4/E6/E0 secondary
 evidence uses six. There is no global power-selected repeat count.
 

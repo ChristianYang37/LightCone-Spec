@@ -65,7 +65,9 @@ EXPLORATORY_STRIDE_WORKLOADS = {
     "systems_screen",
     "systems_local_factorial",
 }
-CONFIDENCE_WEIGHTS = (0.05, 0.1, 0.25, 0.5, 1.0)
+DSPARK_CONFIDENCE_LOSS_WEIGHT = 1.0
+DSPARK_CONFIDENCE_POSITIONS = 7
+DSPARK_CONFIDENCE_THRESHOLDS = tuple(round(value / 10, 1) for value in range(10))
 GENERATION_CHECKPOINTS = (1024, 2048, 4096, 8192, 16384, 24576, 32768)
 TTS_GENERATION_TOKENS = 4096
 GEOMETRY_GENERATION_TOKENS = 8192
@@ -256,7 +258,7 @@ def paper_plan(
         NodePlan("E4-profile", "3", 2, "isolated profilers"),
         NodePlan("E3b-pilot", "20", 1, "excluded bundled trajectory pilots"),
         NodePlan("E3b-final", "132", 1, "12-block primary and six-block secondary confirmation"),
-        NodePlan("E1a", "141", 1, "DSpark screen, confidence calibration, and confirmation"),
+        NodePlan("E1a", "3", 1, "DSpark source capture, latency, and native-scheduler validation"),
         NodePlan("E5-pilot", "11", 2, "serving curve pilot and TP/DP compatibility"),
         NodePlan("E5-final", "66", 2, "12-block primary and six-block secondary serving curves"),
         NodePlan("E6-pilot", "22", 2, "interface, fit, and bundled pilots"),
@@ -711,88 +713,76 @@ def _e3b_final() -> Iterator[dict[str, Any]]:
 
 
 def _e1a() -> Iterator[dict[str, Any]]:
-    configs = list(_parameter_geometries())
-    for depth in ("last1", "last3", "last5"):
-        configs.append({"scope": f"{depth}_native_heads", "parameterization": "full", "rank": None})
-        configs.extend(
-            {"scope": f"{depth}_native_heads", "parameterization": "lora", "rank": rank}
-            for rank in RANKS
-        )
-    configs.extend(
-        (
-            {"scope": "none", "parameterization": "none", "rank": None, "baseline": "target_only"},
-            {"scope": "none", "parameterization": "none", "rank": None, "baseline": "static"},
-        )
-    )
-    for configuration, verification in itertools.product(
-        configs, ("fixed_budget", "native_scheduler")
-    ):
-        baseline = configuration.get("baseline")
-        yield dict(
-            method=baseline or "lightcone_candidate",
-            model="Qwen/Qwen3-8B",
-            backend="NONE" if baseline == "target_only" else "DSPARK",
-            task="CalibrationMix",
-            context=40928,
-            width=16,
-            verification=verification,
-            regime="short_input_long_generation",
-            generation_tokens=GEOMETRY_GENERATION_TOKENS,
-            **configuration,
-        )
-    for weight in CONFIDENCE_WEIGHTS:
-        yield dict(
-            method="lightcone_candidate",
-            model="Qwen/Qwen3-8B",
-            backend="DSPARK",
-            task="CalibrationMix",
-            context=40928,
-            width=16,
-            scope="last1_native_heads",
-            parameterization="full",
-            confidence_loss_weight=weight,
-            verification="native_scheduler",
-            regime="short_input_long_generation",
-            generation_tokens=GEOMETRY_GENERATION_TOKENS,
-            workload="confidence_calibration",
-            segments=_segments(
-                *(
-                    {
-                        "confidence_threshold": round(threshold / 10, 1),
-                        "domains": ("math", "code", "chat"),
-                        "save_confidence_outcomes": True,
-                    }
-                    for threshold in range(10)
+    common = {
+        "method": "lightcone",
+        "model": "Qwen/Qwen3-8B",
+        "backend": "DSPARK",
+        "task": "CalibrationMix",
+        "context": 40928,
+        "width": 8,
+        "regime": "short_input_long_generation",
+        "generation_tokens": GEOMETRY_GENERATION_TOKENS,
+        "temperature": 1.0,
+        "confidence_loss_weight": DSPARK_CONFIDENCE_LOSS_WEIGHT,
+        "source_transfer_recipe": "dflash_lightcone_recipe",
+    }
+    yield {
+        **common,
+        "verification": "fixed_budget",
+        "workload": "dspark_confidence_capture",
+        "segments": _segments(
+            *(
+                {
+                    "domain": domain,
+                    "confidence_threshold": 0.0,
+                    "save_confidence_outcomes": True,
+                    "calibration_split_seed": 0,
+                    "calibration_split": "fit",
+                    "execution_request_count": 12,
+                    "proposal_budget": 8,
+                }
+                for domain in ("math", "code", "chat")
+            )
+        ),
+    }
+    yield {
+        **common,
+        "verification": "fixed_budget",
+        "workload": "dspark_source_latency_panel",
+        "segments": _segments(
+            *(
+                {
+                    "proposal_budget": budget,
+                    "load": "c128",
+                    "batch_size": 128,
+                    "context": context,
+                    "latency_context": context,
+                    "execution_request_count": 128,
+                }
+                for budget, context in itertools.product(
+                    (2, 4, 6, 8), (512, 1024, 2048, 4096)
                 )
-            ),
-        )
-    for slot, block in itertools.product(range(4), range(5)):
-        yield dict(
-            method="lightcone_candidate",
-            model="Qwen/Qwen3-8B",
-            backend="DSPARK",
-            task="CalibrationMix",
-            context=40928,
-            width=16,
-            finalist_slot=slot,
-            block=block,
-            verification="native_scheduler",
-            workload="dspark_finalist_confirmation",
-            segments=_segments(
-                *(
-                    {
-                        "proposal_budget": budget,
-                        "verification": "fixed_budget",
-                        "load": "c128",
-                        "batch_size": 128,
-                        "latency_context": context,
-                    }
-                    for budget, context in itertools.product(
-                        (2, 4, 6, 8), (512, 1024, 2048, 4096)
-                    )
-                )
-            ),
-        )
+            )
+        ),
+    }
+    yield {
+        **common,
+        "verification": "native_scheduler",
+        "workload": "dspark_native_scheduler_validation",
+        "segments": _segments(
+            *(
+                {
+                    "domain": domain,
+                    "confidence_threshold": None,
+                    "save_confidence_outcomes": True,
+                    "calibration_split": "validation",
+                    "calibration_split_seed": 0,
+                    "execution_request_count": 12,
+                }
+                for domain in ("math", "code", "chat")
+            )
+        ),
+    }
 
 
 def _e5_serving_segments() -> list[dict[str, Any]]:

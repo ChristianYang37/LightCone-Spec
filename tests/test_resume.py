@@ -30,7 +30,9 @@ from lightcone_spec.runner import (
     _repair_metric_dedup_e5_resume_v1,
     _restore_soft_gate_width_selection,
     _resume_materialization,
+    _run_node_jobs,
     _run_pending_jobs,
+    _run_tp1_interference_v2,
     _save_or_validate_run_config,
     _seed_e3a_static_deployment_width,
     _segment_jobs,
@@ -40,6 +42,7 @@ from lightcone_spec.runner import (
     _set_e2_expected_evidence,
     _skip_satisfied_e2_dependency_jobs,
     _soft_gate_width_replacements,
+    _tp1_interference_v2_jobs,
     _upgrade_legacy_e0_materialization,
 )
 from lightcone_spec.state import StateStore
@@ -74,6 +77,71 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     attempt = state.start(first, (0, 1), tmp_path / "attempt-3")
     state.complete(first.job_id, attempt)
     assert state.status_counts("preflight") == {"completed": 1, "pending": 2}
+
+
+def test_e1a_source_transfer_never_defaults_native_sts(tmp_path: Path):
+    state = StateStore(tmp_path)
+    state.set_selection(
+        "lightcone_recipe",
+        {
+            "scope": "last3",
+            "parameterization": "lora",
+            "rank": 8,
+            "optimizer": "adamw",
+            "learning_rate": 3e-5,
+            "schedule": "constant",
+            "stride": 10,
+        },
+    )
+    capture = _segment_jobs(materialize("E1a")[0])[0]
+    selected = _selection_for_job(state, capture)
+    assert selected is not None
+    assert selected["confidence_loss_weight"] == 1.0
+    assert selected["confidence_temperatures"] == [1.0] * 7
+    assert selected["scope"] == "last3"
+
+    native = _segment_jobs(materialize("E1a")[2])[0]
+    with pytest.raises(ScientificFailure, match="lacks fitted STS recipe"):
+        _selection_for_job(state, native)
+    temperatures = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+    state.set_selection(
+        "dspark_recipe",
+        {**selected, "confidence_temperatures": temperatures, "verification": "native_scheduler"},
+    )
+    assert _selection_for_job(state, native)["confidence_temperatures"] == temperatures
+
+
+def test_e1a_scientific_sts_unavailability_keeps_independent_latency_work(
+    monkeypatch, tmp_path: Path
+):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    parents = tuple(
+        replace(
+            job,
+            job_id=f"source-{job.job_id}",
+            node="E1a-source-transfer-v2",
+            parameters={**job.parameters, "source_node": "E1a"},
+        )
+        for job in materialize("E1a")
+    )
+    state.add_internal_jobs(parents, storage_node="E1a-source-transfer-v2")
+    executed = []
+
+    def fake_run(config, state, node, stop_event, jobs):
+        executed.extend(job.parameters["workload"] for job in jobs)
+        for job in jobs:
+            state.skip_job(job.job_id, "synthetic completed work")
+
+    monkeypatch.setattr("lightcone_spec.runner._run_pending_jobs", fake_run)
+    monkeypatch.setattr(
+        "lightcone_spec.runner._fit_dspark_recipe",
+        lambda state: (_ for _ in ()).throw(ScientificFailure("empty position 7")),
+    )
+    _run_node_jobs(config, state, "E1a-source-transfer-v2", threading.Event())
+    assert executed == ["dspark_confidence_capture", "dspark_source_latency_panel"]
+    assert "empty position 7" in state.selection("E1a_scientific_unavailable")
+    assert state.status_counts("E1a-source-transfer-v2") == {"skipped": 3}
 
 
 def test_preflight_resume_rederives_parallelism_without_new_attempts(monkeypatch, tmp_path: Path):
@@ -259,6 +327,57 @@ def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
         assert _execution_allocations(config, state, base.node, (special,))["base"] == (0, 1)
     special = replace(base, node="E6-final", block=None)
     assert _execution_allocations(config, state, special.node, (special,))["base"] == (0, 1)
+
+
+def test_tp1_v2_gate_uses_exact_excluded_interference_matrix(tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("tp1_resource_parallel_v2", {"enabled": True})
+    job = Job(
+        job_id="ordinary-e5",
+        node="E5-pilot",
+        ordinal=1,
+        method="static",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="CalibrationMix",
+        context=40928,
+        load="c16",
+        width=16,
+        gpu_count=2,
+    )
+    assert _execution_allocations(config, state, job.node, (job,))[job.job_id] == (1,)
+
+    validation = _tp1_interference_v2_jobs()
+    assert len(validation) == 8
+    assert {(row.parameters["mode"], row.parameters["repetition"], row.parameters["gpu_index"])
+            for row in validation} == {
+        (mode, repetition, gpu)
+        for mode in ("isolated", "concurrent")
+        for repetition in range(2)
+        for gpu in range(2)
+    }
+    assert all(row.load == "c16" and row.context == 40928 for row in validation)
+    assert all(row.parameters["execution_request_count"] == 16 for row in validation)
+    assert all(row.parameters["generation_tokens"] == 256 for row in validation)
+    assert all(row.parameters["requires_isolation"] is True for row in validation)
+
+
+def test_tp1_v2_gate_stays_disabled_when_numa_binding_is_unavailable(
+    monkeypatch, tmp_path
+):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    (config.run_dir / "numa-affinity.json").write_text(
+        json.dumps({"enabled": False, "reason": "platform unavailable"})
+    )
+    monkeypatch.setenv("LIGHTCONE_NUMA_ISOLATION", "1")
+    _run_tp1_interference_v2(config, state, threading.Event())
+    selection = state.selection("tp1_resource_parallel_v2")
+    assert selection["enabled"] is False
+    assert selection["criterion"] == "numa_affinity_unavailable"
+    assert state.jobs("TP1-interference-v2") == ()
 
 
 def test_session_order_filter_uses_original_pair_seed(tmp_path):
@@ -599,7 +718,7 @@ def test_reopened_stage_preserves_completed_rows_but_checks_pending_rows(
     tmp_path: Path,
 ):
     state = StateStore(tmp_path)
-    completed, pending = materialize("E1a")[116:118]
+    completed, pending = materialize("E1a")[:2]
     state.add_jobs("E1a", (completed, pending))
     attempt = state.start(completed, (0,), tmp_path / "completed-attempt")
     state.complete(completed.job_id, attempt)

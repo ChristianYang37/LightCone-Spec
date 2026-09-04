@@ -151,7 +151,7 @@ new file mode 100644
 index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,288 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -251,6 +251,7 @@ index 00000000..8ec8b2c7
 +    confidence_loss_weight: float = 0.1
 +    confidence_threshold: float | None = None
 +    confidence_temperature: float = 1.0
++    confidence_temperatures: tuple[float, ...] = (1.0,) * 7
 +    save_confidence_outcomes: bool = False
 +    lora_matrix_policy: str = "linear_weights"
 +    native_head_policy: str = "include_for_hybrid_scope"
@@ -328,6 +329,15 @@ index 00000000..8ec8b2c7
 +        confidence_temperature = _finite(
 +            value.get("confidence_temperature", 1.0), "confidence_temperature"
 +        )
++        raw_confidence_temperatures = value.get("confidence_temperatures")
++        confidence_temperatures = (
++            (confidence_temperature,) * 7
++            if raw_confidence_temperatures is None
++            else tuple(
++                _finite(item, "confidence_temperatures")
++                for item in raw_confidence_temperatures
++            )
++        )
 +        if stride < 1 or canvas < 1 or microbatch < 1 or coalescing < 1:
 +            raise ValueError(
 +                "stride, canvas_tokens, and adaptation_microbatch_size must be positive"
@@ -338,6 +348,10 @@ index 00000000..8ec8b2c7
 +            raise ValueError("confidence_threshold must be between zero and one")
 +        if confidence_temperature <= 0:
 +            raise ValueError("confidence_temperature must be positive")
++        if len(confidence_temperatures) != 7 or any(
++            item <= 0 for item in confidence_temperatures
++        ):
++            raise ValueError("confidence_temperatures must contain seven positive values")
 +        if stream_priority not in {"default", "high"}:
 +            raise ValueError("stream_priority must be default or high")
 +        reset_scope = str(value.get("reset_scope", "cohort"))
@@ -388,6 +402,7 @@ index 00000000..8ec8b2c7
 +            confidence_loss_weight=confidence_weight,
 +            confidence_threshold=confidence_threshold,
 +            confidence_temperature=confidence_temperature,
++            confidence_temperatures=confidence_temperatures,
 +            save_confidence_outcomes=bool(value.get("save_confidence_outcomes", False)),
 +            failure_injection=value.get("failure_injection"),
 +        )

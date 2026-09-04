@@ -1338,8 +1338,8 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
         job
         for job in materialize("E1a")
         if job.backend == "DSPARK"
-        and job.method == "lightcone_candidate"
-        and "native_heads" in job.parameters["scope"]
+        and job.method == "lightcone"
+        and job.parameters.get("workload") == "dspark_confidence_capture"
     )
     dspark = ServerProcess(
         config,
@@ -1351,11 +1351,11 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     )
     with dspark:
         assert launched["env"]["SGLANG_RAGGED_VERIFY_MODE"] == "compact"
-        assert "native_heads" in dspark.adaptation["parameter_scope"]
+        assert dspark.adaptation["confidence_loss_weight"] == 1.0
         calibration = next(
             job
             for job in materialize("E1a")
-            if job.parameters.get("workload") == "confidence_calibration"
+            if job.parameters.get("workload") == "dspark_confidence_capture"
         )
         low = replace(
             calibration,
@@ -1526,19 +1526,18 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     calibration = next(
         item
         for item in materialize("E1a")
-        if item.parameters.get("workload") == "confidence_calibration"
+        if item.parameters.get("workload") == "dspark_confidence_capture"
     )
     e1a = adaptation_payload(
         materialize("E1a")[0],
         {"optimizer": "adamw", "confidence_loss_weight": 0.25},
     )
     assert e1a["fixed_total_token_budget"] == 8
-    assert e1a["confidence_loss_weight"] == 0.25
+    assert e1a["confidence_loss_weight"] == 1.0
     assert e1a["canvas_tokens"] == 8
     assert calibration.parameters["regime"] == "short_input_long_generation"
     assert calibration.parameters["generation_tokens"] == 8192
-    assert calibration.parameters["scope"] == "last1_native_heads"
-    assert calibration.parameters["parameterization"] == "full"
+    assert calibration.parameters["source_transfer_recipe"] == "dflash_lightcone_recipe"
     replacement = calibration.__class__(
         **{
             **calibration.to_dict(),
