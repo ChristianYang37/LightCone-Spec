@@ -15,6 +15,7 @@ from lightcone_spec.runner import (
     ScientificFailure,
     _cleanup_interrupted_servers,
     _complete_blocked_profiler,
+    _e1a_source_transfer_jobs,
     _e2_keep_count,
     _e2_missing_dependency_jobs,
     _e5_reference,
@@ -28,6 +29,7 @@ from lightcone_spec.runner import (
     _repair_e0_e6_partial_resume_v1,
     _repair_e3b_scientific_rejections,
     _repair_metric_dedup_e5_resume_v1,
+    _requeue_dspark_dynamic_batch_budget_failures,
     _restore_soft_gate_width_selection,
     _resume_materialization,
     _run_node_jobs,
@@ -142,6 +144,33 @@ def test_e1a_scientific_sts_unavailability_keeps_independent_latency_work(
     assert executed == ["dspark_confidence_capture", "dspark_source_latency_panel"]
     assert "empty position 7" in state.selection("E1a_scientific_unavailable")
     assert state.status_counts("E1a-source-transfer-v2") == {"skipped": 3}
+
+
+def test_dspark_dynamic_batch_budget_repair_requeues_only_latency_cells(tmp_path: Path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    parents = _e1a_source_transfer_jobs()
+    latency_parent = next(
+        job
+        for job in parents
+        if job.parameters.get("workload") == "dspark_source_latency_panel"
+    )
+    latency = _segment_jobs(latency_parent)
+    state.add_internal_jobs(latency, storage_node="E1a-source-transfer-v2-segments")
+    for job in latency:
+        attempt_dir = config.run_dir / "failed" / job.job_id
+        attempt_dir.mkdir(parents=True)
+        attempt = state.start(job, (0,), attempt_dir)
+        state.fail(job.job_id, attempt, "fixed verification budget lies outside the exact batch", retry=False)
+
+    audit = _requeue_dspark_dynamic_batch_budget_failures(state)
+    assert audit["expected_cells"] == 16
+    assert audit["reopened_failed_cells"] == 16
+    assert state.status_counts("E1a-source-transfer-v2-segments") == {"pending": 16}
+    assert all(state.failed_attempts(job.job_id) == 1 for job in latency)
+
+    assert _requeue_dspark_dynamic_batch_budget_failures(state) == audit
+    assert state.status_counts("E1a-source-transfer-v2-segments") == {"pending": 16}
 
 
 def test_preflight_resume_rederives_parallelism_without_new_attempts(monkeypatch, tmp_path: Path):

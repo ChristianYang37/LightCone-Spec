@@ -6458,6 +6458,36 @@ def _e1a_source_transfer_jobs() -> tuple[Job, ...]:
     )
 
 
+def _requeue_dspark_dynamic_batch_budget_failures(state: StateStore) -> dict[str, Any]:
+    """Reopen only the source-latency cells affected by registered-total scaling."""
+
+    name = "formal_dspark_dynamic_batch_budget_repair_version"
+    existing = state.selection(name, None)
+    if isinstance(existing, dict):
+        return existing
+    parent = next(
+        job
+        for job in _e1a_source_transfer_jobs()
+        if job.parameters.get("workload") == "dspark_source_latency_panel"
+    )
+    job_ids = tuple(job.job_id for job in _segment_jobs(parent))
+    if len(job_ids) != 16:
+        raise RuntimeError(
+            f"DSpark dynamic-batch repair expected 16 latency cells, found {len(job_ids)}"
+        )
+    reason = "requeued after DSpark registered-total dynamic-batch scaling repair"
+    reopened = state.retry_failed_job_ids(job_ids, reason=reason)
+    audit = {
+        "version": 1,
+        "expected_cells": len(job_ids),
+        "reopened_failed_cells": reopened,
+        "job_ids": list(job_ids),
+        "reason": reason,
+    }
+    state.set_selection(name, audit)
+    return audit
+
+
 def _run_e1a_source_transfer_v2(
     config: ExperimentConfig,
     state: StateStore,
@@ -6496,6 +6526,7 @@ def _run_e1a_source_transfer_v2(
         }
         state.set_selection("formal_e1a_source_transfer_v2", audit)
     state.add_internal_jobs(jobs, storage_node="E1a-source-transfer-v2")
+    _requeue_dspark_dynamic_batch_budget_failures(state)
     _run_node_jobs(config, state, "E1a-source-transfer-v2", stop_event)
     if stop_event.is_set():
         return

@@ -310,6 +310,21 @@ class StateStore:
                 )
             return int(changed)
 
+    def retry_failed_job_ids(self, job_ids: tuple[str, ...], *, reason: str) -> int:
+        """Requeue an exact diagnosed job set without removing failed attempts."""
+
+        if not job_ids:
+            return 0
+        placeholders = ",".join("?" for _ in job_ids)
+        with self.connect() as connection:
+            changed = connection.execute(
+                f"UPDATE jobs SET status='pending', assigned_gpus=NULL, started_at=NULL, "
+                f"completed_at=NULL, error=? WHERE job_id IN ({placeholders}) "
+                "AND status='failed'",
+                (reason, *job_ids),
+            ).rowcount
+            return int(changed)
+
     def reopen_skipped(self, nodes: tuple[str, ...]) -> int:
         """Resume future DAG nodes skipped by an earlier dependency failure."""
 
