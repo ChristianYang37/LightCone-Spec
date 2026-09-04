@@ -478,6 +478,13 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     assert max(estimated.values()) / min(estimated.values()) < 1.01
     assert _screening_job(tts_screen[0])
 
+    e0_pair_calibration = next(
+        job
+        for job in materialize("E0-tune")
+        if job.parameters.get("pair_calibration")
+    )
+    assert _screening_job(e0_pair_calibration)
+
     remaining_e1 = tuple(
         job for job in materialize("E1") if job.ordinal in {51, 61}
     )

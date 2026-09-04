@@ -603,6 +603,57 @@ def test_e0_pair_calibration_inherits_terminal_session_compatibility(
         assert metrics["compatibility_reason"] == "unsupported_model_architecture"
 
 
+def test_e0_pair_calibration_capacity_failure_is_terminal_infeasible(
+    monkeypatch, tmp_path
+):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    job = Job(
+        job_id="e0-qwen14-dspark-lightcone",
+        node="E0-tune",
+        ordinal=40,
+        method="lightcone",
+        model="Qwen/Qwen3-14B",
+        backend="DSPARK",
+        task="CalibrationMix",
+        gpu_count=2,
+        parameters={"pair_calibration": True},
+    )
+    state.add_jobs("E0-tune", (job,))
+
+    class CapacityBlockedServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            raise RuntimeError(
+                "Loaded weights and the 27.388 GiB unallocated adaptation "
+                "headroom leave no GPU memory for the KV cache"
+            )
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", CapacityBlockedServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    _run_pending_jobs(
+        config,
+        state,
+        "E0-tune",
+        threading.Event(),
+        state.pending_jobs("E0-tune"),
+    )
+
+    assert state.status_counts("E0-tune") == {"completed": 1}
+    metrics = json.loads(
+        (state.completed_attempt_dir(job.job_id) / "metrics.json").read_text()
+    )
+    assert metrics["scientific_outcome"] == "infeasible"
+    assert metrics["capacity_feasible"] is False
+    assert metrics["hard_feasible"] is False
+
+
 def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
     config = _config(tmp_path)
     state = StateStore(config.run_dir)

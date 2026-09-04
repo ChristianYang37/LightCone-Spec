@@ -198,6 +198,7 @@ def _screening_job(job: Job) -> bool:
     if node.endswith("-segments"):
         node = node[: -len("-segments")]
     return node in {
+        "E0-tune",
         "E3a",
         "TTS-Cal",
         "E1-common-load",
