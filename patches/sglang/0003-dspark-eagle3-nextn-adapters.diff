@@ -911,7 +911,7 @@ index ae778ee..eb8fe29 100644
  
          verify_token_budget = self._verify_planner.resolve_verify_token_budget(
              draft_input=draft_input,
-@@ -550,6 +634,17 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -550,6 +634,18 @@ class DSparkWorkerV2(BaseSpecWorker):
              prefix_lens=prefix_lens,
              req_pool_indices=batch.req_pool_indices,
          )
@@ -925,11 +925,12 @@ index ae778ee..eb8fe29 100644
 +                verify_width=self.verify_num_draft_tokens,
 +                fixed_total_token_budget=online_adapter.config.fixed_total_token_budget,
 +                native_total_token_budget=None,
++                configured_batch_size=online_adapter.config.max_in_flight,
 +            ).total_token_budget
  
          global_num_reqs = (
              max(batch.global_num_tokens)
-@@ -681,6 +776,121 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -681,6 +777,121 @@ class DSparkWorkerV2(BaseSpecWorker):
              dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
          )
  
@@ -1056,7 +1057,7 @@ new file mode 100644
 index 0000000..128c698
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_online_adaptation.py
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,553 @@
 +"""DSpark adaptation tensors and loss functions."""
 +
 +from __future__ import annotations
@@ -1538,6 +1539,7 @@ index 0000000..128c698
 +    verify_width: int,
 +    fixed_total_token_budget: int | None,
 +    native_total_token_budget: int | None,
++    configured_batch_size: int | None = None,
 +) -> DSparkVerificationDecision:
 +    if (
 +        not isinstance(batch_size, int)
@@ -1552,16 +1554,28 @@ index 0000000..128c698
 +    if mode == "fixed_budget":
 +        if native_total_token_budget is not None:
 +            raise ValueError("fixed verification cannot consume a native decision")
++        configured = (
++            batch_size if configured_batch_size is None else configured_batch_size
++        )
 +        if (
-+            not isinstance(fixed_total_token_budget, int)
++            not isinstance(configured, int)
++            or isinstance(configured, bool)
++            or configured < batch_size
++            or not isinstance(fixed_total_token_budget, int)
 +            or isinstance(fixed_total_token_budget, bool)
-+            or not batch_size <= fixed_total_token_budget <= maximum
++            or fixed_total_token_budget % configured != 0
 +        ):
++            raise ValueError(
++                "fixed verification budget is invalid for the configured batch"
++            )
++        per_request = fixed_total_token_budget // configured
++        exact_total = batch_size * per_request
++        if not batch_size <= exact_total <= maximum:
 +            raise ValueError("fixed verification budget lies outside the exact batch")
 +        return DSparkVerificationDecision(
 +            mode,
-+            fixed_total_token_budget,
-+            fixed_total_token_budget - batch_size,
++            exact_total,
++            exact_total - batch_size,
 +            False,
 +        )
 +    if mode != "native_scheduler":

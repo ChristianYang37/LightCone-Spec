@@ -741,6 +741,64 @@ def test_qwen_speculative_workspace_covers_registered_width():
     assert "speculative_num_draft_tokens or 0" not in patch
 
 
+def _patched_dspark_verification_resolver():
+    patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "dspark_online_adaptation.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    nodes = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "DSparkVerificationDecision"
+        )
+        or (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "resolve_dspark_verification"
+        )
+    ]
+    namespace = {"dataclass": dataclass}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(patch), "exec"), namespace)
+    return namespace["resolve_dspark_verification"]
+
+
+def test_dspark_fixed_budget_scales_to_the_exact_dynamic_batch():
+    resolve = _patched_dspark_verification_resolver()
+    full = resolve(
+        mode="fixed_budget",
+        batch_size=128,
+        verify_width=8,
+        fixed_total_token_budget=256,
+        native_total_token_budget=None,
+        configured_batch_size=128,
+    )
+    partial = resolve(
+        mode="fixed_budget",
+        batch_size=1,
+        verify_width=8,
+        fixed_total_token_budget=256,
+        native_total_token_budget=None,
+        configured_batch_size=128,
+    )
+    assert (full.total_token_budget, full.additional_token_budget) == (256, 128)
+    assert (partial.total_token_budget, partial.additional_token_budget) == (2, 1)
+    with pytest.raises(ValueError, match="configured batch"):
+        resolve(
+            mode="fixed_budget",
+            batch_size=1,
+            verify_width=8,
+            fixed_total_token_budget=257,
+            native_total_token_budget=None,
+            configured_batch_size=128,
+        )
+
+
 def test_unified_dspark_model_accepts_markovless_dflash_checkpoint():
     patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
     assert "+        return None" in patch
@@ -1538,6 +1596,25 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     assert calibration.parameters["regime"] == "short_input_long_generation"
     assert calibration.parameters["generation_tokens"] == 8192
     assert calibration.parameters["source_transfer_recipe"] == "dflash_lightcone_recipe"
+    latency = next(
+        job
+        for job in materialize("E1a")
+        if job.parameters.get("workload") == "dspark_source_latency_panel"
+    )
+    latency_segment = latency.__class__(
+        **{
+            **latency.to_dict(),
+            "context": latency.parameters["segments"][0]["context"],
+            "load": latency.parameters["segments"][0]["load"],
+            "parameters": {
+                **latency.parameters,
+                **latency.parameters["segments"][0],
+            },
+        }
+    )
+    latency_payload = adaptation_payload(latency_segment)
+    assert latency_payload["max_in_flight"] == 128
+    assert latency_payload["fixed_total_token_budget"] == 256
     replacement = calibration.__class__(
         **{
             **calibration.to_dict(),
