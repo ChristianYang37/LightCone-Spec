@@ -435,6 +435,67 @@ def test_tp1_resource_workers_preserve_declaration_and_claims(monkeypatch, tmp_p
     assert all(state.next_attempt(job.job_id) == 2 for job in jobs)
 
 
+def test_tp1_worker_startup_failure_stops_sibling_after_active_cell(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    jobs = tuple(
+        Job(
+            job_id=f"e0-{ordinal}",
+            node="E0-tune",
+            ordinal=ordinal,
+            method="static",
+            model="Qwen/Qwen3-8B",
+            backend="DFLASH",
+            task="CalibrationMix",
+            gpu_count=2,
+        )
+        for ordinal in range(4)
+    )
+    state.add_jobs("E0-tune", jobs)
+    gpu1_started = threading.Event()
+    executed: list[str] = []
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            self.gpus = kwargs["gpus"]
+
+        def __enter__(self):
+            if self.gpus == (0,):
+                assert gpu1_started.wait(timeout=5)
+                raise RuntimeError("deterministic startup failure")
+            gpu1_started.set()
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def execute(config, state, job, *, gpus, **kwargs):
+        attempt = state.start(job, gpus, tmp_path / job.job_id)
+        time.sleep(0.02)
+        state.complete(job.job_id, attempt)
+        executed.append(job.job_id)
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", FakeServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    monkeypatch.setattr(
+        "lightcone_spec.runner.server_session_key",
+        lambda job, selection: (job.job_id,),
+    )
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    with pytest.raises(RuntimeError, match="deterministic startup failure"):
+        _run_pending_jobs(
+            config,
+            state,
+            "E0-tune",
+            threading.Event(),
+            state.pending_jobs("E0-tune"),
+        )
+    assert len(executed) == 1
+    assert int(executed[0].split("-")[-1]) % 2 == 1
+    assert state.status_counts("E0-tune") == {"completed": 1, "pending": 3}
+
+
 def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
     config = _config(tmp_path)
     state = StateStore(config.run_dir)

@@ -417,7 +417,10 @@ def server_command(
             "--speculative-use-rejection-sampling",
         ]
     )
-    if job.backend == "NEXTN":
+    # SGLang's EAGLE-family parser requires an explicit single branch whenever
+    # rejection sampling is enabled.  NEXTN already used the flag, while the
+    # E0 EAGLE3 compatibility probe previously failed before model loading.
+    if job.backend in {"EAGLE3", "NEXTN"}:
         argv.extend(["--speculative-eagle-topk", "1"])
     if job.backend == "DSPARK":
         argv.extend(["--attention-backend", "triton"])

@@ -16,7 +16,7 @@ import time
 import urllib.error
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -2585,6 +2585,22 @@ class _SessionCellPool:
             return len(self._pending)
 
 
+def _join_workers_fail_fast(
+    futures: Iterable[Any], failure_event: threading.Event
+) -> None:
+    """Surface the first worker error and stop siblings after their active cell."""
+
+    pending = tuple(futures)
+    for future in as_completed(pending):
+        try:
+            future.result()
+        except Exception:
+            failure_event.set()
+            for sibling in pending:
+                sibling.cancel()
+            raise
+
+
 def _session_pool_work(job: Job) -> float:
     return float(job.parameters.get("generation_tokens", 256))
 
@@ -2658,8 +2674,7 @@ def _run_session_cell_pool(
         thread_name_prefix="lightcone-cell-pool",
     ) as executor:
         futures = [executor.submit(worker, gpu) for gpu in config.gpu_ids[:worker_count]]
-        for future in futures:
-            future.result()
+        _join_workers_fail_fast(futures, node_failed)
 
 
 def _pair_interference_jobs(config: ExperimentConfig) -> tuple[Job, ...]:
@@ -3708,8 +3723,7 @@ def _run_pending_jobs(
                 )
                 for pair, jobs in exclusive_queues.items()
             ]
-            for future in futures:
-                future.result()
+            _join_workers_fail_fast(futures, node_failed)
     if node == "preflight":
         isolated = [job for job in singles if job.parameters.get("mode") == "isolated"]
         for job in isolated:
@@ -3736,8 +3750,7 @@ def _run_pending_jobs(
                             label=f"concurrent-gpu-{gpu}",
                         )
                     )
-                for future in futures:
-                    future.result()
+                _join_workers_fail_fast(futures, stop_event)
         return
     if pooled_singles:
         _run_session_cell_pool(
@@ -3769,8 +3782,7 @@ def _run_pending_jobs(
     if workers:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lightcone-gpu") as pool:
             futures = [pool.submit(worker, gpu, jobs) for gpu, jobs in queues.items()]
-            for future in futures:
-                future.result()
+            _join_workers_fail_fast(futures, node_failed)
 
 
 def _run_node_jobs(

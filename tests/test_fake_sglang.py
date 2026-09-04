@@ -2223,6 +2223,36 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
     graphs = adaptive_command.index("--cuda-graph-bs-decode")
     assert adaptive_command[graphs + 1 : graphs + 5] == ["1", "2", "4", "8"]
 
+
+def test_eagle3_rejection_sampling_uses_single_branch(tmp_path: Path):
+    job = next(item for item in materialize("E0-tune") if item.backend == "EAGLE3")
+    model = tmp_path / "model"
+    draft = tmp_path / "draft"
+    model.mkdir()
+    draft.mkdir()
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="run",
+        sglang_root=tmp_path,
+        results_root=tmp_path,
+        models={job.model: model},
+        drafts={f"{job.model}|EAGLE3": draft},
+        datasets={},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"),
+        protocol=ProtocolConfig(),
+    )
+    command = server_command(
+        config,
+        job,
+        port=30000,
+        output_dir=tmp_path,
+        adaptation=None,
+    )
+    assert "--speculative-use-rejection-sampling" in command
+    index = command.index("--speculative-eagle-topk")
+    assert command[index + 1] == "1"
+
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
     class State:
         run_dir = tmp_path
