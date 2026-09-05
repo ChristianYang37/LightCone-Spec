@@ -1468,6 +1468,15 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     assert (output / "server.stopped").is_file()
 
     config.drafts["Qwen/Qwen3-8B|DSPARK"] = model
+    headless_job = replace(adaptive, parameters={
+        **adaptive.parameters, "checkpoint_family": "deepspec_next_token_v1",
+    })
+    headless = ServerProcess(
+        config, headless_job, gpus=(0,), port=30001, output_dir=output, selection=None,
+    )
+    with headless:
+        assert launched["env"]["SGLANG_RAGGED_VERIFY_MODE"] == "static"
+        assert headless.adaptation["confidence_loss_weight"] == 0.0
     dspark_job = next(
         job
         for job in materialize("E1a")

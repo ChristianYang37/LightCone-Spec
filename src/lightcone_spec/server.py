@@ -761,7 +761,11 @@ class ServerProcess:
                 int(self.job.parameters.get("position_bin_tokens", 2048))
             )
         if _execution_backend(self.job) == "DSPARK":
-            environment["SGLANG_RAGGED_VERIFY_MODE"] = "compact"
+            # Official headless DFlash reuses the gamma-aligned executor, not
+            # DSpark's confidence scheduler. Verify every registered position.
+            environment["SGLANG_RAGGED_VERIFY_MODE"] = (
+                "static" if self.job.backend == "DFLASH" else "compact"
+            )
         environment.pop("LIGHTCONE_FIXED_VERIFY_BUDGET_PER_REQUEST", None)
         if (_execution_backend(self.job) == "DSPARK"
                 and self.job.parameters.get("verification") == "fixed_budget"):
