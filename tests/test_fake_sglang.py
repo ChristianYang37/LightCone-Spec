@@ -2436,6 +2436,28 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
     assert not model(values, None, None).hidden_states.requires_grad
 
 
+@pytest.mark.parametrize("tokenizer_limit", [int(1e30), 131072, -1])
+def test_tokenize_reports_server_limit_not_hf_sentinel(tokenizer_limit):
+    import textwrap
+
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    chunk = patch.split(
+        "diff --git a/python/sglang/srt/entrypoints/openai/serving_tokenize.py", 1
+    )[1].split("\ndiff --git ", 1)[0]
+    code = textwrap.dedent("\n".join(
+        line[1:] for line in chunk.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ))
+    tokenizer = SimpleNamespace(model_max_length=tokenizer_limit)
+    namespace = {"self": SimpleNamespace(tokenizer_manager=SimpleNamespace(
+        tokenizer=tokenizer, context_len=40960,
+    ))}
+    exec(compile(code, "tokenize-model-limit", "exec"), namespace)
+    assert namespace["max_model_len"] == 40960
+    assert tokenizer.model_max_length == tokenizer_limit
+    assert -(2**63) <= namespace["max_model_len"] < 2**63
+
+
 def test_deepspec_eagle_graph_width_uses_trained_feature_layers():
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
     section = patch.split(

@@ -3212,3 +3212,17 @@ index 22c37d88..ff96fd4e 100644
      native_head_set = frozenset(native_heads)
      selected: list[str] = []
      lora: list[str] = []
+diff --git a/python/sglang/srt/entrypoints/openai/serving_tokenize.py b/python/sglang/srt/entrypoints/openai/serving_tokenize.py
+--- a/python/sglang/srt/entrypoints/openai/serving_tokenize.py
++++ b/python/sglang/srt/entrypoints/openai/serving_tokenize.py
+@@ -44,7 +44,9 @@ class OpenAIServingTokenize(OpenAIServingBase):
+     ) -> Union[TokenizeResponse, ErrorResponse]:
+         try:
+             tokenizer = self.tokenizer_manager.tokenizer
+-            max_model_len = getattr(tokenizer, "model_max_length", -1)
++            # HF's unspecified-length sentinel can exceed JSON's 64-bit integer
++            # serializer. Report the actual server admission limit, not that sentinel.
++            max_model_len = int(self.tokenizer_manager.context_len)
+ 
+             if request.messages is not None:
+                 token_ids = self._tokenize_chat_request(request)
