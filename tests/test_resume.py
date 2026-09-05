@@ -16,6 +16,7 @@ from lightcone_spec.runner import (
     _cleanup_interrupted_servers,
     _complete_blocked_profiler,
     _complete_infeasible_startup,
+    _completed_stage_has_no_work,
     _e1a_source_transfer_jobs,
     _e2_keep_count,
     _e2_missing_dependency_jobs,
@@ -70,6 +71,28 @@ def _config(tmp_path: Path) -> ExperimentConfig:
         server=ServerConfig(python=tmp_path / "python"),
         protocol=ProtocolConfig(),
     )
+
+
+def test_completed_stage_resume_fast_path_respects_reopened_work(tmp_path: Path):
+    state = StateStore(tmp_path)
+    jobs = materialize("preflight")[:2]
+    state.add_jobs("preflight", jobs)
+    for job in jobs:
+        attempt = state.start(job, (0, 1), tmp_path / job.job_id / "attempt-01")
+        state.complete(job.job_id, attempt)
+    assert state.finish_stage("preflight") == "completed"
+    assert _completed_stage_has_no_work(state, "preflight")
+
+    state.skip_job(jobs[0].job_id, "no-op for completed row")
+    assert _completed_stage_has_no_work(state, "preflight")
+    with state.connect() as connection:
+        connection.execute(
+            "UPDATE jobs SET status='skipped' WHERE job_id=?",
+            (jobs[0].job_id,),
+        )
+    assert state.reopen_skipped(("preflight",)) == 1
+    assert state.stage_status("preflight") == "pending"
+    assert not _completed_stage_has_no_work(state, "preflight")
 
 
 def test_interrupt_retry_skip_and_resume(tmp_path: Path):

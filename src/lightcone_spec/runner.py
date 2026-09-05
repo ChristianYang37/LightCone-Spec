@@ -7535,6 +7535,18 @@ def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
     state.set_selection("formal_priority_eta_v2", audit)
 
 
+def _completed_stage_has_no_work(state: StateStore, node: str) -> bool:
+    """Avoid recomputing summaries for an unchanged completed paper node.
+
+    Resume repairs run before this check.  Any repair that requeues or reopens
+    evidence also returns the stage to ``pending``, so repaired work is not
+    skipped while stable completed stages avoid an increasingly expensive
+    summarize/reduce pass on every runner restart.
+    """
+
+    return state.stage_status(node) == "completed"
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -7607,6 +7619,8 @@ class PaperRunner:
                         _write_priority_eta_v2(self.config, self.state)
                 if self.stop_event.is_set():
                     break
+                if _completed_stage_has_no_work(self.state, node):
+                    continue
                 if (
                     node == "E1a"
                     and isinstance(
