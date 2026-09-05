@@ -29,6 +29,7 @@ from lightcone_spec.runner import (
     _reopen_soft_gate_e3b,
     _repair_completed_s10_downstream_resume,
     _repair_e0_e6_partial_resume_v1,
+    _repair_e0_feasible_pair_prune_v1,
     _repair_e3b_scientific_rejections,
     _repair_metric_dedup_e5_resume_v1,
     _requeue_dspark_dynamic_batch_budget_failures,
@@ -43,6 +44,7 @@ from lightcone_spec.runner import (
     _seed_e3a_static_deployment_width,
     _segment_jobs,
     _select_e0_recipes,
+    _select_valid_e0,
     _selection_for_job,
     _session_order,
     _set_e2_expected_evidence,
@@ -654,6 +656,63 @@ def test_e0_pair_calibration_capacity_failure_is_terminal_infeasible(
     assert metrics["scientific_outcome"] == "infeasible"
     assert metrics["capacity_feasible"] is False
     assert metrics["hard_feasible"] is False
+
+
+def test_e0_capacity_blocked_probe_is_pruned_from_persisted_downstream(tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("dspark_recipe", {"verification": "native_scheduler"})
+    probes = tuple(job for job in materialize("E0-tune") if job.parameters.get("probe"))
+    state.add_jobs("E0-tune", probes)
+    admitted = {
+        ("Qwen/Qwen3-4B", "DSPARK"),
+        ("Qwen/Qwen3-14B", "DSPARK"),
+    }
+    for job in probes:
+        pair = (job.model, job.backend)
+        capacity_blocked = pair == ("Qwen/Qwen3-14B", "DSPARK")
+        feasible = pair in admitted and not capacity_blocked
+        attempt_dir = config.run_dir / "jobs" / job.job_id / "attempt-01"
+        attempt_dir.mkdir(parents=True)
+        (attempt_dir / "config.json").write_text(json.dumps(job.to_dict()))
+        (attempt_dir / "metrics.json").write_text(
+            json.dumps(
+                {
+                    "scientific_outcome": "completed" if feasible else "infeasible",
+                    "feasible": feasible,
+                    "hard_feasible": feasible,
+                    "capacity_feasible": False if capacity_blocked else "N/A",
+                    "compatible": pair in admitted,
+                }
+            )
+        )
+        attempt = state.start(job, (0,), attempt_dir)
+        state.complete(job.job_id, attempt)
+
+    assert _select_valid_e0(state) == [
+        ("Qwen/Qwen3-4B", "DSPARK", "CalibrationMix")
+    ]
+    stale_valid = [
+        ("Qwen/Qwen3-4B", "DSPARK", "CalibrationMix"),
+        ("Qwen/Qwen3-14B", "DSPARK", "CalibrationMix"),
+    ]
+    state.set_selection("valid_e0", stale_valid)
+    for node in ("E0-pilot", "E0-final"):
+        state.add_jobs(node, materialize(node, valid_e0=stale_valid, e0_recipes={}))
+
+    audit = _repair_e0_feasible_pair_prune_v1(state)
+    assert audit is not None
+    assert audit["corrected"] == [
+        ("Qwen/Qwen3-4B", "DSPARK", "CalibrationMix")
+    ]
+    assert state.selection("valid_e0", None) == [list(row) for row in audit["corrected"]]
+    for node in ("E0-pilot", "E0-final"):
+        assert all(
+            job.model != "Qwen/Qwen3-14B" for job in state.pending_jobs(node)
+        )
+        existing = state.jobs(node)
+        planned = materialize(node, valid_e0=audit["corrected"], e0_recipes={})
+        assert _resume_materialization(state, node, planned) == existing
 
 
 def test_session_startup_terminalization_skips_rows_already_completed(tmp_path):

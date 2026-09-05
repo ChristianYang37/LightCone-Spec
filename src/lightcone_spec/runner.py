@@ -121,6 +121,15 @@ def _resume_materialization(
         return existing
     if not existing:
         return planned
+    if node in {"E0-pilot", "E0-final"} and state.selection(
+        "formal_e0_feasible_pair_prune_version", None
+    ) == 1:
+        # A completed E0-tune can narrow the compatible-and-feasible pair set
+        # after an older run already materialized downstream rows.  Preserve
+        # those stable job identities: the repair marks obsolete pending rows
+        # superseded, and returning the stored surface avoids re-numbering the
+        # retained rows into duplicate job ids.
+        return existing
     with state.connect() as connection:
         statuses = {
             str(row["job_id"]): str(row["status"])
@@ -5323,9 +5332,73 @@ def _select_valid_e0(state: StateStore) -> list[tuple[str, str, str]]:
         (item["model"], item["backend"], item["task"])
         for item, metrics in _metric_rows(state, "E0-tune")
         if item["parameters"].get("probe")
+        and _hard_feasible(metrics)
         and metrics.get("compatible", True)
         and (item["backend"] != "DSPARK" or dspark_ready)
     ]
+
+
+def _repair_e0_feasible_pair_prune_v1(state: StateStore) -> dict[str, Any] | None:
+    """Remove capacity-infeasible E0 probes from persisted downstream work.
+
+    ``valid_e0`` historically represented interface compatibility only.  A
+    capacity-blocked probe could therefore be admitted even though the same
+    model/backend pair cannot start on this registered hardware.  Recompute
+    the selection from completed evidence, preserve every old row, and only
+    supersede downstream work that has not run.
+    """
+
+    if state.selection("formal_e0_feasible_pair_prune_version", None) == 1:
+        return None
+    counts = state.status_counts("E0-tune")
+    if not counts.get("completed") or any(
+        counts.get(status) for status in ("pending", "running", "failed")
+    ):
+        return None
+    observed_probes = [
+        item
+        for item, _ in _metric_rows(state, "E0-tune")
+        if item["parameters"].get("probe")
+    ]
+    expected_probes = sum(
+        job.parameters.get("probe") is True for job in materialize("E0-tune")
+    )
+    if len(observed_probes) != expected_probes:
+        raise RuntimeError(
+            "cannot repair E0 feasibility pruning without all completed probe evidence"
+        )
+    previous = state.selection("valid_e0", [])
+    corrected = _select_valid_e0(state)
+    state.set_selection("valid_e0", corrected)
+    valid_pairs = {(model, backend) for model, backend, _ in corrected}
+    valid_models = {model for model, _ in valid_pairs}
+    superseded: dict[str, int] = {}
+    reason = "superseded: E0 probe was not hard-feasible on registered hardware"
+    for node in ("E0-pilot", "E0-final"):
+        obsolete = tuple(
+            job.job_id
+            for job in state.jobs(node)
+            if (
+                job.model not in valid_models
+                if job.method == "target_only"
+                else (job.model, job.backend) not in valid_pairs
+            )
+        )
+        superseded[node] = state.supersede_jobs(
+            obsolete,
+            reason,
+            stage_node=node,
+        )
+    audit = {
+        "version": 1,
+        "previous": previous,
+        "corrected": corrected,
+        "superseded_pending": superseded,
+        "criterion": "probe_hard_feasible_and_compatible",
+    }
+    state.set_selection("formal_e0_feasible_pair_prune", audit)
+    state.set_selection("formal_e0_feasible_pair_prune_version", 1)
+    return audit
 
 
 def _select_e0_recipes(state: StateStore) -> dict[str, dict[str, Any]]:
@@ -7523,6 +7596,7 @@ class PaperRunner:
                     self.state,
                     self.stop_event,
                 )
+                _repair_e0_feasible_pair_prune_v1(self.state)
                 if self.state.selection("formal_priority_window_v2", {}).get("status") == "completed":
                     _run_tp1_interference_v2(
                         self.config,
