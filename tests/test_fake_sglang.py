@@ -2369,6 +2369,57 @@ def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
     assert "restore SGLang and reapply patches" in run.stderr
 
 
+def test_gemma_draft_allocator_preserves_strict_checkpoint_window():
+    import textwrap
+
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    section = patch.split(
+        "diff --git a/python/sglang/srt/configs/model_config.py ", 1
+    )[1].split("\ndiff --git ", 1)[0]
+    hunks = section.split("\n@@ ")[1:]
+    initializer = "\n".join(
+        line[1:] for line in hunks[0].splitlines()[1:] if line.startswith("+")
+    )
+    method = "\n".join(
+        line[1:] for line in hunks[1].splitlines()[1:] if line.startswith(("+", " "))
+    )
+    namespace = {"Optional": __import__("typing").Optional}
+    exec(textwrap.dedent(method), namespace)
+
+    class StrictGemmaText(SimpleNamespace):
+        def __setattr__(self, name, value):
+            if name == "sliding_window" and not isinstance(value, int):
+                raise TypeError("sliding_window must retain its checkpoint integer")
+            super().__setattr__(name, value)
+
+    for architecture, is_draft, expected_window in (
+        ("Gemma4DSparkModel", True, None),
+        ("Gemma4Eagle3Model", True, None),
+        ("Gemma4UnifiedForConditionalGeneration", False, 4096),
+        ("Qwen3Eagle3Model", True, 4096),
+    ):
+        text = StrictGemmaText(
+            sliding_window=4096, head_dim=128, v_head_dim=128,
+            global_head_dim=256, attention_k_eq_v=True,
+            num_key_value_heads=8, num_global_key_value_heads=2,
+            layer_types=["sliding_attention", "full_attention"], num_hidden_layers=2,
+        )
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            hf_text_config=text, is_draft_model=is_draft,
+        )
+        exec(textwrap.dedent(initializer), {"self": config, "is_draft_model": is_draft})
+        assert text.sliding_window == 4096
+        assert namespace["_get_sliding_window_size"](config) == expected_window
+        if expected_window is None:
+            assert text.layer_types == ["full_attention"] * 2
+            assert text.head_dim == text.v_head_dim == 256
+            assert text.num_key_value_heads == 2
+        else:
+            assert text.layer_types == ["sliding_attention", "full_attention"]
+            assert text.head_dim == 128 and text.num_key_value_heads == 8
+
+
 def test_gemma_shared_kv_math_and_all_norm_gradients():
     import torch
     import torch.nn.functional as F

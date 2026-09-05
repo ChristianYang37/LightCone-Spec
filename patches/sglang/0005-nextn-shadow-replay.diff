@@ -1545,7 +1545,7 @@ diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/confi
 index 37566da4..16087355 100644
 --- a/python/sglang/srt/configs/model_config.py
 +++ b/python/sglang/srt/configs/model_config.py
-@@ -293,6 +293,18 @@ class ModelConfig:
+@@ -293,6 +293,20 @@ class ModelConfig:
              )
          )
          self.hf_text_config = get_hf_text_config(self.hf_config)
@@ -1560,10 +1560,26 @@ index 37566da4..16087355 100644
 +            if bool(text.attention_k_eq_v):
 +                text.num_key_value_heads = int(text.num_global_key_value_heads)
 +            text.layer_types = ["full_attention"] * int(text.num_hidden_layers)
-+            text.sliding_window = None
++            # Keep the checkpoint's typed integer intact. The draft allocator
++            # resolves full attention below; assigning None to strict Gemma HF
++            # configs raises before any model weights can be loaded.
          self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
          self.embedding_model_spec = resolve_embedding_model_spec(
              self.hf_config.architectures,
+@@ -1324,6 +1338,13 @@ class ModelConfig:
+     def _get_sliding_window_size(self) -> Optional[int]:
++        if self.is_draft_model and self.hf_config.architectures[0] in {
++            "Gemma4DSparkModel", "Gemma4Eagle3Model",
++        }:
++            # Public Gemma drafts are full-attention, unlike the hybrid target.
++            # Override only SGLang allocator metadata, not strict HF fields.
++            return None
++
+         for key in ("sliding_window_size", "sliding_window", "window_size"):
+             value = getattr(self.hf_text_config, key, None)
+             if value is not None:
+                 return value
+         return None
 diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
 index 722c5101..5cd836f5 100644
 --- a/python/sglang/srt/layers/attention/flashinfer_backend.py
