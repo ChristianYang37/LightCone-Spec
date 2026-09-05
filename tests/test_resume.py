@@ -21,6 +21,7 @@ from lightcone_spec.runner import (
     _e2_keep_count,
     _e2_missing_dependency_jobs,
     _e5_reference,
+    _eta_remaining_jobs,
     _eta_resource_count,
     _exclude_redundant_e2_dependency_jobs,
     _execution_allocations,
@@ -720,6 +721,7 @@ def test_e0_capacity_blocked_probe_is_pruned_from_persisted_downstream(tmp_path)
         ("Qwen/Qwen3-14B", "DSPARK", "CalibrationMix"),
     ]
     state.set_selection("valid_e0", stale_valid)
+    state.set_selection("formal_priority_eta_v2", {"remaining_leaf_cells": 999})
     for node in ("E0-pilot", "E0-final"):
         state.add_jobs(node, materialize(node, valid_e0=stale_valid, e0_recipes={}))
 
@@ -729,6 +731,7 @@ def test_e0_capacity_blocked_probe_is_pruned_from_persisted_downstream(tmp_path)
         ("Qwen/Qwen3-4B", "DSPARK", "CalibrationMix")
     ]
     assert state.selection("valid_e0", None) == [list(row) for row in audit["corrected"]]
+    assert state.selection("formal_priority_eta_v2", None) is None
     for node in ("E0-pilot", "E0-final"):
         assert all(
             job.model != "Qwen/Qwen3-14B" for job in state.pending_jobs(node)
@@ -736,6 +739,16 @@ def test_e0_capacity_blocked_probe_is_pruned_from_persisted_downstream(tmp_path)
         existing = state.jobs(node)
         planned = materialize(node, valid_e0=audit["corrected"], e0_recipes={})
         assert _resume_materialization(state, node, planned) == existing
+
+
+def test_eta_does_not_count_public_plan_for_completed_internal_stage(tmp_path):
+    state = StateStore(tmp_path)
+    state.set_stage_status("E1a", "completed", row_count=3)
+
+    leaves, parents = _eta_remaining_jobs(state)
+
+    assert parents > 0
+    assert all(job.node != "E1a" for job in leaves)
 
 
 def test_session_startup_terminalization_skips_rows_already_completed(tmp_path):

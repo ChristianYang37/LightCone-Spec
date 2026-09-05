@@ -5396,6 +5396,10 @@ def _repair_e0_feasible_pair_prune_v1(state: StateStore) -> dict[str, Any] | Non
         "superseded_pending": superseded,
         "criterion": "probe_hard_feasible_and_compatible",
     }
+    # The priority ETA may have been frozen before this migration removed
+    # capacity-infeasible downstream work.  Force the derived estimate to be
+    # regenerated from the corrected pending surface.
+    state.delete_selections(("formal_priority_eta_v2",))
     state.set_selection("formal_e0_feasible_pair_prune", audit)
     state.set_selection("formal_e0_feasible_pair_prune_version", 1)
     return audit
@@ -7327,9 +7331,15 @@ def _eta_remaining_jobs(state: StateStore) -> tuple[tuple[Job, ...], int]:
     leaves: dict[str, Job] = {}
     pending_parents = 0
     for node in PAPER_NODES:
+        stage_completed = state.stage_status(node) == "completed"
         for planned in _eta_planned_jobs(state, node):
             record = stored.get(planned.job_id)
             if record is None:
+                # A completed stage can be represented by an internal source-
+                # transfer replacement with intentionally different job IDs.
+                # Do not resurrect its public plan as phantom remaining work.
+                if stage_completed:
+                    continue
                 pending_parents += 1
                 segments = _segment_jobs(planned)
                 if segments:
