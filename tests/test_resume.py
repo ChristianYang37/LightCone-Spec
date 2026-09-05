@@ -59,6 +59,176 @@ from lightcone_spec.runner import (
 from lightcone_spec.state import StateStore
 
 
+def test_coverage_repair_is_method_specific_and_dense_transfer_preserves_workload():
+    from lightcone_spec.coverage import (
+        compatibility_replacements,
+        dense_14b_transfer,
+        method_feasibility,
+    )
+
+    jobs = [job for job in materialize("E0-tune") if job.parameters.get("pair_calibration")]
+    rows = [(job, {"hard_feasible": True}) for job in jobs]
+    tts = next(
+        job
+        for job in jobs
+        if job.model == "Gemma4-12B" and job.backend == "EAGLE3" and job.method == "tts"
+    )
+    rows = [
+        (
+            job,
+            {"hard_feasible": False, "scientific_outcome": "blocked", "error": "CUDA out of memory"}
+            if job == tts
+            else metrics,
+        )
+        for job, metrics in rows
+    ]
+    repairs = compatibility_replacements(rows)
+    assert not any(job.parameters["replaces_job_id"] == tts.job_id for job in repairs)
+    assert not any(job.model == "Gemma4-12B" and job.method == "static" for job in repairs)
+    matrix = method_feasibility(rows)
+    assert matrix["Gemma4-12B|EAGLE3|static|tp1_dp1"]["hard_feasible"]
+    assert not matrix["Gemma4-12B|EAGLE3|tts|tp1_dp1"]["hard_feasible"]
+    registration = [
+        (tts, {"hard_feasible": False, "error": "Gemma4Eagle3Model is not a registered model"})
+    ]
+    assert len(compatibility_replacements(registration)) == 1
+    original = next(
+        job
+        for job in materialize("E0-final")
+        if job.model == "Qwen/Qwen3-14B" and job.method == "target_only"
+    )
+    migrated = dense_14b_transfer(original)
+    assert migrated.gpu_count == 2 and migrated.parameters["topology"] == "tp2_dp1"
+    assert migrated.parameters["evidence_owner"] == "E6"
+    assert migrated.parameters["segments"] == original.parameters["segments"]
+    assert (migrated.task, migrated.load, migrated.block, migrated.context) == (
+        original.task,
+        original.load,
+        original.block,
+        original.context,
+    )
+    assert dense_14b_transfer(original) == migrated
+
+
+def test_coverage_gate_and_resume_never_claim_completed_cells(tmp_path, monkeypatch):
+    import lightcone_spec.runner as module
+    from lightcone_spec.protocol import mechanism_jobs, source_coverage_jobs
+
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    stop = threading.Event()
+    assert not module._run_four_block_coverage(config, state, stop)
+    assert not state.jobs(source_coverage_jobs()[0].node)
+    state.set_selection("formal_coverage_runtime_v1", {"status": "accepted"})
+    state.set_selection("tts_recipe", {"stride": 10, "learning_rate": 1e-4})
+    state.set_selection("lightcone_recipe", {"stride": 10})
+    source = source_coverage_jobs()[:2]
+    mechanism = mechanism_jobs()[:1]
+    monkeypatch.setattr(module, "source_coverage_jobs", lambda: source)
+    monkeypatch.setattr(module, "mechanism_jobs", lambda: mechanism)
+    monkeypatch.setattr(module, "summarize_attempts", lambda *args: None)
+    claims = []
+
+    def execute(config, state, node, event, pending):
+        for job in pending:
+            claims.append(job.job_id)
+            attempt = state.start(job, (0,), config.run_dir / job.job_id / "attempt-01")
+            state.complete(job.job_id, attempt)
+
+    monkeypatch.setattr(module, "_run_pending_jobs", execute)
+    assert module._run_four_block_coverage(config, state, stop)
+    assert module._run_four_block_coverage(config, state, stop)
+    assert len(claims) == len(set(claims)) == 3
+
+
+def test_eta_counts_new_leaves_separately_and_deducts_only_terminal_coverage(tmp_path):
+    from lightcone_spec.protocol import source_coverage_jobs
+
+    state = StateStore(tmp_path)
+    base, _ = _eta_remaining_jobs(state, include_coverage=False)
+    expanded, _ = _eta_remaining_jobs(state)
+    assert len(expanded) - len(base) == 1344
+    job = source_coverage_jobs()[0]
+    state.add_internal_jobs((job,), storage_node=job.node)
+    attempt = state.start(job, (0,), tmp_path / "attempt-01")
+    state.complete(job.job_id, attempt)
+    updated, _ = _eta_remaining_jobs(state)
+    assert len(updated) == len(expanded) - 1
+
+
+def test_coverage_e0_gap_plan_preserves_finished_sibling_and_dense_budget(tmp_path):
+    import lightcone_spec.runner as module
+
+    state = StateStore(tmp_path)
+    original = next(
+        job
+        for job in materialize("E0-pilot")
+        if job.model == "Gemma4-12B" and job.backend == "EAGLE3" and job.method == "static"
+    )
+    state.add_internal_jobs((original,), storage_node=original.node)
+    children = _segment_jobs(original)
+    state.add_internal_jobs(children, storage_node="E0-pilot-segments")
+    first = children[0]
+    attempt = state.start(first, (0,), tmp_path / "child" / "attempt-01")
+    state.complete(first.job_id, attempt)
+    state.skip_job(original.job_id, "model/backend compatibility unavailable")
+    planned = module._coverage_e0_gaps(state)
+    assert not any(job.parameters.get("replaces_job_id") == first.job_id for job in planned)
+    siblings = [
+        job for job in planned if job.parameters["original_parent_job_id"] == original.job_id
+    ]
+    assert len(siblings) == len(children) - 1
+    assert all(
+        job.block == original.block and job.parameters["source_node"] == original.node
+        for job in siblings
+    )
+    dense = [job for job in planned if job.model == "Qwen/Qwen3-14B"]
+    assert dense and all(
+        job.gpu_count == 2 and job.parameters["topology"] == "tp2_dp1" for job in dense
+    )
+    assert all(job.parameters["evidence_owner"] == "E6" for job in dense)
+    assert planned == module._coverage_e0_gaps(state)
+
+
+def test_coverage_e1a_refits_after_capture_once_and_preserves_geometry(tmp_path, monkeypatch):
+    import lightcone_spec.runner as module
+
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    geometry = {"optimizer": "chronobelief", "rank": 8, "stride": 10}
+    state.set_selection("lightcone_recipe", geometry)
+    state.set_selection("dspark_recipe", {"confidence_temperatures": [1.0] * 7})
+    calls = []
+
+    def execute(config, state, node, stop, pending):
+        for job in pending:
+            if job.parameters["workload"] == "dspark_native_scheduler_validation":
+                assert state.selection("dspark_recipe")["confidence_temperatures"] == [1.2] * 7
+            calls.append(job.job_id)
+            attempt = state.start(job, (0,), config.run_dir / job.job_id / "attempt-01")
+            state.complete(job.job_id, attempt)
+
+    def rows(state, node):
+        return [
+            (job.to_dict(), {"hard_feasible": True})
+            for job in state.jobs("coverage-E1a-v1")
+            if state.job_status(job.job_id) == "completed"
+        ]
+
+    def fit(state):
+        assert len(calls) == 3
+        return {**geometry, "confidence_temperatures": [1.2] * 7}
+
+    monkeypatch.setattr(module, "_run_pending_jobs", execute)
+    monkeypatch.setattr(module, "_metric_rows", rows)
+    monkeypatch.setattr(module, "_fit_dspark_recipe", fit)
+    module._run_coverage_e1a_repair(config, state, threading.Event())
+    module._run_coverage_e1a_repair(config, state, threading.Event())
+    assert len(calls) == len(set(calls)) == 22
+    assert state.selection("lightcone_recipe") == geometry
+    assert state.selection("formal_coverage_e1a_v1")["dspark_available"]
+
+
 def _config(tmp_path: Path) -> ExperimentConfig:
     return ExperimentConfig(
         source=tmp_path / "paper.yaml",
@@ -1215,6 +1385,24 @@ def test_plain_config_resume_allows_new_sglang_path_and_dataset_key(tmp_path: Pa
     saved = yaml.safe_load((config.run_dir / "paper.yaml").read_text())
     assert saved["paths"]["sglang_root"].endswith("sglang-v14")
     assert set(saved["paths"]["datasets"]) == {"AIME-2024"}
+
+
+def test_resume_keeps_main_draft_identity_when_adding_source_b7(tmp_path):
+    config = replace(_config(tmp_path), drafts={"DFLASH": tmp_path / "main-b16"})
+    config.run_dir.mkdir()
+    _save_or_validate_run_config(config)
+    changed = replace(
+        config,
+        drafts={**config.drafts, "DeepSpec-source|Qwen/Qwen3-8B|DFLASH": tmp_path / "source-b7"},
+    )
+    _save_or_validate_run_config(changed)
+    for bad in (
+        {**changed.drafts, "DFLASH": tmp_path / "source-b7"},
+        {**changed.drafts, "NEW-MAIN": tmp_path / "other"},
+        config.drafts,
+    ):
+        with pytest.raises(RuntimeError, match="different experiment config"):
+            _save_or_validate_run_config(replace(changed, drafts=bad))
 
 
 def test_sqlite_records_actual_gpu_pair(tmp_path: Path):

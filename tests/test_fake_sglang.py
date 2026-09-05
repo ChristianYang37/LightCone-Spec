@@ -2273,6 +2273,7 @@ def test_eagle3_rejection_sampling_uses_single_branch(tmp_path: Path):
     assert adaptive_command[steps + 1] == "15"
     assert adaptation_payload(adaptive)["canvas_tokens"] == 16
 
+
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
     class State:
         run_dir = tmp_path
@@ -2366,3 +2367,468 @@ def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
     )
     assert run.returncode == 1
     assert "restore SGLang and reapply patches" in run.stderr
+
+
+def test_gemma_shared_kv_math_and_all_norm_gradients():
+    import torch
+    import torch.nn.functional as F
+
+    from lightcone_spec.gemma import (
+        gemma_canvas_attention,
+        gemma_residual_mlp,
+        gemma_rms,
+        gemma_rotary,
+        gemma_softcap,
+    )
+
+    torch.manual_seed(7)
+    hidden = torch.randn(2, 3, 8)
+    q_weight = torch.randn(16, 8, requires_grad=True)
+    k_weight = torch.randn(4, 8, requires_grad=True)
+    q_norm = torch.randn(4, requires_grad=True)
+    k_norm = torch.randn(4, requires_grad=True)
+    query = gemma_rms(F.linear(hidden, q_weight).view(2, 3, 4, 4), q_norm, 1e-6)
+    raw_kv = F.linear(hidden, k_weight).view(2, 3, 1, 4)
+    key = gemma_rms(raw_kv, k_norm, 1e-6)
+    value = gemma_rms(raw_kv, None, 1e-6)
+    history_k, history_v = torch.randn(2, 2, 1, 4), torch.randn(2, 2, 1, 4)
+    valid = torch.tensor([[True, False], [True, True]])
+    output = gemma_canvas_attention(query, key, value, history_k, history_v, valid)
+    all_k = torch.cat((history_k, key), dim=1).repeat_interleave(4, dim=2)
+    all_v = torch.cat((history_v, value), dim=1).repeat_interleave(4, dim=2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", query, all_k)
+    mask = torch.cat((valid, torch.ones(2, 3, dtype=torch.bool)), dim=1)
+    scores = scores.masked_fill(~mask[:, None, None], -torch.inf)
+    reference = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), all_v).flatten(-2)
+    assert torch.allclose(output, reference, atol=2e-6)
+    grads = torch.autograd.grad(output.square().sum(), (q_weight, k_weight, q_norm, k_norm))
+    assert all(torch.isfinite(g).all() and torch.count_nonzero(g) for g in grads)
+    poisoned = history_v.clone()
+    poisoned[0, 1] = 1e6
+    assert torch.allclose(
+        output, gemma_canvas_attention(query, key, value, history_k, poisoned, valid)
+    )
+    # A partial rotary cache rotates only two of four coordinates.
+    positions = torch.tensor([[0, 1, 2], [0, 1, 2]])
+    cache = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    rotated = gemma_rotary(value, positions, cache)
+    assert torch.equal(rotated[..., 2:], value[..., 2:])
+    assert torch.equal(rotated[:, 0], value[:, 0])
+    parameters = [torch.randn(8, requires_grad=True) for _ in range(3)]
+    parameters += [torch.randn(12, 8, requires_grad=True), torch.randn(8, 6, requires_grad=True)]
+    residual = gemma_residual_mlp(
+        hidden, torch.randn_like(hidden), *parameters, torch.tensor([0.8]), 1e-6
+    )
+    grads = torch.autograd.grad(residual.square().sum(), parameters)
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+    logits = torch.tensor([-100.0, 0.0, 100.0])
+    assert torch.allclose(gemma_softcap(logits, 30), 30 * torch.tanh(logits / 30))
+
+
+def _coverage_added_module(relative_path):
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    marker = f"diff --git a/{relative_path} b/{relative_path}\n"
+    chunk = patch.split(marker, 1)[1].split("\ndiff --git ", 1)[0]
+    return ast.parse(
+        "\n".join(
+            line[1:]
+            for line in chunk.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+    )
+
+
+@pytest.mark.parametrize("eagle", (False, True))
+def test_official_qwen_replay_has_all_layer_gradients(monkeypatch, eagle):
+    import types
+
+    import torch.nn.functional as F
+
+    from lightcone_spec.gemma import gemma_rms
+
+    tree = _coverage_added_module("python/sglang/srt/models/qwen3_draft_replay.py")
+    namespace = {"torch": torch, "F": F}
+    exec(
+        compile(
+            ast.Module([item for item in tree.body if isinstance(item, ast.ClassDef)], []),
+            "qwen-replay",
+            "exec",
+        ),
+        namespace,
+    )
+    distributed = types.ModuleType("sglang.srt.distributed")
+    distributed.get_tp_group = lambda: SimpleNamespace(world_size=1)
+    wrappers = types.ModuleType("sglang.srt.models.gemma4_draft")
+    wrappers._column = lambda module, value: F.linear(value, module.weight)
+    wrappers._row = lambda module, value: F.linear(value, module.weight)
+    wrappers._tp_copy = lambda value: value
+    monkeypatch.setitem(sys.modules, distributed.__name__, distributed)
+    monkeypatch.setitem(sys.modules, wrappers.__name__, wrappers)
+    torch.manual_seed(113)
+    parameters = []
+
+    def parameter(shape):
+        value = torch.nn.Parameter(torch.randn(shape) * 0.2)
+        parameters.append(value)
+        return value
+
+    def linear(out_features, in_features):
+        return SimpleNamespace(weight=parameter((out_features, in_features)), bias=None)
+
+    def norm(size):
+        return SimpleNamespace(weight=parameter((size,)), variance_epsilon=1e-6)
+
+    attention = SimpleNamespace(
+        total_num_kv_heads=2,
+        num_kv_heads=2,
+        num_heads=2,
+        head_dim=4,
+        q_size=8,
+        kv_size=8,
+        qkv_proj=linear(24, 16 if eagle else 8),
+        o_proj=linear(8, 8),
+        q_norm=norm(4),
+        k_norm=norm(4),
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.tensor([[1.0, 1.0, 0.0, 0.0]]).repeat(8, 1)),
+    )
+    layer = SimpleNamespace(
+        self_attn=attention,
+        input_layernorm=norm(8),
+        post_attention_layernorm=norm(8),
+        mlp=SimpleNamespace(gate_up_proj=linear(12, 8), down_proj=linear(8, 6)),
+    )
+    if eagle:
+        layer.hidden_norm = norm(8)
+    embedding = torch.nn.Embedding(9, 8)
+    backbone = SimpleNamespace(embed_tokens=embedding, layers=[layer], norm=norm(8))
+    model = namespace["QwenDraftReplay"]()
+    model.config = SimpleNamespace(hidden_size=8)
+    if eagle:
+        model.model = backbone
+    else:
+        model.embed_tokens, model.layers, model.norm = (
+            backbone.embed_tokens,
+            backbone.layers,
+            backbone.norm,
+        )
+    count = 1 if eagle else 3
+    ids = torch.arange(2 * count)
+    previous = torch.randn(2 * count, 8)
+    batch = SimpleNamespace(spec_info=SimpleNamespace(hidden_states=previous))
+    history_k, history_v = torch.randn(2, 2, 2, 4), torch.randn(2, 2, 2, 4)
+    valid = torch.tensor([[True, False], [True, True]])
+    model._training_histories = [(history_k, history_v, valid)]
+    actual, _ = model._replay_hidden(ids, torch.zeros(2 * count, dtype=torch.long), batch)
+
+    def rms(module, value):
+        return gemma_rms(value, module.weight, 1e-6)
+
+    embedded = embedding(ids).detach()
+    hidden = previous if eagle else embedded
+    inputs = (
+        torch.cat((rms(layer.input_layernorm, embedded), rms(layer.hidden_norm, hidden)), -1)
+        if eagle
+        else rms(layer.input_layernorm, hidden)
+    )
+    q, k, v = F.linear(inputs, attention.qkv_proj.weight).chunk(3, -1)
+    q = rms(attention.q_norm, q.view(2, count, 2, 4))
+    k = torch.cat((history_k, rms(attention.k_norm, k.view(2, count, 2, 4))), 1)
+    v = torch.cat((history_v, v.view(2, count, 2, 4)), 1)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) / 2
+    mask = torch.cat((valid, torch.ones(2, count, dtype=torch.bool)), 1)
+    scores = scores.masked_fill(~mask[:, None, None], -torch.inf)
+    attended = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v).reshape(-1, 8)
+    reference = hidden + F.linear(attended, attention.o_proj.weight)
+    gate, up = F.linear(
+        rms(layer.post_attention_layernorm, reference), layer.mlp.gate_up_proj.weight
+    ).chunk(2, -1)
+    reference = rms(
+        backbone.norm, reference + F.linear(F.silu(gate) * up, layer.mlp.down_proj.weight)
+    )
+    assert torch.allclose(actual, reference, atol=2e-6)
+    actual_grad = torch.autograd.grad(actual.square().sum(), parameters, retain_graph=True)
+    expected_grad = torch.autograd.grad(reference.square().sum(), parameters)
+    for measured, expected in zip(actual_grad, expected_grad, strict=True):
+        assert torch.isfinite(measured).all() and torch.count_nonzero(measured)
+        assert torch.allclose(measured, expected, atol=2e-5, rtol=2e-4)
+
+
+def _gemma_tp_gradient_worker(rank, init_path):
+    """Actual two-process collectives, not forward-only simulated sharding."""
+    import types
+
+    import torch.distributed as dist
+    import torch.nn.functional as functional
+
+    from lightcone_spec.gemma import gemma_canvas_attention, gemma_rms, gemma_rotary
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=2)
+    try:
+        # Load the exact runtime collective autograd definitions, without importing
+        # the CUDA-serving dependency tree in a CPU regression test.
+        native_patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text().splitlines()
+        start = next(
+            index
+            for index, line in enumerate(native_patch)
+            if line.startswith("+class _TensorParallelCopy(")
+        )
+        native_lines = []
+        for line in native_patch[start:]:
+            if not line.startswith("+"):
+                break
+            native_lines.append(line[1:])
+        native_tree = ast.parse("\n".join(native_lines))
+        dflash_tree = _patched_residual_rms()[1]
+        namespace = {"torch": torch, "dist": dist}
+        classes = [
+            item
+            for tree in (native_tree, dflash_tree)
+            for item in tree.body
+            if isinstance(item, ast.ClassDef)
+            and item.name in {"_TensorParallelCopy", "_TensorParallelSum"}
+        ]
+        exec(compile(ast.Module(classes, []), "runtime-collectives", "exec"), namespace)
+        for module_name, symbol in (
+            ("sglang.srt.speculative.native_backend_online_adaptation", "_TensorParallelCopy"),
+            ("sglang.srt.speculative.dflash_online_adaptation", "_TensorParallelSum"),
+        ):
+            stub = types.ModuleType(module_name)
+            setattr(stub, symbol, namespace[symbol])
+            sys.modules[module_name] = stub
+        tree = _coverage_added_module("python/sglang/srt/models/gemma4_draft.py")
+        functions = [
+            item
+            for item in tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in {"_tp_copy", "_column", "_row", "_replay_attention"}
+        ]
+        namespace.update(
+            F=functional,
+            gemma_rms=gemma_rms,
+            gemma_rotary=gemma_rotary,
+            gemma_canvas_attention=gemma_canvas_attention,
+            get_tp_group=lambda: SimpleNamespace(world_size=2, device_group=dist.group.WORLD),
+        )
+        exec(compile(ast.Module(functions, []), "gemma-replay", "exec"), namespace)
+        torch.manual_seed(710)
+        hidden = torch.randn(2, 8, requires_grad=True)
+        q = torch.randn(16, 8, requires_grad=True)
+        k = torch.randn(4, 8, requires_grad=True)
+        o = torch.randn(8, 16, requires_grad=True)
+        qn = torch.randn(4, requires_grad=True)
+        kn = torch.randn(4, requires_grad=True)
+        hist = (
+            torch.randn(1, 3, 1, 4),
+            torch.randn(1, 3, 1, 4),
+            torch.tensor([[True, True, False]]),
+        )
+        positions = torch.tensor([3, 4])
+        cache = torch.cat((torch.ones(8, 1), torch.zeros(8, 1)), -1)
+        query = gemma_rotary(
+            gemma_rms(functional.linear(hidden, q).view(1, 2, 4, 4), qn, 1e-6),
+            positions.view(1, 2),
+            cache,
+        )
+        raw_key = functional.linear(hidden, k).view(1, 2, 1, 4)
+        key = gemma_rotary(gemma_rms(raw_key, kn, 1e-6), positions.view(1, 2), cache)
+        value = gemma_rms(raw_key, None, 1e-6)
+        reference = functional.linear(
+            gemma_canvas_attention(query, key, value, *hist).view(2, 16), o
+        )
+        expected = torch.autograd.grad(reference.square().mean(), (hidden, q, k, o, qn, kn))
+        local = [
+            tensor.detach().clone().requires_grad_()
+            for tensor in (
+                hidden,
+                q.chunk(2, 0)[rank],
+                k,
+                o.chunk(2, 1)[rank],
+                qn,
+                kn,
+            )
+        ]
+        attention = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=local[1], bias=None),
+            k_proj=SimpleNamespace(weight=local[2], bias=None),
+            o_proj=SimpleNamespace(weight=local[3], bias=None),
+            q_norm=SimpleNamespace(weight=local[4], eps=1e-6),
+            k_norm=SimpleNamespace(weight=local[5], eps=1e-6),
+            v_norm=SimpleNamespace(eps=1e-6),
+            rotary_emb=SimpleNamespace(cos_sin_cache=cache),
+            num_heads=2,
+            num_kv_heads=1,
+            total_num_kv_heads=1,
+            head_dim=4,
+            tied_kv=True,
+            q_size=8,
+        )
+        actual = namespace["_replay_attention"](attention, local[0], positions, hist, eagle=False)
+        torch.testing.assert_close(actual, reference, atol=2e-5, rtol=2e-5)
+        gradients = torch.autograd.grad(actual.square().mean(), local)
+        expected = (
+            expected[0],
+            expected[1].chunk(2, 0)[rank],
+            expected[2],
+            expected[3].chunk(2, 1)[rank],
+            expected[4],
+            expected[5],
+        )
+        for gradient, reference_gradient in zip(gradients, expected, strict=True):
+            torch.testing.assert_close(gradient, reference_gradient, atol=3e-5, rtol=3e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gemma_tp2_replicated_kv_and_norm_gradients_match_unsplit_reference(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_gemma_tp_gradient_worker, args=(str(tmp_path / "gloo-init"),), nprocs=2, join=True)
+
+
+def _native_lora_tp_worker(rank, init_path):
+    import torch.distributed as dist
+    import torch.nn.functional as F
+
+    from lightcone_spec.native_tp import LowRankDelta, global_gradient_norm
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=2)
+    try:
+        for partition in ("column", "row"):
+            torch.manual_seed(240)
+            base = torch.randn(8, 8)
+            inputs = torch.randn(5, 8)
+            target = torch.randn(5, 8)
+            reference = LowRankDelta(base, rank=2, seed=71, scale=2.0)
+            shard = base.chunk(2, 0 if partition == "column" else 1)[rank]
+            local = LowRankDelta(
+                shard,
+                rank=2,
+                seed=71,
+                scale=2.0,
+                partition=partition,
+                tp_rank=rank,
+                tp_size=2,
+                group=dist.group.WORLD,
+            )
+            optimizers = [
+                torch.optim.AdamW(module.parameters(), lr=0.01, weight_decay=0.001)
+                for module in (reference, local)
+            ]
+            # Three steps exercise initially-zero B, then nonzero shared A/B,
+            # independent Adam moments, and a genuinely active clipping bound.
+            for _ in range(3):
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
+                full_output = F.linear(inputs, reference(base))
+                full_loss = (full_output - target).square().sum()
+                full_loss.backward()
+                if partition == "column":
+                    output = F.linear(inputs, local(shard))
+                    loss = (output - target.chunk(2, -1)[rank]).square().sum()
+                else:
+                    output = F.linear(inputs.chunk(2, -1)[rank], local(shard))
+                    total = output.detach().clone()
+                    dist.all_reduce(total)
+                    output = total + (output - output.detach())
+                    loss = (output - target).square().sum()
+                loss.backward()
+                params = tuple(reference.parameters())
+                local_params = tuple(local.parameters())
+                expected_norm = torch.stack([p.grad.square().sum() for p in params]).sum().sqrt()
+                measured_norm = global_gradient_norm(
+                    [p.grad for p in local_params],
+                    (partition == "column", partition == "row"),
+                    dist.group.WORLD,
+                    2,
+                )
+                torch.testing.assert_close(measured_norm, expected_norm, atol=2e-5, rtol=2e-5)
+                for group, norm in ((params, expected_norm), (local_params, measured_norm)):
+                    for parameter in group:
+                        parameter.grad.mul_(min(1.0, 0.1 / (float(norm) + 1e-12)))
+                for optimizer in optimizers:
+                    optimizer.step()
+                for index, (full, part) in enumerate(zip(params, local_params, strict=True)):
+                    sharded = (partition == "column" and index == 1) or (
+                        partition == "row" and index == 0
+                    )
+                    axis = 0 if index == 1 else 1
+                    expected = full.chunk(2, axis)[rank] if sharded else full
+                    torch.testing.assert_close(part, expected, atol=2e-6, rtol=2e-5)
+                    for name in ("exp_avg", "exp_avg_sq"):
+                        expected = optimizers[0].state[full][name]
+                        if sharded:
+                            expected = expected.chunk(2, axis)[rank]
+                        torch.testing.assert_close(
+                            optimizers[1].state[part][name], expected, atol=2e-6, rtol=2e-5
+                        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_native_lora_tp2_three_updates_and_global_clip_match_tp1(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_native_lora_tp_worker, args=(str(tmp_path / "lora-gloo"),), nprocs=2, join=True)
+
+
+def test_compact_verifier_teacher_remains_strided_and_bonus_is_not_a_draft():
+    from lightcone_spec.native_tp import strided_teacher_rows
+
+    # The compact input has [3,8] rows, but the verifier has scattered its
+    # output into two fixed 8-row slots before returning to the learner.
+    logits = torch.arange(16).view(16, 1)
+    teacher = strided_teacher_rows(logits, 2, 7, 2)
+    assert teacher[:, :, 0].tolist() == [list(range(7)), list(range(8, 15))]
+    assert 7 not in teacher and 15 not in teacher
+    with pytest.raises(ValueError, match="RID stride"):
+        strided_teacher_rows(logits[:11], 2, 7, 2)
+
+
+def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(
+            ["git", "apply", f"--include={relative}", str(patch.resolve())],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+    source = ast.parse((tmp_path / relative).read_text())
+    wanted = {"_clip_fp32_gradients", "ParameterProposal", "ResidentOptimizer"}
+    namespace = {"torch": torch, "math": math, "Sequence": Sequence, "dataclass": dataclass}
+    exec(
+        compile(
+            ast.Module(
+                [
+                    item
+                    for item in source.body
+                    if isinstance(item, (ast.ClassDef, ast.FunctionDef)) and item.name in wanted
+                ],
+                [],
+            ),
+            "cumulative-runtime-optimizer",
+            "exec",
+        ),
+        namespace,
+    )
+    config = SimpleNamespace(
+        name="chronobelief",
+        learning_rate=0.001,
+        beta1=0.9,
+        beta2=0.99,
+        epsilon=1e-8,
+        weight_decay=0.0,
+        grad_clip=1.0,
+        schedule="constant",
+    )
+    optimizer = namespace["ResidentOptimizer"]((torch.zeros(1),), config)
+    proposal = optimizer.propose(
+        (torch.tensor([3.0]),),
+        global_gradient_norm=torch.tensor(9.0),
+        feedback_source_version=0,
+        safe_boundary_version=0,
+    )
+    torch.testing.assert_close(proposal.gradient_norms, torch.tensor([9.0]))
+    torch.testing.assert_close(proposal.first_moments[0], torch.tensor([1 / 30]))

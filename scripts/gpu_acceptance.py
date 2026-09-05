@@ -1208,6 +1208,91 @@ def compare(args: argparse.Namespace) -> None:
         raise SystemExit("; ".join(failures))
 
 
+def coverage(args: argparse.Namespace) -> None:
+    """Run only in a drained window; the formal SQLite is strictly read-only."""
+    import sqlite3
+    import threading
+
+    from lightcone_spec.coverage import gpu_acceptance_jobs
+    from lightcone_spec.runner import _run_pending_jobs
+    from lightcone_spec.state import StateStore
+
+    formal = ExperimentConfig.load(args.config)
+    output = args.output.resolve()
+    if output == formal.run_dir.resolve() or output.is_relative_to(formal.run_dir.resolve()):
+        raise ValueError("GPU acceptance output must be outside the formal run")
+    for path in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            argv = path.read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if b"run" in argv and any(
+            Path(value.decode(errors="replace")).name == "lightcone-spec" for value in argv if value
+        ):
+            raise RuntimeError("formal runner is still active; drain at a cell boundary first")
+    config = replace(formal, results_root=output, run_name="excluded-coverage")
+    state = StateStore(config.run_dir)
+    if not state.selection("qa_formal_selection_snapshot", False):
+        with sqlite3.connect(f"file:{formal.run_dir / 'state.sqlite'}?mode=ro", uri=True) as source:
+            for name, value in source.execute("SELECT name,value_json FROM selections"):
+                state.set_selection(name, json.loads(value))
+        state.set_selection("qa_formal_selection_snapshot", True)
+    planned = tuple(
+        job
+        for job in gpu_acceptance_jobs()
+        if args.phase == "all" or job.parameters["qa_phase"] == args.phase
+    )
+    state.add_internal_jobs(planned, storage_node="coverage-gpu-qa")
+    for job in planned:
+        if state.job_status(job.job_id) == "completed":
+            continue
+        if state.job_status(job.job_id) != "pending":
+            raise RuntimeError(f"inspect failed/interrupted QA evidence before retry: {job.job_id}")
+        # Each accepted cell has its own clean server. TP2 occupies both cards;
+        # isolation avoids turning validation timings into a parallel claim.
+        _run_pending_jobs(config, state, "coverage-gpu-qa", threading.Event(), (job,))
+        directory = state.completed_attempt_dir(job.job_id)
+        if directory is None:
+            raise RuntimeError(f"coverage GPU QA failed: {job.job_id}")
+        metrics = json.loads((directory / "metrics.json").read_text())
+        if not metrics.get("hard_feasible"):
+            # A complete diagnostic is retained, but only a specifically
+            # reviewed capacity outcome may later be accepted as unavailable.
+            raise RuntimeError(f"coverage GPU QA needs outcome review: {directory}")
+        if job.method in {"tts", "lightcone"}:
+            if metrics.get("resolved_stride") != 10 or metrics.get("updates_published", 0) < 2:
+                raise RuntimeError(
+                    f"coverage GPU QA has insufficient real publications: {directory}"
+                )
+        if any(metrics.get(key, 0) for key in SAFETY_COUNTERS):
+            raise RuntimeError(f"coverage GPU QA safety counters failed: {directory}")
+        print(
+            json.dumps({"job_id": job.job_id, "status": "passed", "attempt_dir": str(directory)}),
+            flush=True,
+        )
+    records = []
+    for job in gpu_acceptance_jobs():
+        directory = state.completed_attempt_dir(job.job_id)
+        records.append(
+            {
+                "job_id": job.job_id,
+                "phase": job.parameters["qa_phase"],
+                "attempt_dir": None if directory is None else str(directory),
+                "status": state.job_status(job.job_id),
+            }
+        )
+    _write(
+        output / "coverage-progress.json",
+        {
+            "formal_benchmark": False,
+            "records": records,
+            "status": "GPU_cells_complete_pending_gate_and_outcome_review"
+            if all(row["status"] == "completed" for row in records)
+            else "incomplete",
+        },
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1250,6 +1335,13 @@ def main() -> None:
     command.add_argument("--rebuild", type=Path, required=True)
     command.add_argument("--output", type=Path, required=True)
     command.set_defaults(handler=compare)
+    command = commands.add_parser("coverage")
+    command.add_argument("--config", type=Path, required=True)
+    command.add_argument("--output", type=Path, required=True)
+    command.add_argument(
+        "--phase", choices=("all", "gemma", "qwen", "dense14", "panels"), default="all"
+    )
+    command.set_defaults(handler=coverage)
     command = commands.add_parser("nextn")
     command.add_argument("--config", type=Path, required=True)
     command.add_argument("--output", type=Path, required=True)

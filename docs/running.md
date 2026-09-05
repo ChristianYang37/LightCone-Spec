@@ -98,3 +98,38 @@ temperatures: an unavailable seven-position STS recipe disables only
 DSpark-LightCone work, while independent methods remain runnable. ETA output is
 stored under `stages/priority-window-v2/eta.json` and reports remaining parent
 jobs, logical leaf cells, P50/P90 total time, and the E5-only tail.
+
+## Four-block coverage rollout
+
+The coverage extension uses marker `paper-v1-nextn-shadow-v26` on a new patched
+SGLang worktree; do not apply it over the active v25 runtime. Keep the production
+runner working during CPU checks and CI, then drain it at a cell boundary and
+back up SQLite/WAL and active evidence before switching runtimes.
+
+Prepare unchanged official source files with `scripts/prepare_source_coverage.py`.
+Add its nine `DeepSpec-source|...` dataset keys and twelve separately verified
+official checkpoint keys to the runtime configuration; do not overwrite existing
+dataset/draft paths. Source block-7/TTT7 and main DFlash block-16 are distinct.
+
+In a drained window run `scripts/gpu_acceptance.py coverage --config /absolute/paper.yaml
+--output /absolute/excluded-diagnostics --phase all` (or the `gemma`, `qwen`,
+`dense14`, `panels` phases). Its 41 short cells use an excluded SQLite and a
+read-only formal selection snapshot. They do not enable the formal extension.
+Review real capacity outcomes separately from runtime errors, and verify
+nonzero updates, request reset, TP2, and deliberate valid-token safety rejection
+before recording the internal `formal_coverage_runtime_v1` accepted selection.
+
+Resume preserves old attempts. Method-specific compatibility replacements,
+corrected native-teacher STS, restored E0 leaves, and E6-owned dense-14B evidence
+have separate internal stage identities. Additional source/mechanism work is
+exactly 1,296/48 leaves and runs before the unchanged E5-last tail. The public
+21-node plan and existing six-/twelve-block evidence are not rewritten.
+
+`stages/coverage-eta-v1/eta.json` accounts for remaining original, replacement,
+and four-block leaves. It uses request-linear costs only within matched
+model/backend/method, output length, load, topology and panel strata, charging
+clean startup conservatively. Missing strata leave full ETA `UNMEASURED`; the
+priced subset is explicitly not a total ETA. The earlier priority-v2 estimate
+excludes the new source panels and must not be presented as their finish time.
+Summaries and statistical reducers both consume replacement-filtered logical
+cells, including completed siblings beneath superseded bundled parents.

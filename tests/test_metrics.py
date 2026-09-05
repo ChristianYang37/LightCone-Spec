@@ -14,19 +14,227 @@ from lightcone_spec.metrics import (
     block_bootstrap_interval,
     committed_goodput,
     derive_feasibility_semantics,
+    four_block_log_ratio_statistics,
+    four_block_panel_statistics,
     hierarchical_request_interval,
     holm_decisions,
+    mechanism_position_summary,
     normalize_attempt_semantics,
     paired_bca_interval,
     paired_block_statistics,
     paired_relative_bca_interval,
     per_user_generation_speed,
+    position_acceptance_metrics,
     summarize_attempts,
     validate_scientific_metrics,
 )
 from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
+
+
+def test_coverage_eta_scales_request_budget_without_reusing_unknown_output_costs():
+    from lightcone_spec.coverage import request_budget_eta
+    from lightcone_spec.protocol import source_coverage_jobs
+
+    job = source_coverage_jobs()[0]
+    evidence = [(job, {"hard_feasible": True, "duration_seconds": 100.,
+                       "request_count": 10, "session_startup_seconds": 5.})]
+    args = dict(resources={job.job_id: 2}, repetitions=20)
+    small = request_budget_eta((job,), evidence, request_counts={job.job_id: 10}, **args)
+    large = request_budget_eta((job,), evidence, request_counts={job.job_id: 500}, **args)
+    assert small["p50_seconds"] == 105 and large["p50_seconds"] == 5005
+    other = replace(job, parameters={**job.parameters, "generation_tokens": 32768})
+    unknown = request_budget_eta((other,), evidence, request_counts={job.job_id: 500}, **args)
+    assert unknown["status"] == "UNMEASURED" and unknown["p50_seconds"] is None
+    assert unknown["priced_leaves"] == 0
+    excluded = replace(job, parameters={**job.parameters, "excluded_from_analysis": True})
+    assert request_budget_eta((job,), [(excluded, evidence[0][1])],
+                              request_counts={job.job_id: 500}, **args)["priced_leaves"] == 0
+
+
+def test_legacy_bonus_counters_are_recomputed_only_when_layout_is_identified(tmp_path):
+    from lightcone_spec.metrics import historical_position_rounds
+
+    raw = [{"verify_len": [8], "accepted_drafts": [7]}]
+    converted = historical_position_rounds({"backend": "DSPARK"}, raw)
+    assert converted[0]["verify_len"] == [7]
+    assert raw[0]["verify_len"] == [8]
+    assert historical_position_rounds({"backend": "EAGLE3"}, raw)[0]["verify_len"] == [7]
+    ambiguous = [{"verify_len": [3], "accepted_drafts": [2]}]
+    _, derived = normalize_attempt_semantics({"backend": "DSPARK"}, {"rounds": ambiguous}, tmp_path)
+    assert derived["position_conditional_acceptance"] == "N/A"
+    assert derived["position_metric_semantics"] == "unidentified_legacy_verify_layout"
+    current = [{**raw[0], "verify_len_semantics": "draft_positions_v2"}]
+    assert historical_position_rounds({"backend": "DSPARK"}, current) == current
+
+
+def test_mechanism_bins_keep_censoring_timestamps_and_publication_units():
+    from lightcone_spec.mechanism import MechanismRecorder
+
+    recorder = MechanismRecorder(bin_tokens=2)
+    teacher = torch.tensor([[[2.0, 0.0], [0.0, 2.0], [float("nan"), 0.0]]])
+    recorder.record(
+        request_ids=["r"],
+        generated_offsets=[1],
+        teacher_logits=teacher,
+        draft_logits=teacher.clone(),
+        valid_mask=torch.tensor([[True, True, False]]),
+        accepted_drafts=[1],
+        committed_tokens=[2],
+        prompt_lengths=[100],
+    )
+    recorder.finish("r", natural_stop=True)
+    snapshots = recorder.snapshot(
+        [
+            {
+                "status": "published",
+                "request_ids": ["r"],
+                "prefix_len_before": [101],
+            }
+        ]
+    )
+    assert len(snapshots["mechanism_bins"]) == 2
+    assert sum(row["exposed_draft_positions"] for row in snapshots["mechanism_bins"]) == 2
+    assert sum(row["updates_published"] for row in snapshots["mechanism_bins"]) == 1
+    assert "logits" not in json.dumps(snapshots)
+    result = mechanism_position_summary(
+        snapshots["mechanism_bins"],
+        [
+            {
+                "request_id": "r",
+                "native_token_timestamps_ns": [0, 1_000_000, 3_000_000],
+            }
+        ],
+    )
+    assert result[0]["native_p50_itl_ms"] == 1.0
+    assert result[1]["native_p50_itl_ms"] == 2.0
+    assert result[1]["natural_stops"] == 1
+    assert result[0]["effective_requests"] == 1
+    assert result[0]["positions"]["1"]["prefix_survival"] == 1
+    assert result[1]["positions"]["2"]["conditional_acceptance"] == 0
+    assert result[0]["target_entropy"] > result[0]["draft_top1_ce"]
+    with pytest.raises(ValueError, match="unknown or duplicate"):
+        mechanism_position_summary(
+            snapshots["mechanism_bins"] * 2,
+            [
+                {
+                    "request_id": "r",
+                    "native_token_timestamps_ns": [0, 1, 2],
+                }
+            ],
+        )
+    recorder.reset()
+    assert recorder.snapshot()["mechanism_bins"] == []
+
+
+def test_four_independent_block_log_ratios_and_exact_resolution():
+    result = four_block_log_ratio_statistics(
+        {0: 110, 1: 120, 2: 115, 3: 118},
+        dict.fromkeys(range(4), 100),
+    )
+    assert result["exact_sign_flip_p"] == 0.125
+    assert result["degrees_of_freedom"] == 3
+    assert result["ratio_ci95"][0] < result["geometric_mean_ratio"] < result["ratio_ci95"][1]
+    assert result["geometric_mean_ratio"] == pytest.approx((1.1 * 1.2 * 1.15 * 1.18) ** 0.25)
+    with pytest.raises(ValueError, match="exactly blocks"):
+        four_block_log_ratio_statistics({0: 1, 1: 2, 2: 3}, {0: 1, 1: 2, 2: 3})
+    with pytest.raises(ValueError, match="positive finite"):
+        four_block_log_ratio_statistics(dict.fromkeys(range(4), 0), dict.fromkeys(range(4), 1))
+
+
+def test_prefix_and_conditional_acceptance_have_distinct_denominators(tmp_path):
+    rounds = [{"accepted_drafts": [0, 1, 2, 3], "verify_len": [3, 3, 3, 3]}]
+    metrics = position_acceptance_metrics(rounds)
+    assert metrics["position_prefix_survival"] == [0.75, 0.5, 0.25]
+    assert metrics["position_conditional_survival"] == [0.75, 2 / 3, 0.5]
+    censored = position_acceptance_metrics([{"accepted_drafts": [1, 0], "verify_len": [1, 3]}])
+    assert censored["position_conditional_survival"] == [0.5, None, None]
+    assert censored["position_exposure_counts"] == [2, 1, 1]
+    assert (
+        position_acceptance_metrics([{"accepted_drafts": [1], "verify_len": []}])[
+            "position_prefix_survival"
+        ]
+        == "N/A"
+    )
+    original = {"rounds": rounds, "position_conditional_survival": [0.75, 0.5, 0.25]}
+    _, corrected = normalize_attempt_semantics({"method": "static"}, original, tmp_path)
+    assert corrected["position_conditional_survival"] == [0.75, 2 / 3, 0.5]
+    assert original["position_conditional_survival"] == [0.75, 0.5, 0.25]
+
+
+def test_four_block_reducer_preserves_negative_rows_and_excludes_legacy_bca():
+    rows = []
+    for method in ("static", "lightcone"):
+        for block in range(4):
+            rows.append(
+                (
+                    {
+                        "method": method,
+                        "block": block,
+                        "parameters": {
+                            "statistical_unit": "independent_clean_server_paired_block",
+                            "sampling_seed": 980406 + block,
+                        },
+                    },
+                    {
+                        "goodput": 100 + (10 + block if method == "lightcone" else 0),
+                        "hard_feasible": True,
+                    },
+                )
+            )
+    assert paired_block_statistics(rows) == []
+    result = four_block_panel_statistics(rows)
+    comparison = next(
+        row
+        for row in result
+        if row["candidate_method"] == "lightcone" and row["baseline_method"] == "static"
+    )
+    assert comparison["status"] == "measured"
+    assert len(comparison["raw_blocks"]["lightcone"]) == 4
+    rows[-1][1]["hard_feasible"] = False
+    result = four_block_panel_statistics(rows)
+    assert all("ratio_ci95" not in row for row in result)
+    with pytest.raises(ValueError, match="duplicate four-block"):
+        four_block_panel_statistics([*rows, rows[0]])
+    rows[-1][0]["parameters"]["sampling_seed"] = 0
+    with pytest.raises(ValueError, match="different seeds"):
+        four_block_panel_statistics(rows)
+
+
+def test_mechanism_four_block_ci_uses_run_points_and_keeps_censored_zero(tmp_path):
+    from lightcone_spec.metrics import four_block_mechanism_statistics
+
+    rows = []
+    for method in ("static", "tts", "lightcone"):
+        for block in range(4):
+            config = {
+                "method": method,
+                "block": block,
+                "parameters": {
+                    "statistical_unit": "independent_clean_server_paired_block",
+                    "sampling_seed": block,
+                },
+            }
+            bucket = {
+                "position_start": 0,
+                "position_end": 2048,
+                "effective_requests": 30,
+                "natural_stops": 2,
+                "target_entropy": 1.0 + 0.1 * block,
+                "positions": {"1": {"prefix_survival": 0.0, "conditional_acceptance": None}},
+            }
+            rows.append((config, {"hard_feasible": True, "mechanism_position_summary": [bucket]}))
+    result = four_block_mechanism_statistics(rows)
+    measured = [row for row in result if row["metric"] == "target_entropy"]
+    assert len(measured) == 3 and all(row["status"] == "measured" for row in measured)
+    assert all(
+        len(row["raw_blocks"]["lightcone"]) == 4
+        for row in measured
+        if "lightcone" in row["raw_blocks"]
+    )
+    zero = [row for row in result if row["metric"] == "position_1_prefix_survival"]
+    assert all(row["status"] == "undefined_log_ratio" and "ratio_ci95" not in row for row in zero)
 
 
 def test_goodput_bootstrap_and_holm():

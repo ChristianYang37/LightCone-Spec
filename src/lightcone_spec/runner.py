@@ -28,12 +28,20 @@ from scipy.linalg import null_space
 
 from .client import GenerationResult, ScheduledRun
 from .config import ExperimentConfig
+from .coverage import (
+    COMPATIBILITY_NODE,
+    DENSE_14B,
+    compatibility_replacements,
+    method_feasibility,
+    request_budget_eta,
+)
 from .data import (
     load_arrival_offsets,
     load_arrival_trace,
     load_calibration_mix,
     load_prompt_pool,
     load_prompt_records,
+    load_source_prompt_records,
 )
 from .metrics import (
     SAFETY_COUNTERS,
@@ -42,12 +50,15 @@ from .metrics import (
     committed_goodput,
     derive_feasibility_semantics,
     holm_decisions,
+    mechanism_position_summary,
     normalize_attempt_semantics,
     paired_bca_interval,
     paired_block_statistics,
     paired_relative_bca_interval,
     per_user_generation_speed,
+    position_acceptance_metrics,
     summarize_attempts,
+    summarize_metric_rows,
     validate_scientific_metrics,
 )
 from .protocol import (
@@ -64,12 +75,16 @@ from .protocol import (
     FORMAL_ADAPTATION_STRIDE,
     GEOMETRY_GENERATION_TOKENS,
     MAX_E2_GEOMETRIES,
+    MECHANISM_NODE,
     PAPER_NODES,
     PRIMARY_BLOCKS,
     SECONDARY_BLOCKS,
+    SOURCE_COVERAGE_NODE,
     Job,
     e2_candidates,
     materialize,
+    mechanism_jobs,
+    source_coverage_jobs,
     uses_formal_adaptation_stride,
 )
 from .server import (
@@ -191,11 +206,18 @@ def _records_scientific_rejection(job: Job) -> bool:
         job.node == "S10-reconciliation"
         or job.node == "bugfix-reconciliation-v1"
         or job.node in {"soft-gate-width-v1", "profile-proxy-v1"}
+        or job.node
+        in {
+            SOURCE_COVERAGE_NODE,
+            MECHANISM_NODE,
+            "coverage-compatibility-v1",
+            "dense-14b-transfer-v1",
+            "coverage-E0-pilot-v1",
+            "coverage-E0-final-v1",
+            "coverage-E1a-v1",
+        }
         or job.node == "E3-width-calibration"
-        or (
-            job.node in {"E3b-pilot", "E3b-final"}
-            and "segment_index" in job.parameters
-        )
+        or (job.node in {"E3b-pilot", "E3b-final"} and "segment_index" in job.parameters)
         or job.method in CANDIDATE_METHODS
         or bool(job.parameters.get("interface_fit"))
         or _screening_job(job)
@@ -674,35 +696,14 @@ def _nsys_csv_summary(payload: str) -> dict[str, object]:
 
 
 def _position_survival(rounds: object) -> list[float] | str:
-    if not isinstance(rounds, list):
-        return "N/A"
-    accepted = [
-        int(value)
-        for row in rounds
-        if isinstance(row, dict) and isinstance(row.get("accepted_drafts"), list)
-        for value in row["accepted_drafts"]
-    ]
-    verified = [
-        int(value)
-        for row in rounds
-        if isinstance(row, dict) and isinstance(row.get("verify_len"), list)
-        for value in row["verify_len"]
-    ]
-    if not accepted or len(accepted) != len(verified):
-        return "N/A"
-    width = max(verified, default=0)
-    return [
-        sum(a >= position for a, v in zip(accepted, verified, strict=True) if v >= position)
-        / sum(v >= position for v in verified)
-        for position in range(1, width + 1)
-        if any(v >= position for v in verified)
-    ]
+    return position_acceptance_metrics(rounds)["position_prefix_survival"]
 
 
 def _task_for_data(config: ExperimentConfig, job: Job) -> str:
-    if job.task not in config.datasets:
-        raise ScientificFailure(f"job requires an explicit dataset path for {job.task}")
-    return job.task
+    key = str(job.parameters.get("dataset_key", job.task))
+    if key not in config.datasets:
+        raise ScientificFailure(f"job requires an explicit dataset path for {key}")
+    return key
 
 
 def _prompt_offset(job: Job, limit: int) -> int:
@@ -803,9 +804,54 @@ def _cell_inputs(
     count = _request_count(config, state, job)
     dataset_key = _task_for_data(config, job)
     metadata: dict[str, object] = {"dataset": dataset_key}
+    if job.parameters.get("regime") in {"source_native_prompt", "mechanism_native_prompt"}:
+        seed = int(job.parameters["sampling_seed"])
+        if job.parameters["regime"] == "source_native_prompt":
+            records = load_source_prompt_records(
+                config.dataset_path(dataset_key),
+                max_samples=count,
+                seed=seed,
+            )
+        else:
+            records = load_prompt_records(
+                config.dataset_path(dataset_key),
+                limit=count,
+                selection_seed=int(job.parameters["stimulus_selection_seed"]),
+            )
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(config.model_path(job.model)),
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+        inputs = tuple(
+            tuple(
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": row["prompt"]}],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            )
+            for row in records
+        )
+        budget = int(job.parameters["generation_tokens"])
+        if any(not tokens or len(tokens) + budget > int(job.context) for tokens in inputs):
+            raise ScientificFailure(
+                "native prompt plus output budget exceeds registered context; no truncation allowed"
+            )
+        metadata.update(
+            examples=records,
+            context_construction="native_chat_template_no_padding",
+            sampling_seed=seed,
+            respect_eos=True,
+            enable_thinking=False,
+            execution_request_count=len(inputs),
+        )
+        return inputs, budget, metadata
     tts_calibration_window = (
-        job.node == "TTS-Cal"
-        or job.parameters.get("workload") == "tts_stride10_confirmation"
+        job.node == "TTS-Cal" or job.parameters.get("workload") == "tts_stride10_confirmation"
     )
     domain = job.parameters.get("domain")
     calibration_split = job.parameters.get("calibration_split")
@@ -1032,6 +1078,31 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
 
 
 def _runtime_job(config: ExperimentConfig, state: StateStore, job: Job) -> Job:
+    if job.parameters.get("coverage_runtime") and job.backend != "NONE":
+        # Inspect only the explicitly configured local checkpoint. Existing
+        # job/config rows remain immutable; this is a recorded runtime route.
+        draft = config.draft_path(job.model, job.backend)
+        checkpoint = json.loads((draft / "config.json").read_text())
+        architectures = checkpoint.get("architectures", [])
+        if any(
+            name in architectures
+            for name in (
+                "Qwen3DSparkModel",
+                "Qwen3Eagle3Model",
+                "Gemma4DSparkModel",
+                "Gemma4Eagle3Model",
+            )
+        ):
+            job = replace(
+                job,
+                width=8,
+                parameters={
+                    **job.parameters,
+                    "checkpoint_family": "deepspec_next_token_v1",
+                    "registered_width": job.width,
+                    "proposal_budget": 8,
+                },
+            )
     job = replace(
         job,
         parameters={
@@ -1094,9 +1165,7 @@ def _runtime_job(config: ExperimentConfig, state: StateStore, job: Job) -> Job:
         if (
             job.node.startswith("E5")
             and isinstance(job.load, str)
-            and (
-                job.load == "burstgpt_shape"
-            )
+            and (job.load == "burstgpt_shape")
         ):
             _, concurrency = _e5_reference(state, job)
             return replace(
@@ -1389,6 +1458,7 @@ def _run_request_scoped(
     same_seed: bool = False,
     request_prefix: str = "request-scoped",
     temperature: float = 0.0,
+    respect_eos: bool = False,
 ):
     started = time.perf_counter()
     results = []
@@ -1399,6 +1469,7 @@ def _run_request_scoped(
             seed=seed if same_seed else seed + index,
             temperature=temperature,
             request_ids=(f"{request_prefix}-{index:05d}",),
+            **({"ignore_eos": False} if respect_eos else {}),
         )
         results.append(rows[0])
     return tuple(results), time.perf_counter() - started
@@ -1416,9 +1487,13 @@ def _execute_cell(
     # Freeze the ORIGINAL input job, not its resolved load. In particular,
     # common_slo_load and BurstGPT retain their historical prompt-pool size.
     execution_request_count = _request_count(config, state, job)
-    input_job = replace(job, parameters={
-        **job.parameters, "execution_request_count": execution_request_count,
-    })
+    input_job = replace(
+        job,
+        parameters={
+            **job.parameters,
+            "execution_request_count": execution_request_count,
+        },
+    )
     execution_resources = {
         "declared_gpu_count": job.gpu_count,
         "execution_gpu_ids": list(gpus),
@@ -1430,9 +1505,13 @@ def _execute_cell(
         output_dir = config.run_dir / "jobs" / job.job_id / f"attempt-{next_attempt:02d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         attempt = state.start(job, gpus, output_dir)
-        _write_json(output_dir / "config.json", replace(
-            input_job, parameters={**input_job.parameters, **execution_resources},
-        ).to_dict())
+        _write_json(
+            output_dir / "config.json",
+            replace(
+                input_job,
+                parameters={**input_job.parameters, **execution_resources},
+            ).to_dict(),
+        )
         _write_jsonl(output_dir / "requests.jsonl.gz", ())
         session_files = {
             "server.log": server.output_dir / "server.log",
@@ -1694,7 +1773,11 @@ def _execute_cell(
                     max_in_flight=dispatcher_concurrency,
                 )
             elif arrivals is None:
-                seed = config.protocol.seed + (job.block or 0)
+                seed = int(
+                    runtime_job.parameters.get(
+                        "sampling_seed", config.protocol.seed + (job.block or 0)
+                    )
+                )
                 if runtime_job.load and runtime_job.load.startswith("closed_loop_c"):
                     scheduled = client.run_closed_loop(
                         prompts,
@@ -1710,7 +1793,9 @@ def _execute_cell(
                     results, elapsed = scheduled.results, scheduled.elapsed_seconds
                     if any(outcome.status == "error" for outcome in scheduled.outcomes):
                         raise RuntimeError("closed-loop request failed")
-                elif request_scoped:
+                elif request_scoped or runtime_job.parameters.get("respect_eos"):
+                    if runtime_job.parameters.get("respect_eos") and dispatcher_concurrency != 1:
+                        raise ValueError("native source/diagnostic execution requires matched c1")
                     results, elapsed = _run_request_scoped(
                         client,
                         prompts,
@@ -1719,6 +1804,7 @@ def _execute_cell(
                         same_seed=bool(runtime_job.parameters.get("controlled_replay")),
                         request_prefix=f"{job.job_id}-measure",
                         temperature=temperature,
+                        respect_eos=bool(runtime_job.parameters.get("respect_eos")),
                     )
                 else:
                     scheduled = client.run_bounded(
@@ -1796,19 +1882,14 @@ def _execute_cell(
                 if classification == "runtime_failure":
                     raise RuntimeError(
                         "measured request failed at runtime: "
-                        + "; ".join(
-                            str(row.get("error") or row["status"])
-                            for row in incomplete
-                        )
+                        + "; ".join(str(row.get("error") or row["status"]) for row in incomplete)
                     )
                 scientific_outcome = _incomplete_scientific_outcome(job, incomplete)
                 if scientific_outcome is None:
                     raise RuntimeError(
                         f"{len(incomplete)} requests did not complete in a measured cell"
                     )
-                counters = {
-                    name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
-                }
+                counters = {name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS}
                 _write_json(
                     output_dir / "metrics.json",
                     {
@@ -1825,19 +1906,11 @@ def _execute_cell(
                         "request_count": len(results),
                         "request_outcomes": {
                             "offered": len(outcome_rows),
-                            "admitted": sum(
-                                row["admitted_ns"] is not None for row in outcome_rows
-                            ),
-                            "completed": sum(
-                                row["status"] == "completed" for row in outcome_rows
-                            ),
+                            "admitted": sum(row["admitted_ns"] is not None for row in outcome_rows),
+                            "completed": sum(row["status"] == "completed" for row in outcome_rows),
                             "error": sum(row["status"] == "error" for row in outcome_rows),
-                            "timed_out": sum(
-                                row["status"] == "timed_out" for row in outcome_rows
-                            ),
-                            "cancelled": sum(
-                                row["status"] == "cancelled" for row in outcome_rows
-                            ),
+                            "timed_out": sum(row["status"] == "timed_out" for row in outcome_rows),
+                            "cancelled": sum(row["status"] == "cancelled" for row in outcome_rows),
                             "unfinished": sum(
                                 row["status"] == "unfinished" for row in outcome_rows
                             ),
@@ -2049,13 +2122,33 @@ def _execute_cell(
                     "formal multi-turn segment produced fewer than ten speculation rounds"
                 )
             survival = _position_survival(metrics.get("rounds"))
-            metrics["position_conditional_survival"] = survival
+            metrics.update(position_acceptance_metrics(metrics.get("rounds")))
             metrics["effective_target_token_batch"] = (
                 float(sum(survival)) if isinstance(survival, list) else "N/A"
             )
             metrics["total_variation"] = "N/A"
             metrics["target_entropy"] = "N/A"
             metrics["target_top_token_draft_cross_entropy"] = "N/A"
+            if runtime_job.parameters.get("mechanism_telemetry"):
+                bins = after.get("mechanism_bins")
+                if not isinstance(bins, list) or not bins:
+                    raise RuntimeError("mechanism cell lacks native position diagnostics")
+                position_rows = mechanism_position_summary(
+                    bins, [result.to_dict() for result in results]
+                )
+                metrics["mechanism_bins"] = bins
+                metrics["mechanism_position_summary"] = position_rows
+                metrics["measurement_scope"] = "long_generation_mechanism_diagnostic"
+                metrics["exclude_headline_performance"] = True
+                exposed = sum(row["exposed_draft_positions"] for row in position_rows)
+                if exposed <= 0:
+                    raise RuntimeError("mechanism cell has no valid teacher positions")
+                metrics["target_entropy"] = (
+                    sum(row["target_entropy_sum"] for row in position_rows) / exposed
+                )
+                metrics["target_top_token_draft_cross_entropy"] = (
+                    sum(row["draft_top1_ce_sum"] for row in position_rows) / exposed
+                )
             metrics["directional_condition_frequency"] = "N/A"
             metrics["projected_net_drift"] = "N/A"
             metrics["residual_magnitude"] = "N/A"
@@ -2218,7 +2311,8 @@ def _execute_cell(
                 )
                 state.complete(job.job_id, attempt)
                 return
-            if _screening_job(job) and _capacity_infeasible(
+            if (_screening_job(job) or job.parameters.get("coverage_runtime")
+                    or job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}) and _capacity_infeasible(
                 error,
                 session_files["server.log"],
                 session_offsets["server.log"],
@@ -2307,8 +2401,19 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
         )
         return _formalize_recipe(selected)
     if job.method == "lightcone":
-        name = "dspark_recipe" if job.backend == "DSPARK" else "lightcone_recipe"
-        selected = dict(state.selection(name, {}))
+        name = (
+            "dspark_recipe"
+            if job.backend == "DSPARK"
+            and job.node != SOURCE_COVERAGE_NODE
+            and job.parameters.get("verification") != "fixed_budget"
+            else "lightcone_recipe"
+        )
+        recipe = state.selection(name, None)
+        if name == "dspark_recipe" and not isinstance(recipe, dict):
+            raise ScientificFailure(
+                "DSpark LightCone lacks validated STS recipe; no default fallback"
+            )
+        selected = dict(recipe or {})
         if job.node.startswith("E6"):
             selected.update(parameterization="lora", rank=8, scope="all")
         return _formalize_recipe(selected)
@@ -2387,13 +2492,20 @@ def _job_gpus(config: ExperimentConfig, job: Job) -> tuple[int, ...]:
 def _tp1_resource_eligible(job: Job) -> bool:
     """Only ordinary single-server E0/E5 work may shed its declared pair."""
     return (
-        job.node in {"E0-tune", "E0-pilot", "E0-final", "E5-pilot", "E5-final"}
+        str(job.parameters.get("source_node", job.node))
+        in {"E0-tune", "E0-pilot", "E0-final", "E5-pilot", "E5-final"}
         and job.gpu_count == 2
         and job.parameters.get("topology", "tp1_dp1") == "tp1_dp1"
-        and not any(job.parameters.get(name) for name in (
-            "profiler", "failure", "controlled_replay", "controlled_pair_baseline",
-            "requires_isolation",
-        ))
+        and not any(
+            job.parameters.get(name)
+            for name in (
+                "profiler",
+                "failure",
+                "controlled_replay",
+                "controlled_pair_baseline",
+                "requires_isolation",
+            )
+        )
     )
 
 
@@ -3677,8 +3789,9 @@ def _run_pending_jobs(
             probe = job.job_id if job.parameters.get("adaptive_probe") else None
             key = (job.block, probe, *server_session_key(runtime, _selection_for_job(state, job)))
             legacy_keys.setdefault(_job_gpus(config, job), []).append(key)
-        legacy_keys = {gpus: _session_order(config, node, gpus, keys)
-                       for gpus, keys in legacy_keys.items()}
+        legacy_keys = {
+            gpus: _session_order(config, node, gpus, keys) for gpus, keys in legacy_keys.items()
+        }
     node_failed = threading.Event()
     pooled_singles = tuple(job for job in singles if _session_pool_eligible(job))
     singles = tuple(job for job in singles if job not in pooled_singles)
@@ -3695,19 +3808,24 @@ def _run_pending_jobs(
             grouped.setdefault(key, []).append((job, runtime_job, selection))
         if remapped:
             declared = tuple(dict.fromkeys(_job_gpus(config, job) for job in jobs))
-            keys = list(dict.fromkeys(key for pair in declared for key in legacy_keys[pair]
-                                      if key in grouped))
+            keys = list(
+                dict.fromkeys(
+                    key for pair in declared for key in legacy_keys[pair] if key in grouped
+                )
+            )
         else:
-            keys = _session_order(config, node, gpus, grouped)
+            if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}:
+                # Protocol ordinals already encode the frozen within-block method
+                # randomization. A second session shuffle would change that order.
+                keys = sorted(grouped, key=lambda key: min(row[0].ordinal for row in grouped[key]))
+            else:
+                keys = _session_order(config, node, gpus, grouped)
         for key in keys:
             if stop_event.is_set() or node_failed.is_set():
                 return
             rows = grouped[key]
             first_job, first_runtime, first_selection = rows[0]
-            if (
-                first_job.node == "E4-profile"
-                and first_job.parameters.get("profiler") == "ncu"
-            ):
+            if first_job.node == "E4-profile" and first_job.parameters.get("profiler") == "ncu":
                 reason = _ncu_permission_block_reason(
                     config.profiler_tools["ncu"], config.server.python, gpus[0]
                 )
@@ -3771,9 +3889,8 @@ def _run_pending_jobs(
                     # errors, but apply it to every E0-tune session rather than only
                     # rows carrying the original ``probe`` flag.
                     compatibility_scope = (
-                        first_job.node == "E0-tune"
-                        or first_job.parameters.get("probe")
-                    )
+                        first_job.node == "E0-tune" or first_job.parameters.get("probe")
+                    ) and not first_job.parameters.get("coverage_runtime")
                     if compatibility_scope and _adaptive_probe_incompatible(
                         error, session_dir / "server.log"
                     ):
@@ -3785,7 +3902,11 @@ def _run_pending_jobs(
                             ),
                         )
                         break
-                    if _screening_job(first_job) and _capacity_infeasible(error):
+                    if (
+                        _screening_job(first_job)
+                        or first_job.parameters.get("coverage_runtime")
+                        or first_job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+                    ) and _capacity_infeasible(error, session_dir / "server.log"):
                         _terminalize_pending_session_rows(
                             state,
                             rows,
@@ -3878,8 +3999,10 @@ def _run_pending_jobs(
         if stop_event.is_set() or node_failed.is_set():
             return
     if remapped:
-        queues = {gpu: tuple(job for job in singles if allocations[job.job_id] == (gpu,))
-                  for gpu in config.gpu_ids}
+        queues = {
+            gpu: tuple(job for job in singles if allocations[job.job_id] == (gpu,))
+            for gpu in config.gpu_ids
+        }
         queues = {gpu: jobs for gpu, jobs in queues.items() if jobs}
     else:
         queues = _single_gpu_queues(config, singles)
@@ -4134,6 +4257,8 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
     rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
     excluded = set(state.selection("formal_evidence_exclusions", []))
     candidates = list(state.completed_attempt_rows(node))
+    if node in PAPER_NODES:
+        candidates.extend(state.completed_attempt_rows(f"{node}-segments"))
     if node in PAPER_NODES:
         for job_id, directory in state.completed_attempt_rows():
             config_path = directory / "config.json"
@@ -5493,7 +5618,7 @@ def _mechanism_summary(state: StateStore, node: str) -> list[dict[str, object]]:
 
 def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None:
     summary_dir = config.run_dir / "stages" / node
-    summarize_attempts(state.completed_attempt_dirs(node), summary_dir)
+    summarize_metric_rows(_metric_rows(state, node), summary_dir)
     if node != "preflight":
         _write_json(summary_dir / "mechanism.json", _mechanism_summary(state, node))
     if node.endswith("-final"):
@@ -5754,14 +5879,21 @@ def _save_or_validate_run_config(config: ExperimentConfig) -> None:
         new_paths = dict(normalized["paths"])
         old_datasets = dict(old_paths.pop("datasets"))
         new_datasets = dict(new_paths.pop("datasets"))
+        old_drafts = dict(old_paths.pop("drafts"))
+        new_drafts = dict(new_paths.pop("drafts"))
         old_paths.pop("sglang_root")
         new_paths.pop("sglang_root")
         same_existing_datasets = all(
             new_datasets.get(name) == value for name, value in old_datasets.items()
         )
+        same_existing_drafts = all(
+            new_drafts.get(name) == value for name, value in old_drafts.items()
+        ) and all(
+            name.startswith("DeepSpec-source|") for name in new_drafts.keys() - old_drafts.keys()
+        )
         previous = {**previous, "paths": old_paths}
         current = {**normalized, "paths": new_paths}
-        if previous != current or not same_existing_datasets:
+        if previous != current or not same_existing_datasets or not same_existing_drafts:
             raise RuntimeError("run directory belongs to a different experiment config")
         saved.write_text(yaml.safe_dump(normalized, sort_keys=True), encoding="utf-8")
         return
@@ -7314,7 +7446,9 @@ def _eta_planned_jobs(state: StateStore, node: str) -> tuple[Job, ...]:
         return ()
 
 
-def _eta_remaining_jobs(state: StateStore) -> tuple[tuple[Job, ...], int]:
+def _eta_remaining_jobs(
+    state: StateStore, *, include_coverage: bool = True
+) -> tuple[tuple[Job, ...], int]:
     """Return logical pending leaves plus pending or not-yet-registered parents."""
     with state.connect() as connection:
         raw = connection.execute(
@@ -7362,7 +7496,44 @@ def _eta_remaining_jobs(state: StateStore) -> tuple[tuple[Job, ...], int]:
                         leaves[child.job_id] = child
             else:
                 leaves.update((job.job_id, job) for job in segments)
+    coverage = (*source_coverage_jobs(), *mechanism_jobs()) if include_coverage else ()
+    for planned in coverage:
+        record = stored.get(planned.job_id)
+        if record is None or record[1] in {"pending", "running"}:
+            leaves[planned.job_id] = planned if record is None else record[2]
+            pending_parents += 1
+    if include_coverage:
+        for storage_node, status, job in stored.values():
+            if (storage_node.startswith("coverage-") and status in {"pending", "running"}
+                    and job.job_id not in leaves and not _segment_jobs(job)):
+                leaves[job.job_id] = job
+                pending_parents += 1
     return tuple(leaves.values()), pending_parents
+
+
+def _write_coverage_eta(config, state):
+    remaining, parents = _eta_remaining_jobs(state)
+    order = ["coverage-E1a-v1", COMPATIBILITY_NODE, "coverage-E0-pilot-v1",
+             "coverage-E0-final-v1", *[n for n in PAPER_NODES if not n.startswith("E5")],
+             SOURCE_COVERAGE_NODE, MECHANISM_NODE, "E5-pilot", "E5-final"]
+    remaining = tuple(sorted(remaining, key=lambda j: (
+        order.index(j.node) if j.node in order else len(order), j.ordinal)))
+    evidence = [row for node in (*PAPER_NODES, SOURCE_COVERAGE_NODE, MECHANISM_NODE)
+                for row in _metric_rows(state, node)]
+    isolated = not state.selection("tp1_resource_parallel_v2", {}).get("enabled")
+    audit = request_budget_eta(
+        remaining, evidence,
+        request_counts={j.job_id: _request_count(config, state, j) for j in remaining},
+        resources={j.job_id: (2 if isolated and j.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+                              else _eta_resource_count(state, j)) for j in remaining},
+        seed=config.protocol.seed,
+    )
+    audit.update(remaining_parents=parents, additional_registered_source_cells=1296,
+                 additional_registered_mechanism_cells=48, scope="full_remaining_dag_and_coverage")
+    path = config.run_dir / "stages" / "coverage-eta-v1" / "eta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, audit)
+    state.set_selection("formal_coverage_eta_v1", audit)
 
 
 def _eta_stratum(config: dict[str, Any] | Job) -> tuple[str, ...]:
@@ -7401,7 +7572,10 @@ def _eta_resource_count(state: StateStore, job: Job) -> int:
 def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
     if state.selection("formal_priority_eta_v2", None) is not None:
         return
-    remaining, parent_count = _eta_remaining_jobs(state)
+    # The legacy cell-runtime bootstrap cannot price 500-request source cells
+    # as if they were old 16-request cells. Keep its scope explicit until the
+    # new panels have measured topology/request-budget strata.
+    remaining, parent_count = _eta_remaining_jobs(state, include_coverage=False)
     if not remaining:
         return
     duration_samples: dict[tuple[str, ...], list[float]] = {}
@@ -7471,8 +7645,7 @@ def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
     order_index = {
         node: index
         for index, node in enumerate(
-            [row for row in PAPER_NODES if not row.startswith("E5")]
-            + ["E5-pilot", "E5-final"]
+            [row for row in PAPER_NODES if not row.startswith("E5")] + ["E5-pilot", "E5-final"]
         )
     }
     cells.sort(
@@ -7514,11 +7687,11 @@ def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
             clocks[gpu] += duration
             sessions[gpu] = session
         total_outcomes[repetition] = max(clocks)
-        e5_outcomes[repetition] = max(clocks) - (
-            e5_start if e5_start is not None else max(clocks)
-        )
+        e5_outcomes[repetition] = max(clocks) - (e5_start if e5_start is not None else max(clocks))
     audit = {
         "version": 2,
+        "scope": "base_dag_excludes_four_block_coverage",
+        "four_block_coverage_eta": "UNMEASURED",
         "remaining_parent_jobs": parent_count,
         "remaining_leaf_cells": len(remaining),
         "valid_runtime_attempts": len(all_durations),
@@ -7543,6 +7716,306 @@ def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, audit)
     state.set_selection("formal_priority_eta_v2", audit)
+
+
+def _coverage_e0_gaps(state: StateStore) -> tuple[Job, ...]:
+    """Leaf replacements preserve completed siblings and original paired seeds."""
+    output = []
+    for node in ("E0-pilot", "E0-final"):
+
+        def key(job):
+            return job.model, job.backend, job.method, job.block
+
+        existing = {key(job): job for job in state.jobs(node)}
+        children = {job.job_id: job for job in state.jobs(f"{node}-segments")}
+        for planned in materialize(node, e0_recipes=state.selection("e0_recipes", {})):
+            original = existing.get(key(planned))
+            dense = planned.model == DENSE_14B
+            native_update = planned.backend in {"DSPARK", "EAGLE3"} and planned.method in {
+                "tts",
+                "lightcone",
+            }
+            if original is not None and not dense:
+                # Valid completed work and ordinary pending blocks stay in the
+                # existing DAG. Recover only the earlier pair-pruning gaps.
+                status = state.job_status(original.job_id)
+                if status in {"pending", "running"} or (
+                    status == "completed" and not native_update
+                ):
+                    continue
+                with state.connect() as connection:
+                    reason = (
+                        connection.execute(
+                            "SELECT error FROM jobs WHERE job_id=?", (original.job_id,)
+                        ).fetchone()[0]
+                        or ""
+                    )
+                if status != "completed" and not any(
+                    text in reason.lower()
+                    for text in ("e0 probe", "compatib", "valid_e0", "model/backend", "dependency")
+                ):
+                    continue
+            parent = original or planned
+            for leaf in _segment_jobs(parent):
+                if (
+                    not dense
+                    and not native_update
+                    and leaf.job_id in children
+                    and state.job_status(leaf.job_id) == "completed"
+                ):
+                    continue
+                parameters = dict(leaf.parameters)
+                parameters.pop("parent_job_id", None)
+                parameters.update(
+                    source_node=node,
+                    coverage_runtime=True,
+                    reconciliation_kind="dense_14b_move_to_tp2"
+                    if dense
+                    else "model_method_coverage_gap",
+                    evidence_owner="E6" if dense else "E0",
+                    topology="tp2_dp1" if dense else "tp1_dp1",
+                    panel="dense_14b_transfer" if dense else "coverage_restoration",
+                    original_parent_job_id=parent.job_id,
+                )
+                if leaf.job_id in children:
+                    parameters["replaces_job_id"] = leaf.job_id
+                output.append(
+                    replace(
+                        leaf,
+                        job_id=f"coverage-v1__{leaf.job_id}",
+                        node=f"coverage-{node}-v1",
+                        gpu_count=2,
+                        parameters=parameters,
+                    )
+                )
+    return tuple(output)
+
+
+def _run_coverage_e1a_repair(config, state, stop_event):
+    """Invalidate STS fitted with misowned native teacher rows, not DFlash geometry."""
+    name, node = "formal_coverage_e1a_v1", "coverage-E1a-v1"
+    audit = state.selection(name, None)
+    if isinstance(audit, dict) and audit.get("status") == "completed":
+        return
+    jobs = tuple(
+        replace(
+            leaf,
+            node=node,
+            job_id=f"coverage-v1__{leaf.job_id}",
+            parameters={
+                **{key: value for key, value in leaf.parameters.items() if key != "parent_job_id"},
+                "source_node": "E1a",
+                "coverage_runtime": True,
+                "reconciliation_kind": "native_teacher_rid_and_owned_mask",
+                "replaces_job_id": leaf.job_id,
+            },
+        )
+        for parent in _e1a_source_transfer_jobs()
+        for leaf in _segment_jobs(parent)
+    )
+    if audit is None:
+        previous = _metric_rows(state, "E1a")
+        excluded = set(state.selection("formal_evidence_exclusions", []))
+        excluded.update(str(row["job_id"]) for row, _ in previous)
+        state.set_selection("formal_evidence_exclusions", sorted(excluded))
+        audit = {
+            "status": "running",
+            "replacement_leaves": len(jobs),
+            "previous_recipe": state.selection("dspark_recipe", None),
+            "replaced_evidence": [row["job_id"] for row, _ in previous],
+        }
+        state.set_selection(name, audit)
+        state.delete_selections(
+            ("dspark_recipe", "dspark_confidence_temperatures", "E1a_scientific_unavailable")
+        )
+    state.add_internal_jobs(jobs, storage_node=node)
+    capture = tuple(
+        job
+        for job in state.pending_jobs(node)
+        if job.parameters.get("workload") == "dspark_confidence_capture"
+    )
+    _run_pending_jobs(config, state, node, stop_event, capture)
+    if stop_event.is_set():
+        return
+    if state.selection("dspark_recipe", None) is None:
+        try:
+            state.set_selection("dspark_recipe", _fit_dspark_recipe(state))
+        except ScientificFailure as error:
+            if state.status_counts(node).get("failed"):
+                raise
+            state.set_selection("E1a_scientific_unavailable", str(error))
+            for job in state.pending_jobs(node):
+                if job.parameters.get("workload") == "dspark_native_scheduler_validation":
+                    state.skip_job(
+                        job.job_id, f"corrected source capture scientifically unavailable: {error}"
+                    )
+    _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, node)
+    validation = [
+        metric
+        for item, metric in _metric_rows(state, "E1a")
+        if item.get("parameters", {}).get("workload") == "dspark_native_scheduler_validation"
+    ]
+    available = len(validation) == 3 and all(_hard_feasible(metric) for metric in validation)
+    if not available:
+        state.delete_selections(("dspark_recipe",))
+        state.set_selection(
+            "E1a_scientific_unavailable", "corrected native-scheduler validation unavailable"
+        )
+    path = config.run_dir / "stages" / node / "audit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    final = {**audit, "status": "completed", "dspark_available": available}
+    _write_json(path, final)
+    state.set_selection(name, final)
+
+
+def _run_coverage_recovery(
+    config: ExperimentConfig, state: StateStore, stop_event: threading.Event
+) -> None:
+    if state.selection("formal_coverage_runtime_v1", {}).get("status") != "accepted":
+        return
+    if state.selection("formal_coverage_recovery_v1", {}).get("status") == "completed":
+        return
+    _run_coverage_e1a_repair(config, state, stop_event)
+    if stop_event.is_set():
+        return
+    plan = state.selection("formal_coverage_recovery_plan_v1", None)
+    if plan is None:
+        rows = [(Job(**item), metrics) for item, metrics in _metric_rows(state, "E0-tune")]
+        jobs = (*compatibility_replacements(rows), *_coverage_e0_gaps(state))
+        plan = [job.to_dict() for job in jobs]
+        state.set_selection("formal_coverage_recovery_plan_v1", plan)
+    jobs = tuple(Job(**row) for row in plan)
+    excluded = set(state.selection("formal_evidence_exclusions", []))
+    excluded.update(
+        job.parameters["replaces_job_id"] for job in jobs if "replaces_job_id" in job.parameters
+    )
+    excluded.update(
+        job.parameters["original_parent_job_id"]
+        for job in jobs
+        if "original_parent_job_id" in job.parameters
+    )
+    state.set_selection("formal_evidence_exclusions", sorted(excluded))
+    for node in (COMPATIBILITY_NODE, "coverage-E0-pilot-v1", "coverage-E0-final-v1"):
+        planned = tuple(job for job in jobs if job.node == node)
+        if not planned:
+            continue
+        state.add_internal_jobs(planned, storage_node=node)
+        parents = tuple(
+            dict.fromkeys(
+                job.parameters["original_parent_job_id"]
+                for job in planned
+                if "original_parent_job_id" in job.parameters
+            )
+        )
+        if parents:
+            state.supersede_jobs(
+                parents, "superseded by method-level coverage/E6 dense transfer", stage_node=node
+            )
+        replaced = tuple(
+            job.parameters["replaces_job_id"]
+            for job in planned
+            if "replaces_job_id" in job.parameters
+        )
+        state.supersede_jobs(
+            replaced, "superseded by auditable coverage replacement", stage_node=node
+        )
+        if stop_event.is_set():
+            return
+        _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
+        if stop_event.is_set():
+            return
+        _require_internal_jobs(state, node)
+    rows = [(Job(**item), metrics) for item, metrics in _metric_rows(state, "E0-tune")]
+    matrix = method_feasibility(rows)
+    audit = {
+        "status": "completed",
+        "compatibility_replacements": sum(job.node == COMPATIBILITY_NODE for job in jobs),
+        "restored_original_leaves": sum(job.node != COMPATIBILITY_NODE for job in jobs),
+        "dense_14b_leaves": sum(job.model == DENSE_14B for job in jobs),
+        "method_feasibility": matrix,
+    }
+    audit_path = config.run_dir / "stages" / "coverage-recovery-v1" / "audit.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(audit_path, audit)
+    dense_rows = [
+        (item, metrics)
+        for node in ("E0-pilot", "E0-final")
+        for item, metrics in _metric_rows(state, node)
+        if item.get("parameters", {}).get("panel") == "dense_14b_transfer"
+    ]
+    dense_path = config.run_dir / "stages" / "E6-dense-14b-transfer" / "evidence.json"
+    dense_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(dense_path, dense_rows)
+    for node in ("E0-tune", "E0-pilot", "E0-final"):
+        rows = _metric_rows(state, node)
+        output = config.run_dir / "stages" / node
+        summarize_metric_rows(rows, output)
+        if node.endswith("-final"):
+            _write_json(output / "statistics.json", paired_block_statistics(rows))
+    state.set_selection("formal_coverage_recovery_v1", audit)
+    _write_coverage_eta(config, state)
+
+
+def _run_four_block_coverage(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> bool:
+    """Append-only panels; deployment enables them only after excluded GPU QA.
+
+    No public stage is added. Existing attempts are untouched, and an unaccepted
+    runtime cannot accidentally start the expensive official source workload.
+    """
+    if state.selection("formal_four_block_coverage_v1", {}).get("status") == "completed":
+        return True
+    acceptance = state.selection("formal_coverage_runtime_v1", {})
+    if acceptance.get("status") != "accepted":
+        return False
+    if not state.selection("tts_recipe", None) or not state.selection("lightcone_recipe", None):
+        raise RuntimeError("four-block coverage requires the frozen formal recipes")
+    panels = (source_coverage_jobs(), mechanism_jobs())
+    parallel = bool(state.selection("tp1_resource_parallel_v2", {}).get("enabled"))
+    for jobs in panels:
+        node = jobs[0].node
+        if stop_event.is_set():
+            return False
+        state.add_internal_jobs(jobs, storage_node=node)
+        # Single-device gaps precede the dedicated dense-14B TP2 window. An
+        # existing paired block always retains _assigned_gpu/block affinity.
+        for gpu_count in (1, 2):
+            pending = tuple(job for job in state.pending_jobs(node) if job.gpu_count == gpu_count)
+            if parallel and gpu_count == 1:
+                _run_pending_jobs(config, state, node, stop_event, pending)
+            else:
+                # Incomplete or failed interference acceptance means clean
+                # isolation, not a silent change to the statistical protocol.
+                for job in sorted(pending, key=lambda job: job.ordinal):
+                    if stop_event.is_set():
+                        return False
+                    _run_pending_jobs(config, state, node, stop_event, (job,))
+            if stop_event.is_set():
+                return False
+        counts = state.status_counts(node)
+        if any(counts.get(status, 0) for status in ("failed", "pending", "running")):
+            raise RuntimeError(f"four-block panel {node} has unfinished runtime failures: {counts}")
+        summarize_attempts(
+            [directory for _, directory in state.completed_attempt_rows(node)],
+            config.run_dir / "stages" / node / "summary",
+        )
+        _write_coverage_eta(config, state)
+    state.set_selection(
+        "formal_four_block_coverage_v1",
+        {
+            "status": "completed",
+            "source_cells": 1296,
+            "mechanism_cells": 48,
+            "statistical_unit": "independent_clean_server_paired_block",
+        },
+    )
+    return True
 
 
 def _completed_stage_has_no_work(state: StateStore, node: str) -> bool:
@@ -7594,6 +8067,20 @@ class PaperRunner:
             for node in nodes:
                 if self.stop_event.is_set():
                     break
+                if (
+                    node == "E5-pilot"
+                    and self.state.selection("formal_four_block_coverage_v1", {}).get("status")
+                    != "completed"
+                ):
+                    coverage_done = _run_four_block_coverage(
+                        self.config, self.state, self.stop_event
+                    )
+                    if self.stop_event.is_set():
+                        break
+                    if not coverage_done:
+                        raise RuntimeError(
+                            "four-block coverage is registered but its GPU runtime acceptance is incomplete"
+                        )
                 _run_formal_s10_reconciliation(
                     self.config,
                     self.state,
@@ -7619,7 +8106,11 @@ class PaperRunner:
                     self.stop_event,
                 )
                 _repair_e0_feasible_pair_prune_v1(self.state)
-                if self.state.selection("formal_priority_window_v2", {}).get("status") == "completed":
+                _run_coverage_recovery(self.config, self.state, self.stop_event)
+                if (
+                    self.state.selection("formal_priority_window_v2", {}).get("status")
+                    == "completed"
+                ):
                     _run_tp1_interference_v2(
                         self.config,
                         self.state,
@@ -7680,9 +8171,7 @@ class PaperRunner:
                         valid_e0=valid_e0,
                         e2_rows=e2_rows,
                         e0_recipes=self.state.selection("e0_recipes", None),
-                        e4_neighborhoods=self.state.selection(
-                            "e4_neighborhoods", None
-                        ),
+                        e4_neighborhoods=self.state.selection("e4_neighborhoods", None),
                     ),
                 )
                 upgraded = (

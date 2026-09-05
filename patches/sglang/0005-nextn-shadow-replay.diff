@@ -1541,3 +1541,1580 @@ index accb6bc3..49ac2d23 100644
  
          background_tasks = BackgroundTasks()
          background_tasks.add_task(abort_request)
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 37566da4..16087355 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -293,6 +293,18 @@ class ModelConfig:
+             )
+         )
+         self.hf_text_config = get_hf_text_config(self.hf_config)
++        if is_draft_model and self.hf_config.architectures[0] in {
++            "Gemma4DSparkModel", "Gemma4Eagle3Model",
++        }:
++            # These public drafts contain only global/full-attention layers.
++            # Resolve the allocator metadata before any KV pool is constructed;
++            # target Gemma's hybrid local/global configuration is untouched.
++            text = self.hf_text_config
++            text.head_dim = text.v_head_dim = int(text.global_head_dim)
++            if bool(text.attention_k_eq_v):
++                text.num_key_value_heads = int(text.num_global_key_value_heads)
++            text.layer_types = ["full_attention"] * int(text.num_hidden_layers)
++            text.sliding_window = None
+         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+         self.embedding_model_spec = resolve_embedding_model_spec(
+             self.hf_config.architectures,
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index 722c5101..5cd836f5 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -2325,6 +2325,8 @@ class FlashInferMultiStepDraftBackend:
+             device="cuda",
+         )
+ 
++        self._online_step_kv = [None] * (self.speculative_num_steps - 1)
++
+         def call_fn(i, forward_batch):
+             forward_batch.spec_info.kv_indptr = (
+                 forward_batch.spec_info.kv_indptr.clone()
+@@ -2332,6 +2334,10 @@ class FlashInferMultiStepDraftBackend:
+             forward_batch.spec_info.kv_indices = (
+                 forward_batch.spec_info.kv_indices.clone()
+             )
++            self._online_step_kv[i] = (
++                forward_batch.spec_info.kv_indptr,
++                forward_batch.spec_info.kv_indices,
++            )
+             self.attn_backends[i].init_forward_metadata(forward_batch)
+ 
+         self.common_template(forward_batch, kv_indices, call_fn)
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index b6da733e..0a8c2af4 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -1952,6 +1952,8 @@ class TritonMultiStepDraftBackend:
+             device=self.device,
+         )
+ 
++        self._online_step_kv = [None] * (self.speculative_num_steps - 1)
++
+         def call_fn(i, forward_batch):
+             forward_batch.spec_info.kv_indptr = (
+                 forward_batch.spec_info.kv_indptr.clone()
+@@ -1959,6 +1961,10 @@ class TritonMultiStepDraftBackend:
+             forward_batch.spec_info.kv_indices = (
+                 forward_batch.spec_info.kv_indices.clone()
+             )
++            self._online_step_kv[i] = (
++                forward_batch.spec_info.kv_indptr,
++                forward_batch.spec_info.kv_indices,
++            )
+             self.attn_backends[i].init_forward_metadata(forward_batch)
+ 
+         self.common_template(forward_batch, kv_indices, call_fn)
+diff --git a/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py b/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
+index 95c88763..3ebb7c2f 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
++++ b/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
+@@ -89,9 +89,12 @@ def _resolve_eagle_aux_hidden_state(
+                 config.eagle_aux_hidden_state_layer_ids = eagle_config[
+                     "eagle_aux_hidden_state_layer_ids"
+                 ]
+-            except:
+-                # if there is no aux layer, set to None
+-                config.eagle_aux_hidden_state_layer_ids = None
++            except (AttributeError, KeyError, TypeError):
++                # Official DeepSpec stores the trained feature layers at top level.
++                # Target setters perform the HF-output (+1) conversion exactly once.
++                config.eagle_aux_hidden_state_layer_ids = getattr(
++                    draft_model_config.hf_config, "target_layer_ids", None
++                )
+ 
+ 
+ def _resolve_dflash_aux_hidden_state(
+diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
+index 7e1916f0..884231a0 100644
+--- a/python/sglang/srt/models/dspark.py
++++ b/python/sglang/srt/models/dspark.py
+@@ -10,6 +10,7 @@ from torch import nn
+ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.dflash import DFlashDraftModel
++from sglang.srt.models.qwen3_draft_replay import QwenDraftReplay
+ from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
+ from sglang.srt.speculative.dspark_components.dspark_config import (
+     parse_dspark_draft_config,
+@@ -324,6 +325,8 @@ class DSparkConfidenceHead(nn.Module):
+ 
+ 
+ def build_confidence_head(config) -> Optional[nn.Module]:
++    if getattr(config, "enable_confidence_head", None) is False:
++        return None
+     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+         return None
+     if not hasattr(config, "enable_confidence_head"):
+@@ -365,6 +368,10 @@ class DSparkDraftMixin:
+     def attach_shared_modules(
+         self, *, embed_tokens: nn.Module, lm_head: nn.Module
+     ) -> None:
++        if getattr(self, "owns_checkpoint_embed_head", False):
++            if self.embed_tokens is None or self.lm_head is None:
++                raise ValueError("checkpoint-owned embedding/head were not constructed")
++            return
+         self.embed_tokens = embed_tokens
+         self.lm_head = lm_head
+ 
+@@ -402,7 +409,13 @@ class DSparkDraftMixin:
+         backbone_weights = []
+         params_dict = dict(self.named_parameters())
+         for name, loaded_weight in weights:
+-            if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
++            name = name.removeprefix("model.")
++            skip_prefixes = (
++                ("rotary_emb.",)
++                if getattr(self, "owns_checkpoint_embed_head", False)
++                else _DSPARK_SKIPPED_WEIGHT_PREFIXES
++            )
++            if any(name.startswith(p) for p in skip_prefixes):
+                 continue
+             if name.startswith("confidence_head."):
+                 if self.confidence_head is None:
+@@ -592,8 +605,22 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
+     pass
+ 
+ 
+-class Qwen3DSparkModel(DSparkDraftModel):
+-    pass
++class Qwen3DSparkModel(QwenDraftReplay, DSparkDraftModel):
++    owns_checkpoint_embed_head = True
++
++    def __init__(self, config, quant_config=None, prefix=""):
++        from sglang.srt.layers.vocab_parallel_embedding import (
++            ParallelLMHead, VocabParallelEmbedding,
++        )
++
++        super().__init__(config, quant_config=quant_config, prefix=prefix)
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size, config.hidden_size, prefix="embed_tokens"
++        )
++        self.lm_head = ParallelLMHead(
++            config.vocab_size, config.hidden_size,
++            quant_config=quant_config, prefix="lm_head",
++        )
+ 
+ 
+ EntryClass = [Qwen3DSparkModel]
+diff --git a/python/sglang/srt/models/gemma4_draft.py b/python/sglang/srt/models/gemma4_draft.py
+new file mode 100644
+index 00000000..86ab081e
+--- /dev/null
++++ b/python/sglang/srt/models/gemma4_draft.py
+@@ -0,0 +1,535 @@
++"""DeepSpec Gemma4 draft backbone. No Qwen aliases or copied trainable V weights."""
++
++import copy
++
++import torch
++import torch.nn.functional as F
++from sglang.srt.distributed import get_pp_group, get_tp_group
++from sglang.srt.layers.linear import (
++    ColumnParallelLinear,
++    MergedColumnParallelLinear,
++    RowParallelLinear,
++)
++from sglang.srt.layers.logits_processor import LogitsProcessor
++from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
++from sglang.srt.layers.rotary_embedding import get_rope
++from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
++from sglang.srt.model_loader.weight_utils import default_weight_loader
++from sglang.srt.models.dflash import DFlashDraftModel
++from sglang.srt.models.dspark import DSparkDraftMixin, gather_and_crop_vocab
++from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
++from sglang.srt.runtime_context import get_parallel, get_server_args
++from torch import nn
++
++from lightcone_spec.gemma import gemma_canvas_attention, gemma_rms, gemma_rotary, gemma_softcap
++
++
++def _tp_copy(value):
++    from sglang.srt.speculative.native_backend_online_adaptation import _TensorParallelCopy
++
++    group = get_tp_group()
++    return _TensorParallelCopy.apply(value, group.device_group) if group.world_size > 1 else value
++
++
++def _column(module, value, *, replicated=False):
++    # Replicated KV consumes the same hidden input; its *weight* collects all
++    # query-head contributions, while the column input collects hidden gradients.
++    weight = _tp_copy(module.weight) if replicated else module.weight
++    return F.linear(_tp_copy(value), weight, getattr(module, "bias", None))
++
++
++def _row(module, value):
++    from sglang.srt.speculative.dflash_online_adaptation import _TensorParallelSum
++
++    local = F.linear(value, module.weight, None)
++    group = get_tp_group()
++    output = _TensorParallelSum.apply(local, group.device_group) if group.world_size > 1 else local
++    bias = getattr(module, "bias", None)
++    return output if bias is None else output + bias
++
++
++def _replay_attention(attention, hidden, positions, history, *, eagle):
++    batch, count = history[2].shape[0], hidden.shape[0] // history[2].shape[0]
++    query = _column(attention.q_proj, hidden).view(
++        batch, count, attention.num_heads, attention.head_dim
++    )
++    replicated = attention.total_num_kv_heads == 1 and get_tp_group().world_size > 1
++    key = _column(attention.k_proj, hidden, replicated=replicated).view(
++        batch, count, attention.num_kv_heads, attention.head_dim
++    )
++    value = (
++        key
++        if attention.tied_kv
++        else _column(attention.v_proj, hidden, replicated=replicated).view_as(key)
++    )
++    query = gemma_rms(query, _tp_copy(attention.q_norm.weight), attention.q_norm.eps)
++    key = gemma_rms(key, _tp_copy(attention.k_norm.weight), attention.k_norm.eps)
++    value = gemma_rms(value, None, attention.v_norm.eps)
++    positions = positions.reshape(batch, count)
++    cache = attention.rotary_emb.cos_sin_cache
++    query, key = gemma_rotary(query, positions, cache), gemma_rotary(key, positions, cache)
++    attended = gemma_canvas_attention(query, key, value, *history, causal_canvas=eagle)
++    return _row(attention.o_proj, attended.reshape(-1, attention.q_size))
++
++
++def _replay_mlp(mlp, hidden):
++    gate, up = _column(mlp.gate_up_proj, hidden).chunk(2, dim=-1)
++    return _row(mlp.down_proj, F.gelu(gate, approximate="tanh") * up)
++
++
++class GemmaReplay:
++    """Latest-round replay reads a snapshot of actual active-bank inference KV."""
++
++    def capture_training_context(self, forward_batch, runner, *, step_kv=None):
++        from lightcone_spec.nextn import ragged_history_locations
++
++        with torch.inference_mode(False), torch.no_grad():
++            if hasattr(self, "model"):
++                if step_kv is None:
++                    raise RuntimeError("Eagle replay requires owned per-step KV metadata")
++                locations, valid = ragged_history_locations(*step_kv)
++            else:
++                lengths = forward_batch.seq_lens
++                positions = torch.arange(int(lengths.max().item()), device=lengths.device)
++                valid = positions[None] < lengths[:, None]
++                locations = runner.req_to_token_pool.req_to_token[
++                    forward_batch.req_pool_indices[:, None], positions[None]
++                ]
++                locations = locations.masked_fill(~valid, 0).long()
++            backbone = self.model if hasattr(self, "model") else self
++            pool = runner.token_to_kv_pool
++            histories = []
++            for layer in backbone.layers:
++                buffers = pool.get_kv_buffer(layer.self_attn.attn.layer_id)
++
++                def gather(buffer):
++                    if buffer.ndim == 3:
++                        return buffer[locations].detach().clone()
++                    page_size = int(runner.server_args.page_size)
++                    pages, offsets = locations // page_size, locations % page_size
++                    return buffer[pages, :, offsets, :].detach().clone()
++
++                histories.append((gather(buffers[0]), gather(buffers[1]), valid.detach().clone()))
++            self._training_histories = histories
++
++    def _replay_hidden(self, input_ids, positions, forward_batch, input_embeds=None):
++        histories = getattr(self, "_training_histories", None)
++        if histories is None:
++            raise RuntimeError("Gemma update lacks owned full-history KV snapshot")
++        # Consume the context once; tensors remain owned by this autograd graph.
++        self._training_histories = None
++        eagle = hasattr(self, "model")
++        backbone = self.model if eagle else self
++        with torch.no_grad():
++            embeds = backbone.embed_tokens(input_ids) * (self.config.hidden_size**0.5)
++        if input_embeds is not None:
++            embeds = input_embeds.detach()
++        if eagle:
++            hidden = forward_batch.spec_info.hidden_states.detach()
++            if hidden.shape[-1] != self.config.hidden_size:
++                hidden = F.linear(hidden, backbone.fc.weight)
++        else:
++            hidden = embeds
++        for layer, history in zip(backbone.layers, histories, strict=True):
++            inputs = (
++                torch.cat((layer.input_layernorm(embeds), layer.hidden_norm(hidden)), dim=-1)
++                if eagle
++                else layer.input_layernorm(hidden)
++            )
++            attended = _replay_attention(layer.self_attn, inputs, positions, history, eagle=eagle)
++            hidden = hidden + layer.post_attention_layernorm(attended)
++            hidden = hidden + layer.post_feedforward_layernorm(
++                _replay_mlp(layer.mlp, layer.pre_feedforward_layernorm(hidden))
++            )
++            hidden = hidden * layer.layer_scalar
++        return backbone.norm(hidden), hidden
++
++    def _replay_logits(self, hidden):
++        from sglang.srt.speculative.dflash_online_adaptation import _TensorParallelAllGather
++
++        logits = F.linear(_tp_copy(hidden.to(self.lm_head.weight.dtype)), self.lm_head.weight)
++        group = get_tp_group()
++        if group.world_size > 1:
++            logits = _TensorParallelAllGather.apply(logits, group.device_group)
++        logits = logits[..., : self.config.vocab_size]
++        cap = getattr(self.config, "final_logit_softcapping", None)
++        # Qwen's native head is model dtype; do not change Markov arithmetic
++        # merely because a differentiable replay is enabled on this round.
++        return gemma_softcap(logits.float(), cap) if cap is not None else logits
++
++    def check_training_reconstruction(self, valid_mask):
++        from sglang.srt.speculative.dflash_online_adaptation import _logit_reconstruction_gate
++
++        rows = getattr(self, "_reconstruction_rows", [])
++        self._reconstruction_rows = []
++        if not rows:
++            raise RuntimeError("Gemma update has no native/replay comparison")
++        native = torch.cat([row[0] for row in rows], dim=0)
++        replay = torch.cat([row[1] for row in rows], dim=0)
++        mask = valid_mask.reshape(-1)
++        if mask.numel() != native.shape[0]:
++            raise RuntimeError("Gemma reconstruction mask ownership mismatch")
++        stats = _logit_reconstruction_gate(
++            native,
++            replay,
++            valid_mask=mask,
++            numerical_unit=max(float(torch.finfo(self.lm_head.weight.dtype).eps), 1e-3),
++        )
++        self._last_reconstruction = dict(
++            zip(
++                ("ok", "max_abs", "relative_rms", "top1", "kl"),
++                [value.item() for value in stats],
++                strict=True,
++            )
++        )
++        return bool(stats[0].item())
++
++
++class GemmaDraftNorm(nn.Module):
++    """Use explicit differentiable norm, including learned scale, on update rounds."""
++
++    def __init__(self, dimension, epsilon, with_scale=True):
++        super().__init__()
++        self.eps = self.variance_epsilon = float(epsilon)
++        if with_scale:
++            self.weight = nn.Parameter(torch.ones(dimension))
++        else:
++            self.register_parameter("weight", None)
++
++    def forward(self, value):
++        return gemma_rms(value, self.weight, self.eps)
++
++
++class GemmaDraftAttention(nn.Module):
++    def __init__(self, config, layer_id, quant_config=None, *, eagle=False):
++        super().__init__()
++        if quant_config is not None:
++            raise ValueError("Gemma draft transfer currently requires unquantized official weights")
++        parallel = get_parallel()
++        self.total_num_heads = int(config.num_attention_heads)
++        self.head_dim = int(config.global_head_dim)
++        self.tied_kv = bool(config.attention_k_eq_v)
++        self.total_num_kv_heads = int(
++            config.num_global_key_value_heads if self.tied_kv else config.num_key_value_heads
++        )
++        if self.total_num_heads % parallel.tp_size:
++            raise ValueError("Gemma query heads cannot be partitioned across TP ranks")
++        self.num_heads = self.total_num_heads // parallel.tp_size
++        # One global KV head is replicated, never split into fractions of a head.
++        kv_tp = min(parallel.tp_size, self.total_num_kv_heads)
++        if self.total_num_kv_heads % kv_tp or parallel.tp_size % kv_tp:
++            raise ValueError("Gemma KV heads do not support this TP layout")
++        kv_rank = parallel.tp_rank // (parallel.tp_size // kv_tp)
++        self.num_kv_heads = self.total_num_kv_heads // kv_tp
++        self.q_size = self.num_heads * self.head_dim
++        self.kv_size = self.num_kv_heads * self.head_dim
++        self.scaling = 1.0
++        self.sliding_window_size = -1
++        self.attn_type = AttentionType.DECODER if eagle else AttentionType.ENCODER_ONLY
++        input_size = int(config.hidden_size) * (2 if eagle else 1)
++        bias = bool(config.attention_bias)
++        self.q_proj = ColumnParallelLinear(
++            input_size, self.total_num_heads * self.head_dim, bias=bias
++        )
++        self.k_proj = ColumnParallelLinear(
++            input_size,
++            self.total_num_kv_heads * self.head_dim,
++            bias=bias,
++            tp_size=kv_tp,
++            tp_rank=kv_rank,
++        )
++        self.v_proj = (
++            None
++            if self.tied_kv
++            else ColumnParallelLinear(
++                input_size,
++                self.total_num_kv_heads * self.head_dim,
++                bias=bias,
++                tp_size=kv_tp,
++                tp_rank=kv_rank,
++            )
++        )
++        self.o_proj = RowParallelLinear(
++            self.total_num_heads * self.head_dim, config.hidden_size, bias=bias
++        )
++        self.q_norm = GemmaDraftNorm(self.head_dim, config.rms_norm_eps)
++        self.k_norm = GemmaDraftNorm(self.head_dim, config.rms_norm_eps)
++        self.v_norm = GemmaDraftNorm(self.head_dim, config.rms_norm_eps, with_scale=False)
++        rope = config.rope_parameters["full_attention"]
++        self.rotary_emb = get_rope(
++            self.head_dim,
++            rotary_dim=self.head_dim,
++            max_position=config.max_position_embeddings,
++            base=rope["rope_theta"],
++            rope_scaling={"rope_type": rope.get("rope_type", "default")},
++            partial_rotary_factor=rope.get("partial_rotary_factor", 1.0),
++            is_neox_style=True,
++        )
++        self.attn = RadixAttention(
++            num_heads=self.num_heads,
++            head_dim=self.head_dim,
++            scaling=1.0,
++            num_kv_heads=self.num_kv_heads,
++            layer_id=layer_id,
++            attn_type=self.attn_type,
++        )
++
++    def kv_proj_only(self, hidden):
++        key, _ = self.k_proj(hidden)
++        value = key if self.tied_kv else self.v_proj(hidden)[0]
++        # Context injector normalizes/rotates K afterwards. V has its own no-scale norm.
++        return key, self.v_norm(value.view(-1, self.num_kv_heads, self.head_dim)).flatten(-2)
++
++    def apply_k_norm(self, key):
++        return self.k_norm(key.view(-1, self.num_kv_heads, self.head_dim)).flatten(-2)
++
++    def apply_k_rope(self, positions, key):
++        _, key = self.rotary_emb(positions, torch.empty_like(key), key)
++        return key
++
++    def forward(self, positions, hidden_states, forward_batch):
++        query, _ = self.q_proj(hidden_states)
++        key, value = self.kv_proj_only(hidden_states)
++        query = self.q_norm(query.view(-1, self.num_heads, self.head_dim)).flatten(-2)
++        key = self.apply_k_norm(key)
++        query, key = self.rotary_emb(positions, query, key)
++        output = self.attn(query, key, value, forward_batch)
++        return self.o_proj(output)[0]
++
++
++class GemmaDraftMLP(nn.Module):
++    def __init__(self, config, quant_config=None):
++        super().__init__()
++        if getattr(config, "hidden_activation", getattr(config, "hidden_act", None)) not in {
++            "gelu_pytorch_tanh",
++            "gelu_new",
++        }:
++            raise ValueError("Gemma draft requires the official tanh-GELU activation")
++        self.gate_up_proj = MergedColumnParallelLinear(
++            config.hidden_size,
++            [config.intermediate_size] * 2,
++            bias=False,
++        )
++        self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
++
++    def forward(self, hidden):
++        gate, up = self.gate_up_proj(hidden)[0].chunk(2, dim=-1)
++        return self.down_proj(F.gelu(gate, approximate="tanh") * up)[0]
++
++
++class GemmaDraftDecoder(nn.Module):
++    def __init__(self, config, layer_id, quant_config=None):
++        super().__init__()
++        if bool(getattr(config, "enable_moe_block", False)) or int(
++            getattr(config, "hidden_size_per_layer_input", 0)
++        ):
++            raise ValueError("Gemma draft integration supports official dense, ungated checkpoints")
++        self.self_attn = GemmaDraftAttention(config, layer_id, quant_config)
++        self.mlp = GemmaDraftMLP(config, quant_config)
++        for name in (
++            "input_layernorm",
++            "post_attention_layernorm",
++            "pre_feedforward_layernorm",
++            "post_feedforward_layernorm",
++        ):
++            setattr(self, name, GemmaDraftNorm(config.hidden_size, config.rms_norm_eps))
++        self.register_buffer("layer_scalar", torch.ones(1))
++
++    def forward(self, positions, hidden_states, forward_batch, residual=None):
++        if residual is not None:
++            raise ValueError("Gemma carries its residual explicitly, not Qwen's fused residual")
++        attention = self.self_attn(positions, self.input_layernorm(hidden_states), forward_batch)
++        hidden = hidden_states + self.post_attention_layernorm(attention)
++        hidden = hidden + self.post_feedforward_layernorm(
++            self.mlp(self.pre_feedforward_layernorm(hidden))
++        )
++        return hidden * self.layer_scalar, None
++
++
++class GemmaDraftBackbone(DFlashDraftModel):
++    decoder_layer_cls = GemmaDraftDecoder
++    supports_fused_context_kv = False
++
++    def __init__(self, config, quant_config=None, prefix=""):
++        super().__init__(config, quant_config=quant_config, prefix=prefix)
++        self.norm = GemmaDraftNorm(config.hidden_size, config.rms_norm_eps)
++        self.hidden_norm = GemmaDraftNorm(config.hidden_size, config.rms_norm_eps)
++
++    def get_attention_sliding_window_size(self):
++        return None
++
++    def load_weights(self, weights):
++        parameters = {name.removeprefix("model."): value for name, value in self.named_parameters()}
++        buffers = {name.removeprefix("model."): value for name, value in self.named_buffers()}
++        loaded, shard_names = set(), {}
++        for name, value in weights:
++            name = name.removeprefix("model.")
++            if name.startswith("rotary_emb.") or ".rotary_emb." in name:
++                continue
++            shard = None
++            for source, index in ((".gate_proj.", 0), (".up_proj.", 1)):
++                if source in name:
++                    name = name.replace(source, ".gate_up_proj.")
++                    shard = index
++                    break
++            destination = parameters.get(name, buffers.get(name))
++            if destination is None:
++                raise ValueError(f"unconsumed Gemma draft checkpoint weight: {name}")
++            loader = getattr(destination, "weight_loader", default_weight_loader)
++            if shard is None:
++                loader(destination, value)
++                loaded.add(name)
++            else:
++                loader(destination, value, shard)
++                shard_names.setdefault(name, set()).add(shard)
++                if shard_names[name] == {0, 1}:
++                    loaded.add(name)
++        required = {
++            name for name in parameters if not name.startswith(("markov_head.", "confidence_head."))
++        }
++        required.update(name for name in buffers if name.endswith("layer_scalar"))
++        missing = required - loaded
++        if missing:
++            raise ValueError(f"missing Gemma draft checkpoint weights: {sorted(missing)}")
++
++
++class Gemma4DSparkModel(GemmaReplay, DSparkDraftMixin, GemmaDraftBackbone):
++    owns_checkpoint_embed_head = True
++    requires_complete_gradients = True
++
++    def __init__(self, config, quant_config=None, prefix=""):
++        super().__init__(config, quant_config=quant_config, prefix=prefix)
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size, config.hidden_size, prefix="embed_tokens"
++        )
++        self.lm_head = ParallelLMHead(
++            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix="lm_head"
++        )
++
++    def forward_embed(self, input_ids):
++        return self.embed_tokens(input_ids) * (self.config.hidden_size**0.5)
++
++    def _stacked_ctx_kv_params(self):
++        return None
++
++    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
++        if not torch.is_grad_enabled():
++            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
++        with torch.no_grad():
++            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
++            native_logits = self._replay_logits(native.hidden_states)
++        replay, _ = self._replay_hidden(input_ids, positions, forward_batch, input_embeds)
++        replay_logits = self._replay_logits(replay)
++        self._reconstruction_rows = [(native_logits.detach(), replay_logits.detach())]
++        # Sampling sees actual native logits; gradients use the independently
++        # checked replay. A later owned-mask gate is mandatory before publication.
++        native.hidden_states = native.hidden_states.detach() + (replay - replay.detach())
++        return native
++
++    def compute_base_logits_and_hidden(self, hidden):
++        hidden = hidden.to(self.lm_head.weight.dtype)
++        if torch.is_grad_enabled():
++            return self._replay_logits(hidden), None, hidden
++        logits = gather_and_crop_vocab(hidden @ self.lm_head.weight.T, self.lm_head)
++        logits = gemma_softcap(logits.float(), getattr(self.config, "final_logit_softcapping", None))
++        # Markov correction is applied later, after the base-logit softcap.
++        return logits, None, hidden
++
++
++class GemmaEagleDecoder(GemmaDraftDecoder):
++    def __init__(self, config, layer_id, quant_config=None):
++        super().__init__(config, layer_id, quant_config)
++        self.self_attn = GemmaDraftAttention(config, layer_id, quant_config, eagle=True)
++        self.hidden_norm = GemmaDraftNorm(config.hidden_size, config.rms_norm_eps)
++
++    def forward(self, positions, embeds, hidden, forward_batch):
++        joined = torch.cat((self.input_layernorm(embeds), self.hidden_norm(hidden)), dim=-1)
++        hidden = hidden + self.post_attention_layernorm(
++            self.self_attn(positions, joined, forward_batch)
++        )
++        hidden = hidden + self.post_feedforward_layernorm(
++            self.mlp(self.pre_feedforward_layernorm(hidden))
++        )
++        return hidden * self.layer_scalar
++
++
++class GemmaEagleBackbone(nn.Module):
++    def __init__(self, config, quant_config=None):
++        super().__init__()
++        self.config = config
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size, config.hidden_size, prefix="model.embed_tokens"
++        )
++        self.fc = nn.Linear(
++            len(config.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False
++        )
++        self.layers = nn.ModuleList(
++            [
++                GemmaEagleDecoder(config, index, quant_config)
++                for index in range(config.num_hidden_layers)
++            ]
++        )
++        self.norm = GemmaDraftNorm(config.hidden_size, config.rms_norm_eps)
++
++    def forward(
++        self, input_ids, positions, forward_batch, input_embeds=None, pp_proxy_tensors=None
++    ):
++        embeds = (
++            self.embed_tokens(input_ids) * (self.config.hidden_size**0.5)
++            if input_embeds is None
++            else input_embeds
++        )
++        hidden = forward_batch.spec_info.hidden_states
++        if hidden.shape[-1] != self.config.hidden_size:
++            hidden = self.fc(hidden)
++        for layer in self.layers:
++            hidden = layer(positions, embeds, hidden, forward_batch)
++        # Eagle's next round consumes pre-final-norm hidden; logits consume norm once.
++        return self.norm(hidden), [hidden]
++
++
++class Gemma4Eagle3Model(GemmaReplay, LlamaForCausalLMEagle3):
++    owns_checkpoint_embed_head = True
++    requires_complete_gradients = True
++
++    def __init__(self, config, quant_config=None, prefix=""):
++        nn.Module.__init__(self)
++        self.config = copy.deepcopy(config)
++        self.config.draft_vocab_size = config.vocab_size
++        self.quant_config = quant_config
++        self.pp_group = get_pp_group()
++        self._draft_window_size = get_server_args().speculative_draft_window_size
++        self.model = GemmaEagleBackbone(self.config, quant_config)
++        self.lm_head = ParallelLMHead(
++            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix="lm_head"
++        )
++        self.logits_processor = LogitsProcessor(self.config)
++        self.capture_aux_hidden_states = True
++        self.load_lm_head_from_target = False
++        self.hot_token_id = None
++        if self._draft_window_size is not None:
++            for layer in self.model.layers:
++                layer.self_attn.attn.sliding_window_size = self._draft_window_size
++
++    def load_weights(self, weights):
++        GemmaDraftBackbone.load_weights(self, weights)
++
++    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
++        updating = torch.is_grad_enabled()
++        with torch.no_grad():
++            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
++        if not updating:
++            return native
++        replay, auxiliary = self._replay_hidden(input_ids, positions, forward_batch, input_embeds)
++        logits = self._replay_logits(replay)
++        rows = getattr(self, "_reconstruction_rows", [])
++        rows.append((native.next_token_logits.detach(), logits.detach()))
++        self._reconstruction_rows = rows
++        native.next_token_logits = native.next_token_logits.detach() + (logits - logits.detach())
++        if native.hidden_states.shape != auxiliary.shape:
++            raise RuntimeError("Gemma EAGLE auxiliary hidden alignment mismatch")
++        native.hidden_states = native.hidden_states.detach() + (auxiliary - auxiliary.detach())
++        return native
++
++
++EntryClass = [Gemma4DSparkModel, Gemma4Eagle3Model]
+diff --git a/python/sglang/srt/models/qwen3_draft_replay.py b/python/sglang/srt/models/qwen3_draft_replay.py
+new file mode 100644
+index 00000000..6b43cc41
+--- /dev/null
++++ b/python/sglang/srt/models/qwen3_draft_replay.py
+@@ -0,0 +1,113 @@
++"""Explicit latest-round Qwen replay; never differentiate through cached kernels."""
++
++import torch
++import torch.nn.functional as F
++
++
++class QwenDraftReplay:
++    requires_complete_gradients = True
++
++    def capture_training_context(self, forward_batch, runner, *, step_kv=None):
++        # Lazy imports avoid a model-registry cycle through DSparkDraftMixin.
++        from sglang.srt.models.gemma4_draft import GemmaReplay
++
++        return GemmaReplay.capture_training_context(self, forward_batch, runner, step_kv=step_kv)
++
++    def check_training_reconstruction(self, valid_mask):
++        from sglang.srt.models.gemma4_draft import GemmaReplay
++
++        return GemmaReplay.check_training_reconstruction(self, valid_mask)
++
++    def _replay_logits(self, hidden):
++        from sglang.srt.models.gemma4_draft import GemmaReplay
++
++        return GemmaReplay._replay_logits(self, hidden)
++
++    def _replay_hidden(self, input_ids, positions, forward_batch, input_embeds=None):
++        from sglang.srt.distributed import get_tp_group
++        from sglang.srt.models.gemma4_draft import _column, _row, _tp_copy
++
++        from lightcone_spec.gemma import gemma_canvas_attention, gemma_rms, gemma_rotary
++
++        histories = getattr(self, "_training_histories", None)
++        self._training_histories = None
++        if histories is None:
++            raise RuntimeError("Qwen update lacks owned full-history KV snapshot")
++        eagle = hasattr(self, "model")
++        backbone = self.model if eagle else self
++        with torch.no_grad():
++            embeds = (
++                backbone.embed_tokens(input_ids) if input_embeds is None else input_embeds.detach()
++            )
++        hidden = forward_batch.spec_info.hidden_states.detach() if eagle else embeds
++        if eagle and hidden.shape[-1] != self.config.hidden_size:
++            hidden = F.linear(hidden, backbone.fc.weight, backbone.fc.bias)
++
++        def norm(module, value):
++            return gemma_rms(value, module.weight, module.variance_epsilon)
++
++        for layer, history in zip(backbone.layers, histories, strict=True):
++            inputs = (
++                torch.cat(
++                    (norm(layer.input_layernorm, embeds), norm(layer.hidden_norm, hidden)), -1
++                )
++                if eagle
++                else norm(layer.input_layernorm, hidden)
++            )
++            attention = layer.self_attn
++            if attention.total_num_kv_heads < get_tp_group().world_size:
++                raise RuntimeError("Qwen replicated-KV replay needs an explicit shard reduction")
++            packed = _column(attention.qkv_proj, inputs)
++            query, key, value = packed.split(
++                (attention.q_size, attention.kv_size, attention.kv_size), dim=-1
++            )
++            batch = history[2].shape[0]
++            count = inputs.shape[0] // batch
++            query = query.view(batch, count, attention.num_heads, attention.head_dim)
++            key = key.view(batch, count, attention.num_kv_heads, attention.head_dim)
++            value = value.view_as(key)
++            query = gemma_rms(
++                query, _tp_copy(attention.q_norm.weight), attention.q_norm.variance_epsilon
++            )
++            key = gemma_rms(
++                key, _tp_copy(attention.k_norm.weight), attention.k_norm.variance_epsilon
++            )
++            cache = attention.rotary_emb.cos_sin_cache
++            query = gemma_rotary(query, positions.reshape(batch, count), cache)
++            key = gemma_rotary(key, positions.reshape(batch, count), cache)
++            attended = gemma_canvas_attention(
++                query, key, value, *history, causal_canvas=eagle, scale=attention.head_dim**-0.5
++            )
++            hidden = hidden + _row(attention.o_proj, attended.reshape(-1, attention.q_size))
++            normalized = norm(layer.post_attention_layernorm, hidden)
++            gate, up = _column(layer.mlp.gate_up_proj, normalized).chunk(2, -1)
++            hidden = hidden + _row(layer.mlp.down_proj, F.silu(gate) * up)
++        return norm(backbone.norm, hidden), hidden
++
++    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
++        if not torch.is_grad_enabled():
++            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
++        with torch.no_grad():
++            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
++            native_logits = (
++                native.next_token_logits
++                if hasattr(self, "model")
++                else self._replay_logits(native.hidden_states)
++            )
++        hidden, auxiliary = self._replay_hidden(input_ids, positions, forward_batch, input_embeds)
++        logits = self._replay_logits(hidden)
++        rows = getattr(self, "_reconstruction_rows", [])
++        rows.append((native_logits.detach(), logits.detach()))
++        self._reconstruction_rows = rows
++        if hasattr(self, "model"):
++            native.next_token_logits = native_logits.detach() + (logits - logits.detach())
++            replay = auxiliary
++        else:
++            replay = hidden
++        native.hidden_states = native.hidden_states.detach() + (replay - replay.detach())
++        return native
++
++    def compute_base_logits_and_hidden(self, hidden):
++        if torch.is_grad_enabled():
++            return self._replay_logits(hidden), None, hidden
++        return super().compute_base_logits_and_hidden(hidden)
+diff --git a/python/sglang/srt/models/qwen3_eagle3.py b/python/sglang/srt/models/qwen3_eagle3.py
+new file mode 100644
+index 00000000..0da9d094
+--- /dev/null
++++ b/python/sglang/srt/models/qwen3_eagle3.py
+@@ -0,0 +1,54 @@
++"""Official DeepSpec Qwen3 EAGLE3: trained Q/K norms and checkpoint-owned head.
++
++The one-layer public TTT7 checkpoint shares the Eagle worker interface, not
++Llama attention mathematics. Old Llama/EAGLE registrations are unchanged.
++"""
++
++import copy
++
++from sglang.srt.layers.linear import QKVParallelLinear
++from sglang.srt.layers.radix_attention import AttentionType
++from sglang.srt.models.dflash import DFlashAttention
++from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
++from sglang.srt.models.qwen3_draft_replay import QwenDraftReplay
++
++
++class Qwen3Eagle3Model(QwenDraftReplay, LlamaForCausalLMEagle3):
++    owns_checkpoint_embed_head = True
++
++    def __init__(self, config, quant_config=None, prefix=""):
++        config = copy.deepcopy(config)
++        if config.num_hidden_layers != 1:
++            raise ValueError(
++                "DeepSpec Qwen3 Eagle integration supports the public one-layer TTT7 model"
++            )
++        features = tuple(config.target_layer_ids)
++        if not features or len(set(features)) != len(features):
++            raise ValueError("official Eagle target features must be nonempty and distinct")
++        config.num_aux_hidden_states = len(features)
++        config.draft_vocab_size = config.vocab_size
++        config.fc_norm = False
++        config.use_aux_norm = False
++        config.norm_output = False
++        config.tie_word_embeddings = False
++        super().__init__(config, quant_config=quant_config, prefix=prefix)
++        for index, layer in enumerate(self.model.layers):
++            attention = DFlashAttention(config, index, quant_config)
++            attention.qkv_proj = QKVParallelLinear(
++                2 * config.hidden_size,
++                attention.head_dim,
++                attention.total_num_heads,
++                attention.total_num_kv_heads,
++                bias=bool(getattr(config, "attention_bias", False)),
++                quant_config=quant_config,
++                prefix=f"model.layers.{index}.self_attn.qkv_proj",
++            )
++            attention.attn_type = AttentionType.DECODER
++            attention.attn.attn_type = AttentionType.DECODER
++            if self._draft_window_size is not None:
++                attention.attn.sliding_window_size = self._draft_window_size
++            layer.self_attn = attention
++        self.load_lm_head_from_target = False
++
++
++EntryClass = [Qwen3Eagle3Model]
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index 7df8edbd..17642ffc 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -496,7 +496,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
+             f"got {mask_token!r}."
+         )
+ 
+-    mask_token_id = dflash_cfg.get("mask_token_id", None)
++    mask_token_id = dflash_cfg.get(
++        "mask_token_id", _cfg_get(draft_hf_config, "mask_token_id", None)
++    )
+     if mask_token_id is not None:
+         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
+             raise ValueError(
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 7192a038..71c6be83 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1,5 +1,6 @@
+ import logging
+ import math
++import os
+ from dataclasses import replace
+ from typing import List, Optional
+ 
+@@ -323,6 +324,12 @@ class DFlashWorkerV2(BaseSpecWorker):
+         self._out_tokens_bufs: List[torch.Tensor] = []
+         self._new_seq_lens_bufs: List[torch.Tensor] = []
+         self._online_drafter_adapter = None
++        self._mechanism_recorder = None
++        if os.environ.get("LIGHTCONE_MECHANISM_BIN_TOKENS"):
++            from lightcone_spec.mechanism import MechanismRecorder
++            self._mechanism_recorder = MechanismRecorder(
++                int(os.environ["LIGHTCONE_MECHANISM_BIN_TOKENS"])
++            )
+         if getattr(server_args, "speculative_adaptation_config", None):
+             from sglang.srt.speculative.dflash_online_adaptation import (
+                 maybe_build_dflash_drafter_adapter,
+@@ -340,6 +347,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+         return self._draft_worker
+ 
+     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
++        if self._mechanism_recorder is not None:
++            self._mechanism_recorder.finish(rid, natural_stop=natural_stop)
+         adapter = self._online_drafter_adapter
+         if adapter is not None:
+             from sglang.srt.speculative.online_adaptation_runtime import (
+@@ -349,6 +358,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+             notify_online_adapters((adapter,), action="finish", request_id=rid)
+ 
+     def note_request_aborted(self, *, rid: str) -> None:
++        if self._mechanism_recorder is not None:
++            self._mechanism_recorder.finish(rid, natural_stop=False)
+         adapter = self._online_drafter_adapter
+         if adapter is not None:
+             from sglang.srt.speculative.online_adaptation_runtime import (
+@@ -359,9 +370,10 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+     def dump_info_records(self) -> Optional[dict]:
+         adapter = self._online_drafter_adapter
+-        if adapter is None:
+-            return None
+-        return {"online_adaptation": adapter.diagnostics()}
++        info = {} if adapter is None else adapter.diagnostics()
++        if self._mechanism_recorder is not None:
++            info.update(self._mechanism_recorder.snapshot(info.get("updates", ())))
++        return {"online_adaptation": info} if info else None
+ 
+     @property
+     def spec_v2_attn_backends(self) -> tuple:
+@@ -610,6 +622,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+         # target state before each draft forward, so there is nothing persistent
+         # to flush here.
+         adapter = self._online_drafter_adapter
++        if self._mechanism_recorder is not None:
++            self._mechanism_recorder.reset()
+         if adapter is not None:
+             adapter.reload_config(self.server_args)
+             adapter.reset()
+@@ -1990,7 +2004,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+             )
+         hidden = hidden.view(bs, int(self.block_size), -1)
+ 
+-        if online_adapter is not None:
++        if online_adapter is not None or self._mechanism_recorder is not None:
+             from sglang.srt.speculative.online_valid_mask import (
+                 request_boundary_metadata,
+                 semantic_proposal_semantics,
+@@ -2013,6 +2027,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 terminal_token_ids=terminal_ids,
+                 ignore_eos=ignore_eos,
+             )
++        if online_adapter is not None:
+             online_adapter.maybe_launch(
+                 draft_hidden=online_draft_hidden,
+                 target_logits=logits_output.next_token_logits,
+@@ -2021,6 +2036,27 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 has_supervision=has_supervision,
+             )
+ 
++        if self._mechanism_recorder is not None:
++            from sglang.srt.models.dspark import gather_and_crop_vocab
++            with torch.inference_mode():
++                diagnostic_hidden = online_draft_hidden.view(bs, int(self.block_size), -1)[:, 1:]
++                diagnostic_logits = gather_and_crop_vocab(
++                    diagnostic_hidden.to(lm_head.weight.dtype) @ lm_head.weight.T, lm_head
++                )
++                self._mechanism_recorder.record(
++                    request_ids=[request.rid for request in batch.reqs],
++                    generated_offsets=[
++                        int(length) - len(request.origin_input_ids)
++                        for request, length in zip(batch.reqs, prefix_lens.tolist(), strict=True)
++                    ],
++                    teacher_logits=logits_output.next_token_logits.view(bs, int(self.block_size), -1)[:, :-1],
++                    draft_logits=diagnostic_logits,
++                    valid_mask=valid_mask,
++                    accepted_drafts=semantic_accepted.tolist(),
++                    committed_tokens=semantic_committed.tolist(),
++                    prompt_lengths=[len(request.origin_input_ids) for request in batch.reqs],
++                )
++
+         self._append_target_hidden_to_draft_kv_by_loc(
+             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+             cache_loc=verify_out_cache_loc,
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_config.py b/python/sglang/srt/speculative/dspark_components/dspark_config.py
+index 0cac5097..ee157bcc 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_config.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_config.py
+@@ -81,7 +81,11 @@ def resolve_runtime_config(
+     verify window, mask token) from the draft checkpoint config, with
+     server_args.speculative_num_draft_tokens taking precedence for gamma."""
+     draft_config = parse_dspark_draft_config(draft_hf_config=draft_hf_config)
+-    if not draft_config.require_markov():
++    plain_dflash = (
++        getattr(draft_hf_config, "markov_rank", None) == 0
++        and getattr(draft_hf_config, "enable_confidence_head", None) is False
++    )
++    if not draft_config.require_markov() and not plain_dflash:
+         raise ValueError(
+             "DSpark draft requires markov_rank > 0; got "
+             f"markov_rank={draft_config.markov_rank}."
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+index 7319db12..9e89de2a 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+@@ -231,12 +231,20 @@ def sample_draft_block(
+                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+ 
+-    draft_tokens, corrected_logits = markov_head.sample_block(
+-        base_logits,
+-        first_prev_tokens=anchor_tokens,
+-        hidden_states=draft_hidden,
+-        sampler=sampler,
+-    )
++    if markov_head is None:
++        # DeepSpec DFlash predicts all gamma positions, without a Markov head.
++        draft_tokens = torch.stack(
++            [sampler(base_logits[:, index, :], index)
++             for index in range(base_logits.shape[1])], dim=1
++        )
++        corrected_logits = base_logits
++    else:
++        draft_tokens, corrected_logits = markov_head.sample_block(
++            base_logits,
++            first_prev_tokens=anchor_tokens,
++            hidden_states=draft_hidden,
++            sampler=sampler,
++        )
+     return DraftBlockResult(
+         draft_tokens=draft_tokens,
+         corrected_logits=corrected_logits,
+@@ -434,6 +442,8 @@ class DraftBlockProposer:
+             capture_hidden_mode=CaptureHiddenMode.NULL,
+         )
+         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
++        if online_update and hasattr(self.draft_model, "capture_training_context"):
++            self.draft_model.capture_training_context(draft_forward_batch, self.draft_model_runner)
+         inference_context = torch.inference_mode(not online_update)
+         with inference_context, torch.set_grad_enabled(online_update):
+             draft_out = self.draft_model_runner.forward(
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index 07566165..b2d296b6 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ from contextlib import nullcontext
+ from dataclasses import replace
+ from typing import Optional
+@@ -646,7 +647,13 @@ class DSparkWorkerV2(BaseSpecWorker):
+             prefix_lens=prefix_lens,
+             req_pool_indices=batch.req_pool_indices,
+         )
+-        if (
++        source_budget = os.environ.get("LIGHTCONE_FIXED_VERIFY_BUDGET_PER_REQUEST")
++        if source_budget is not None:
++            per_request = int(source_budget)
++            if not 1 <= per_request <= self.gamma + 1:
++                raise ValueError("fixed verification exceeds gamma drafts plus one bonus")
++            verify_token_budget = bs * per_request
++        elif (
+             online_adapter is not None
+             and online_adapter.config.verification_mode == "fixed_budget"
+         ):
+@@ -799,23 +806,29 @@ class DSparkWorkerV2(BaseSpecWorker):
+                     bs, online_adapter.config.adaptation_microbatch_size
+                 )
+                 corrected = draft_block.corrected_logits[:microbatch]
+-                teacher_logits = logits_output.next_token_logits[: bs * self.gamma].view(
+-                    bs, self.gamma, -1
+-                )[:microbatch]
++                # Both eager compact verification and graph epilogue scatter
++                # into the same fixed (gamma + bonus) stride before returning.
++                # Compact qo_indptr therefore must never index this tensor.
++                from lightcone_spec.native_tp import strided_teacher_rows
++                teacher_logits = strided_teacher_rows(
++                    logits_output.next_token_logits, bs, self.gamma, microbatch
++                )
+                 if corrected.shape != teacher_logits.shape:
+                     online_adapter.runtime.disable(
+                         "dspark_teacher_shape_mismatch", exactness=True
+                     )
+                 else:
+                     with torch.inference_mode(False), torch.enable_grad():
+-                        valid_mask = torch.ones(
+-                            corrected.shape[:2], dtype=torch.bool, device=device
++                        from sglang.srt.speculative.online_valid_mask import request_boundary_metadata, semantic_proposal_semantics
++                        remaining, terminals, ignored = request_boundary_metadata(batch.reqs, prefix_lens=prefix_lens)
++                        owned, _, _ = semantic_proposal_semantics(
++                            proposal_tokens=draft_tokens, correct_len=accept.correct_len,
++                            remaining_output_tokens=remaining, terminal_token_ids=terminals, ignore_eos=ignored,
+                         )
+                         if layout is not None:
+-                            valid_mask = (
+-                                torch.arange(self.gamma, device=device)[None, :]
+-                                < layout.verify_lens[:microbatch, None]
+-                            )
++                            owned &= torch.arange(self.gamma, device=device)[None] < (layout.verify_lens[:, None] - 1).clamp_min(0)
++                        reconstruction_mask = owned
++                        valid_mask = owned[:microbatch]
+                         target_probabilities = F.softmax(
+                             teacher_logits.detach().clone().float(), dim=-1
+                         )
+@@ -889,12 +902,14 @@ class DSparkWorkerV2(BaseSpecWorker):
+                             valid_mask,
+                         ),
+                         feedback_source_version=online_adapter.source_adapter_version,
++                        reconstruction_mask=reconstruction_mask,
++                        supervision_nonempty=valid_mask.any(),
+                     )
+         if online_adapter is not None:
+             verified_drafts = (
+                 torch.full((bs,), self.gamma, dtype=torch.int64, device=device)
+                 if layout is None
+-                else layout.verify_lens.to(torch.int64)
++                else (layout.verify_lens.to(torch.int64) - 1).clamp_min(0)
+             )
+             online_adapter.after_commit(
+                 request_ids,
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 320b5887..ad886ddd 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -299,7 +299,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             ):
+                 self.draft_runner.model.set_lm_head_from_target(target_lm_head)
+ 
+-        if self.speculative_algorithm.is_eagle3():
++        if getattr(self.draft_runner.model, "owns_checkpoint_embed_head", False):
++            # Official draft weights are not interchangeable with target weights.
++            self.hot_token_id = self.draft_runner.model.get_hot_token_id()
++        elif self.speculative_algorithm.is_eagle3():
+             # most cases EAGLE3 models don't share lm_head
+             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+             if (
+@@ -650,9 +653,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             nextn_replay = (
+                 online_update and self._online_adapter.config.algorithm == "NEXTN"
+             )
++            model_replay = online_update and hasattr(self.draft_runner.model, "capture_training_context")
++            step_kv = None
++            if model_replay or nextn_replay:
++                snapshots = getattr(self.draft_attn_backend, "_online_step_kv", None)
++                if snapshots is None or i >= len(snapshots) or snapshots[i] is None:
++                    raise RuntimeError("online replay lacks this draft step's KV metadata")
++                step_kv = snapshots[i]
++            if online_update and hasattr(self.draft_runner.model, "capture_training_context"):
++                self.draft_runner.model.capture_training_context(
++                    forward_batch, self.draft_runner, step_kv=step_kv
++                )
+             if nextn_replay:
+                 online_replay_batches.append(
+-                    (self._online_adapter.capture_nextn_replay(forward_batch), i)
++                    (self._online_adapter.capture_nextn_replay(forward_batch, step_kv=step_kv), i)
+                 )
+             with (
+                 torch.inference_mode(not online_update or nextn_replay),
+@@ -1277,6 +1291,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                 ):
+                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+             assert verify_input.is_verify_input()
++            gemma_semantics = None
++            if online_update:
++                from sglang.srt.speculative.online_valid_mask import request_boundary_metadata
++                gemma_semantics = request_boundary_metadata(batch.reqs, prefix_lens=round_prefix_lens)
+             batch.spec_info = verify_input
+             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+             # Publish before draft_extend so the fence is at verify-end.
+@@ -1384,7 +1402,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                             )
+                         )
+                         teacher_logits = (
+-                            target_logits[:microbatch, :steps]
++                            target_logits[:microbatch, 1:1 + steps]
+                             .transpose(0, 1)
+                             .reshape(-1, target_logits.shape[-1])
+                         )
+@@ -1401,6 +1419,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                                 "eagle3_teacher_interface_mismatch", exactness=True
+                             )
+                         else:
++                            reconstruction_mask = None
++                            loss_mask = None
++                            if gemma_semantics is not None:
++                                from sglang.srt.speculative.online_valid_mask import semantic_proposal_semantics
++                                proposals = verify_input.draft_token.reshape(
++                                    len(round_request_ids), self.speculative_num_draft_tokens
++                                )[:, 1:]
++                                mask, _, _ = semantic_proposal_semantics(
++                                    proposal_tokens=proposals,
++                                    correct_len=(batch_output.accept_lens.to(torch.int64) - 1).clamp_min(0),
++                                    remaining_output_tokens=gemma_semantics[0],
++                                    terminal_token_ids=gemma_semantics[1],
++                                    ignore_eos=gemma_semantics[2],
++                                )
++                                mask = mask[:, 1:1 + steps]
++                                reconstruction_mask = mask.transpose(0, 1).reshape(-1)
++                                loss_mask = mask[:microbatch].transpose(0, 1).reshape(-1)[:row_count]
+                             with torch.inference_mode(False), torch.enable_grad():
+                                 hidden = hidden[:row_count]
+                                 draft_logits = draft_logits[:row_count]
+@@ -1408,8 +1443,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                                     teacher_logits[:row_count].detach().clone()
+                                 )
+                                 loss = F.kl_div(
+-                                    F.log_softmax(draft_logits.float(), dim=-1),
+-                                    F.softmax(teacher_logits.float(), dim=-1),
++                                    F.log_softmax((draft_logits if loss_mask is None else draft_logits[loss_mask]).float(), dim=-1),
++                                    F.softmax((teacher_logits if loss_mask is None else teacher_logits[loss_mask]).float(), dim=-1),
+                                     reduction="batchmean",
+                                 )
+                             online_adapter.launch(
+@@ -1420,6 +1455,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                                 feedback_source_version=(
+                                     online_adapter.source_adapter_version
+                                 ),
++                                reconstruction_mask=reconstruction_mask,
++                                supervision_nonempty=None if loss_mask is None else loss_mask.any(),
+                             )
+             if online_adapter is not None and not batch.forward_mode.is_idle():
+                 committed = batch_output.accept_lens.to(torch.int64)
+@@ -1427,7 +1464,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                     round_request_ids,
+                     verified_drafts=torch.full(
+                         (len(round_request_ids),),
+-                        self.speculative_num_draft_tokens,
++                        self.speculative_num_draft_tokens - 1,
+                         dtype=torch.int64,
+                         device=self.device,
+                     ),
+diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+index c1b72a47..ec588ab7 100644
+--- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
++++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+@@ -52,6 +52,8 @@ from lightcone_spec.nextn import (
+     torch_native_selected_moe,
+     torch_native_shared_expert_add,
+ )
++from lightcone_spec.native_tp import LowRankDelta as _LowRankDelta
++from lightcone_spec.native_tp import global_gradient_norm as _native_global_gradient_norm
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -100,16 +102,16 @@ class _LowRankFactors:
+         torch.nn.init.kaiming_uniform_(self.a, a=math.sqrt(5), generator=generator)
+ 
+ 
+-class _LowRankDelta(torch.nn.Module):
+-    def __init__(self, weight: torch.Tensor, *, rank: int, seed: int) -> None:
+-        super().__init__()
+-        factors = _LowRankFactors(weight, rank=rank, seed=seed)
+-        self.a = factors.a
+-        self.b = factors.b
+-
+-    def forward(self, original: torch.Tensor) -> torch.Tensor:
+-        return original + (self.b @ self.a).to(original.dtype)
++def _native_tp_partition(module, leaf="weight") -> str:
++    from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ 
++    if leaf != "weight" or int(getattr(module, "tp_size", 1)) == 1:
++        return "replicated"
++    if isinstance(module, RowParallelLinear):
++        return "row"
++    if isinstance(module, ColumnParallelLinear):
++        return "column"
++    raise RuntimeError(f"unsupported native TP parameter layout: {type(module).__name__}.{leaf}")
+ 
+ 
+ def _block_fp8_slot(
+@@ -272,11 +274,17 @@ class NativeBackendOnlineAdapter:
+         self.config: OnlineAdaptationConfig = config
+         self.worker = worker
+         self.model = model
++        tp_group = get_tp_group()
++        replay_tp = algorithm != "NEXTN" and hasattr(model, "capture_training_context") and tp_group.world_size > 1
++        if replay_tp and config.optimizer.name == "muon":
++            raise RuntimeError("TP Muon replay requires global logical-matrix orthogonalization; not a capacity failure")
+         self.device = torch.device(worker.device)
+         rows = _canonical_named_parameters(model)
+-        if algorithm == "NEXTN":
+-            for _, _, parameter in rows:
+-                parameter.requires_grad_(False)
++        # Only selected full tensors or independent LoRA factors are trainable.
++        # Leaving the frozen drafter/head grad-enabled retains an unbudgeted
++        # full-model tape even for a last-layer low-rank recipe.
++        for _, _, parameter in rows:
++            parameter.requires_grad_(False)
+         self.plan: ParameterSelection = build_native_parameter_plan(
+             ((raw_name, parameter) for _, raw_name, parameter in rows),
+             config,
+@@ -293,6 +301,7 @@ class NativeBackendOnlineAdapter:
+         functional_modules: dict[str, torch.nn.Module] = {}
+         trainable_names: list[str] = []
+         trainable: list[torch.Tensor] = []
++        replicated_gradients: list[bool] = []
+         if config.weight_update_mode == "full":
+             for name in self.plan.full_names:
+                 raw_name, parameter = by_name[name]
+@@ -300,6 +309,9 @@ class NativeBackendOnlineAdapter:
+                     parameter.requires_grad_(True)
+                     trainable_names.append(name)
+                     trainable.append(parameter)
++                    parent, _, leaf = raw_name.rpartition(".")
++                    module = model.get_submodule(parent) if parent else model
++                    replicated_gradients.append(not replay_tp or _native_tp_partition(module, leaf) == "replicated")
+                     continue
+                 parent_name, _, _ = raw_name.rpartition(".")
+                 module = model.get_submodule(parent_name) if parent_name else model
+@@ -327,16 +339,23 @@ class NativeBackendOnlineAdapter:
+                     raise ValueError("native LoRA selector named a non-weight tensor")
+                 module = model.get_submodule(parent_name) if parent_name else model
+                 if algorithm != "NEXTN":
++                    partition = _native_tp_partition(module) if replay_tp else "replicated"
+                     parametrization = _LowRankDelta(
+                         parameter,
+                         rank=config.rank,
+                         seed=config.seed + index,
++                        partition=partition,
++                        tp_rank=tp_group.rank_in_group,
++                        tp_size=tp_group.world_size if replay_tp else 1,
++                        group=tp_group.device_group,
++                        scale=float(config.lora_alpha) / float(config.rank),
+                     )
+                     torch.nn.utils.parametrize.register_parametrization(
+                         module, leaf, parametrization, unsafe=True
+                     )
+                     trainable_names.extend((f"{name}.lora_a", f"{name}.lora_b"))
+                     trainable.extend((parametrization.a, parametrization.b))
++                    replicated_gradients.extend((partition != "row", partition != "column"))
+                     continue
+                 factors = _LowRankFactors(
+                     parameter,
+@@ -365,6 +384,9 @@ class NativeBackendOnlineAdapter:
+                     parameter.requires_grad_(True)
+                     trainable_names.append(name)
+                     trainable.append(parameter)
++                    parent, _, leaf = raw_name.rpartition(".")
++                    module = model.get_submodule(parent) if parent else model
++                    replicated_gradients.append(not replay_tp or _native_tp_partition(module, leaf) == "replicated")
+                     continue
+                 parent_name, _, _ = raw_name.rpartition(".")
+                 module = model.get_submodule(parent_name) if parent_name else model
+@@ -386,6 +408,8 @@ class NativeBackendOnlineAdapter:
+             raise RuntimeError("native backend trainable layout is empty")
+         self.names = tuple(trainable_names)
+         self.trainable = tuple(trainable)
++        self.replay_tp = replay_tp
++        self.replicated_gradients = tuple(replicated_gradients)
+         self.functional_parameters = functional_parameters
+         self.functional_modules = functional_modules
+         self.publication_slots = tuple(publication_slots)
+@@ -416,6 +440,7 @@ class NativeBackendOnlineAdapter:
+         )
+         max_batch = max(1, int(server_args.max_running_requests))
+         training_batch = min(max_batch, config.adaptation_microbatch_size)
++        replay_batch = max_batch if hasattr(model, "capture_training_context") else training_batch
+         trace_rounds = math.ceil(config.telemetry_round_items / max_batch)
+         self.runtime = OnlineCohortRuntime(
+             config,
+@@ -451,7 +476,7 @@ class NativeBackendOnlineAdapter:
+             )
+         )
+         activation_bytes = estimate_full_vocab_training_scratch_bytes(
+-            batch_tokens=training_batch * config.canvas_tokens,
++            batch_tokens=replay_batch * config.canvas_tokens,
+             vocab_size=vocab,
+         )
+         candidate_bytes = estimate_functional_optimizer_scratch_bytes(
+@@ -460,7 +485,21 @@ class NativeBackendOnlineAdapter:
+             if isinstance(self.inference, MergedPublicationBank)
+             else 0,
+         )
+-        scratch = parameter_bytes + activation_bytes + candidate_bytes
++        kv_gather_bytes = 0
++        if hasattr(model, "capture_training_context"):
++            backbone = model.model if hasattr(model, "model") else model
++            # Full-batch snapshots are currently retained by the replay graph.
++            # Count clones, concatenation, explicit GQA expansion, and replay
++            # backward workspace instead of claiming zero KV scratch.
++            repeats = max(1, config.canvas_tokens - 2) if algorithm == "EAGLE3" else 1
++            element_bytes = model.lm_head.weight.element_size()
++            for layer in backbone.layers:
++                attention = layer.self_attn
++                kv_gather_bytes += (
++                    repeats * replay_batch * context_capacity * attention.head_dim
++                    * element_bytes * (4 * attention.num_kv_heads + 4 * attention.num_heads)
++                )
++        scratch = parameter_bytes + activation_bytes + candidate_bytes + kv_gather_bytes
+         self.runtime.bind_memory(
+             resident_tensors=resident,
+             peak_scratch_bytes=scratch,
+@@ -475,7 +514,7 @@ class NativeBackendOnlineAdapter:
+                 "optimizer_metadata_bytes": metadata_bytes,
+                 "staging_bytes": _bytes(self.inference.staging),
+                 "training_activation_bytes": activation_bytes,
+-                "kv_gather_scratch_bytes": 0,
++                "kv_gather_scratch_bytes": kv_gather_bytes,
+                 "candidate_scratch_bytes": candidate_bytes,
+                 "graph_buffer_bytes": 0,
+                 "telemetry_bytes": _bytes(telemetry),
+@@ -496,6 +535,8 @@ class NativeBackendOnlineAdapter:
+     ) -> int:
+         version = self.runtime.begin_round(request_ids, prefix_lens)
+         if self.runtime.update_due():
++            if hasattr(self.model, "check_training_reconstruction"):
++                self.model._reconstruction_rows = []
+             count = min(len(request_ids), self.config.adaptation_microbatch_size)
+             selected_ids = tuple(request_ids[:count])
+             width = (
+@@ -534,9 +575,26 @@ class NativeBackendOnlineAdapter:
+         prefix_lens: torch.Tensor,
+         source_tensors: Sequence[torch.Tensor],
+         feedback_source_version: int,
++        reconstruction_mask: torch.Tensor | None = None,
++        supervision_nonempty: torch.Tensor | None = None,
+     ) -> None:
+         if not self.runtime.update_due():
+             return
++        if supervision_nonempty is not None and not bool(supervision_nonempty.item()):
++            self.model._reconstruction_rows = []
++            self.runtime.skip_update_no_supervision()
++            return
++        if reconstruction_mask is not None and not bool(reconstruction_mask.any().item()):
++            self.model._reconstruction_rows = []
++            self.runtime.skip_update_no_supervision()
++            return
++        if hasattr(self.model, "check_training_reconstruction"):
++            if reconstruction_mask is None:
++                self.runtime.disable("gemma_missing_owned_reconstruction_mask", exactness=True)
++                return
++            if not self.model.check_training_reconstruction(reconstruction_mask):
++                self.runtime.disable("gemma_active_weight_reconstruction_mismatch", exactness=True)
++                return
+         if not self.round_alignment_ok or tuple(request_ids) != self.request_ledger.order:
+             self.runtime.counters["exactness_violations"] += 1
+             return
+@@ -593,7 +651,7 @@ class NativeBackendOnlineAdapter:
+                             exactness=True,
+                         )
+                         return
+-                    if self.config.algorithm == "NEXTN" and any(
++                    if (self.config.algorithm == "NEXTN" or getattr(self.model, "requires_complete_gradients", False)) and any(
+                         gradient is None for gradient in raw
+                     ):
+                         self.runtime.disable(
+@@ -621,8 +679,14 @@ class NativeBackendOnlineAdapter:
+                         ).all()
+                     )
+                 with self.runtime.timing("optimizer"):
++                    norm_kwargs = {}
++                    if self.replay_tp:
++                        norm_kwargs["global_gradient_norm"] = _native_global_gradient_norm(
++                            gradients, self.replicated_gradients, tp_group.device_group, tp_group.world_size
++                        )
+                     proposal = self.optimizer.propose(
+                         gradients,
++                        **norm_kwargs,
+                         **(
+                             {
+                                 "feedback_source_version": feedback_source_version,
+@@ -680,13 +744,10 @@ class NativeBackendOnlineAdapter:
+                 replacements[raw_name] = replacement
+         return replacements
+ 
+-    def capture_nextn_replay(self, forward_batch) -> dict[str, torch.Tensor]:
++    def capture_nextn_replay(self, forward_batch, *, step_kv) -> dict[str, torch.Tensor]:
+         if self.model.__class__.__name__ != "Qwen3_5ForCausalLMMTP":
+             raise RuntimeError("NEXTN replay supports Qwen3.5-compatible MTP only")
+-        spec_info = forward_batch.spec_info
+-        locations, valid = ragged_history_locations(
+-            spec_info.kv_indptr, spec_info.kv_indices
+-        )
++        locations, valid = ragged_history_locations(*step_kv)
+         layer_id = int(self.model.model.layers[0].attn.layer_id)
+         history_key, history_value = self._nextn_history(
+             layer_id, {"history_locations": locations}
+@@ -1155,6 +1216,7 @@ class NativeBackendOnlineAdapter:
+                 "native_last_feedback_source_version": self.last_feedback_source_version,
+                 "native_parameter_names": self.names,
+                 "native_shadow_grad": self.last_shadow_grad,
++                "native_reconstruction": getattr(self.model, "_last_reconstruction", None),
+                 "native_request_ledger": self.request_ledger.snapshot(),
+                 "native_request_terminals": self.request_ledger.terminal_states,
+                 "topology": {
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+index afc1a59a..d3133942 100644
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -116,13 +116,19 @@ def _clip_fp32_gradients(
+     width: int,
+     grad_clip: float,
+     label: str,
++    global_norm: torch.Tensor | None = None,
+ ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+     """Clip a heterogeneous layout with fused multi-tensor CUDA kernels."""
+     if len(gradients) != width:
+         raise ValueError(f"{label} gradient layout mismatch")
+     values = tuple(gradient.detach().to(torch.float32) for gradient in gradients)
+-    norms = torch._foreach_norm(values, 2.0)
+-    norm = torch.stack(norms).square().sum().sqrt()
++    if global_norm is None:
++        norms = torch._foreach_norm(values, 2.0)
++        norm = torch.stack(norms).square().sum().sqrt()
++    else:
++        norm = global_norm.detach().float()
++        if norm.numel() != 1:
++            raise ValueError("TP gradient norm must be a scalar")
+     if grad_clip == 0:
+         return values, norm
+     scale = torch.clamp(grad_clip / (norm + 1e-12), max=1.0)
+@@ -264,12 +270,14 @@ class ResidentOptimizer:
+         *,
+         feedback_source_version: int | None = None,
+         safe_boundary_version: int | None = None,
++        global_gradient_norm: torch.Tensor | None = None,
+     ) -> ParameterProposal:
+         gradients, gradient_norm = _clip_fp32_gradients(
+             gradients,
+             width=len(self.master),
+             grad_clip=self.config.grad_clip,
+             label="optimizer",
++            global_norm=global_gradient_norm,
+         )
+         step = self._step + 1
+         learning_rate, schedule_valid = self._scheduled_learning_rate(step)
+@@ -2567,6 +2575,7 @@ class OnlineCohortRuntime:
+                     "request_ids": list(trace.request_ids),
+                     "prefix_len_before": [row[0] for row in values],
+                     "verify_len": [row[1] for row in values],
++                    "verify_len_semantics": "draft_positions_v2",
+                     "accepted_drafts": [row[2] for row in values],
+                     "committed_tokens": [row[3] for row in values],
+                 }
+diff --git a/python/sglang/srt/speculative/online_parameter_plan.py b/python/sglang/srt/speculative/online_parameter_plan.py
+index 22c37d88..ff96fd4e 100644
+--- a/python/sglang/srt/speculative/online_parameter_plan.py
++++ b/python/sglang/srt/speculative/online_parameter_plan.py
+@@ -133,7 +133,12 @@ def build_native_parameter_plan(
+     hybrid = scope in DSPARK_HYBRID_SCOPES
+     layer_scope = scope.removesuffix("_native_heads")
+     layer_ids = _selected_layers(rows, layer_scope)
+-    native_heads = _dspark_heads(rows) if algorithm == "DSPARK" else ()
++    native_heads = (
++        _dspark_heads(rows)
++        if algorithm == "DSPARK" and (
++            hybrid or any("markov_head" in name or "confidence_head" in name for name, _ in rows)
++        ) else ()
++    )
+     native_head_set = frozenset(native_heads)
+     selected: list[str] = []
+     lora: list[str] = []

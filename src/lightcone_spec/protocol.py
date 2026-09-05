@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import random
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
@@ -109,6 +110,92 @@ TTS_SOURCE_TASKS = (
     "TheoremQA",
     "LiveCodeBench",
 )
+SOURCE_PAIRED_SEEDS = (980406, 980407, 980408, 980409)
+SOURCE_EVALUATION_TASKS = (
+    ("GSM8K", "gsm8k", 500), ("MATH-500", "math500", 500),
+    ("AIME-2025", "aime25", 30), ("HumanEval", "humaneval", 164),
+    ("MBPP", "mbpp", 256), ("LiveCodeBench", "livecodebench", 500),
+    ("MT-Bench", "mt-bench", 80), ("AlpacaEval", "alpaca", 500),
+    ("Arena-Hard", "arena-hard-v2", 500),
+)
+SOURCE_METHODS = ("static", "tts", "lightcone")
+SOURCE_COVERAGE_NODE = "E0-source-four-block-v1"
+MECHANISM_NODE = "E3b-mechanism-four-block-v1"
+
+
+def source_checkpoint_id(model: str, backend: str) -> str:
+    """DeepSpec source weights are separate from the main DFlash b16 recipe."""
+    model_name = {
+        "Qwen/Qwen3-4B": "qwen3_4b", "Qwen/Qwen3-8B": "qwen3_8b",
+        "Qwen/Qwen3-14B": "qwen3_14b", "Gemma4-12B": "gemma4_12b",
+    }[model]
+    if backend not in E0_BACKENDS:
+        raise ValueError(f"unsupported source backend {backend}")
+    suffix = "ttt7" if backend == "EAGLE3" else "block7"
+    return f"deepseek-ai/{backend.lower()}_{model_name}_{suffix}"
+
+
+def source_coverage_jobs() -> tuple[Job, ...]:
+    """Immutable extra evidence; do not rewrite already materialized E0 jobs."""
+    rows = []
+    for model, backend in itertools.product(E0_MODELS, E0_BACKENDS):
+        for block, seed in enumerate(SOURCE_PAIRED_SEEDS):
+            for task, dataset, count in SOURCE_EVALUATION_TASKS:
+                methods = list(SOURCE_METHODS)
+                random.Random(f"source-v1|{model}|{backend}|{task}|{seed}").shuffle(methods)
+                for method in methods:
+                    dense = model == "Qwen/Qwen3-14B"
+                    rows.append(dict(
+                        model=model, backend=backend, method=method, task=task,
+                        block=block, context=40960, load="c1", width=8,
+                        gpu_count=2 if dense else 1,
+                        topology="tp2_dp1" if dense else "tp1_dp1",
+                        evidence_owner="E6" if dense else "E0",
+                        panel="dense_14b_source_transfer" if dense else "source_transfer",
+                        workload="dspark_complete_source_four_block",
+                        dataset_key=f"DeepSpec-source|{dataset}",
+                        source_dataset=dataset, source_max_samples=count,
+                        source_checkpoint=source_checkpoint_id(model, backend),
+                        checkpoint_family="deepspec_next_token_v1",
+                        draft_key=f"DeepSpec-source|{model}|{backend}",
+                        execution_request_count=count, sampling_seed=seed,
+                        generation_tokens=2048, regime="source_native_prompt",
+                        temperature=1.0, enable_thinking=False, respect_eos=True,
+                        verification="fixed_budget", proposal_budget=8,
+                        draft_positions=7, target_bonus_tokens=1, drafting="chain",
+                        confidence_threshold=0.0, stride=FORMAL_ADAPTATION_STRIDE,
+                        clean_server_per_cell=True, requires_isolation=True,
+                        statistical_unit="independent_clean_server_paired_block",
+                        pairing_key=f"source-v1|{model}|{backend}|{task}",
+                    ))
+    return _jobs(SOURCE_COVERAGE_NODE, rows)
+
+
+def mechanism_jobs() -> tuple[Job, ...]:
+    rows = []
+    tasks = ("AIME-2025", "MATH-500", "OlympiadBench-Math", "LiveCodeBench")
+    for task, block in itertools.product(tasks, range(4)):
+        methods = list(SOURCE_METHODS)
+        random.Random(f"mechanism-v1|{task}|{block}").shuffle(methods)
+        for method in methods:
+            rows.append(dict(
+                model="Qwen/Qwen3-8B", backend="DFLASH", method=method,
+                task=task, block=block, context=40960, load="c1", width=16,
+                execution_request_count=30 if task == "AIME-2025" else 32,
+                generation_tokens=32768, sampling_seed=block,
+                stimulus_selection_seed=0, regime="mechanism_native_prompt",
+                temperature=1.0, respect_eos=True, enable_thinking=False,
+                workload="long_generation_mechanism_four_block",
+                mechanism_telemetry=True, generation_bin_tokens=2048,
+                clean_server_per_cell=True, requires_isolation=True,
+                exclude_from_headline_performance=True,
+                stride=FORMAL_ADAPTATION_STRIDE,
+                statistical_unit="independent_clean_server_paired_block",
+                pairing_key=f"mechanism-v1|{task}",
+            ))
+    return _jobs(MECHANISM_NODE, rows)
+
+
 E0_ONLINESPEC_METHODS = (
     "onlinespec_ogd",
     "onlinespec_opt",

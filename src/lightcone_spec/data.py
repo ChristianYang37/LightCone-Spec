@@ -27,6 +27,37 @@ CALIBRATION_SOURCES = {
 }
 
 
+def load_source_prompt_records(
+    path: Path, *, max_samples: int, seed: int,
+) -> tuple[dict[str, Any], ...]:
+    """Mirror DeepSpec's first-turn loader and shuffle-only-when-truncated rule.
+
+    Accept original official JSONL rows; stable IDs derive from file row index
+    when the upstream file has no identifier. Do not use normalized pool order.
+    """
+    if max_samples < 1:
+        raise ValueError("source sample budget must be positive")
+    records = []
+    # Iterate physical JSONL lines like the official loader. str.splitlines()
+    # also splits valid U+2028/U+2029 characters inside JSON prompt strings.
+    with path.open(encoding="utf-8") as stream:
+        source_rows = [json.loads(line) for line in stream if line.strip()]
+    for index, row in enumerate(source_rows):
+        turns = row.get("turns")
+        if not isinstance(turns, list) or not turns or not all(isinstance(t, str) for t in turns):
+            raise ValueError(f"official source row {index} requires nonempty string turns")
+        records.append({
+            "problem_id": str(row.get("id", f"{path.stem}:{index}")),
+            "prompt": turns[0], "turns": turns[:1], "source_row_index": index,
+        })
+    if len(records) < max_samples:
+        raise ValueError(f"incomplete official source file: {len(records)} < {max_samples}")
+    if len(records) > max_samples:
+        random.Random(seed).shuffle(records)
+        records = records[:max_samples]
+    return tuple(records)
+
+
 def _rows(path: Path) -> list[dict[str, Any]]:
     if path.is_dir():
         raise ValueError(f"dataset path must name one explicit file: {path}")

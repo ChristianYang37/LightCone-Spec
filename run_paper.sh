@@ -54,7 +54,7 @@ export CUDA_PATH="$cuda_home"
 export PATH="$cuda_home/bin:$PATH"
 export LD_LIBRARY_PATH="$cuda_home/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 marker="$sglang_root/.lightcone-spec-patched"
-patch_version="paper-v1-nextn-shadow-v25"
+patch_version="paper-v1-nextn-shadow-v26"
 
 if [[ ! -e "$marker" ]]; then
   patches=()
@@ -82,6 +82,9 @@ else
     python/sglang/srt/speculative/dflash_online_adaptation.py \
     python/sglang/srt/speculative/dspark_online_adaptation.py \
     python/sglang/srt/speculative/online_adaptation_config.py \
+    python/sglang/srt/models/gemma4_draft.py \
+    python/sglang/srt/models/qwen3_eagle3.py \
+    python/sglang/srt/models/qwen3_draft_replay.py \
     python/sglang/srt/managers/native_token_timestamps.py; do
     if [[ ! -f "$sglang_root/$module" ]]; then
       echo "patched SGLang is missing $module; remove $marker and restore a clean checkout" >&2

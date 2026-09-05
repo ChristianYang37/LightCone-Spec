@@ -9,9 +9,17 @@ import shutil
 from pathlib import Path
 
 from .config import ExperimentConfig
-from .metrics import summarize_attempts
-from .protocol import PAPER_NODES, Job, materialize, paper_plan, segment_count
-from .runner import PaperRunner
+from .metrics import summarize_metric_rows
+from .protocol import (
+    PAPER_NODES,
+    Job,
+    materialize,
+    mechanism_jobs,
+    paper_plan,
+    segment_count,
+    source_coverage_jobs,
+)
+from .runner import PaperRunner, _metric_rows
 from .state import StateStore
 
 
@@ -74,11 +82,21 @@ def _plan(config: ExperimentConfig) -> None:
     print("TTS-batched-calibration\t<=4\tE1 LoRA finalists at excluded c8")
     print("TTS-S10-confirmation\t8\t2 learning rates * 4 paired blocks")
     print("S10-reconciliation\t19\t14 formal-stride + 5 masked-logit replacements")
+    source, mechanism = source_coverage_jobs(), mechanism_jobs()
+    print(
+        f"E0-source-four-block-v1\t{len(source)}\t4 independent paired blocks; max_requests={sum(job.parameters['execution_request_count'] for job in source)}"
+    )
+    print(
+        f"E3b-mechanism-four-block-v1\t{len(mechanism)}\t4 independent paired blocks; diagnostic timing excluded"
+    )
     print(
         f"registered finite-request floor\t{finite_requests}\t"
         f"requests_per_cell={config.server.requests_per_cell}; E5 time-driven rows excluded"
     )
     print(f"registered jobs\t{len(jobs)}\tsegments={segments}")
+    print(
+        f"coverage added leaves\t{len(source) + len(mechanism)}\tbase_plus_coverage={segments + len(source) + len(mechanism)}; replacements separate"
+    )
     print(f"maximum runner jobs\t{len(jobs) + 95}\tincluding dynamic confirmations")
     acceptance = config.results_root / "acceptance"
     if acceptance.is_dir():
@@ -149,7 +167,7 @@ def _summarize(run_dir: Path) -> None:
     written: dict[str, int] = {}
     for row in state.stage_rows():
         node = str(row["node"])
-        frame = summarize_attempts(state.completed_attempt_dirs(node), run_dir / "stages" / node)
+        frame = summarize_metric_rows(_metric_rows(state, node), run_dir / "stages" / node)
         written[node] = len(frame)
     print(json.dumps(written, indent=2, sort_keys=True))
 

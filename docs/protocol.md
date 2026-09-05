@@ -28,6 +28,72 @@ reconciliation adds seven replacement cells and one unprivileged activity
 proxy to the current run without adding public DAG nodes. There is no
 global `N` or `final_blocks` setting.
 
+## Four-block coverage extension (registered; GPU results UNMEASURED)
+
+Two internal panels add exactly **1,344 leaf cells**, without changing the 21
+public nodes or deleting existing six-/twelve-block evidence. Compatibility
+replacements and reopened old cells are counted separately, not included in
+this number. The base 7,366-leaf plan plus these new panels is 8,710 leaves
+before such replacements; historical SQLite rows are not an execution budget.
+
+| Panel | Matrix | New leaves |
+|---|---|---:|
+| Complete source-data transfer | 4 models × 3 backends × Static/TTS/LightCone × 9 datasets × 4 blocks | 1,296 |
+| Long-generation mechanism | Qwen3-8B+DFlash × 4 tasks × 3 methods × 4 blocks | 48 |
+
+Each block is an independent clean-server paired run. Source seeds are frozen
+as 980406/980407/980408/980409; the first is the official seed. Mechanism seeds
+are 0/1/2/3 with stimulus selection fixed at seed 0. Within each comparison,
+methods share stimuli and seed; their order is deterministically randomized.
+Report all four raw block points. Paired effects use block-level log ratios and
+a Student t interval with three degrees of freedom, assuming independent,
+approximately normal log ratios. The smallest two-sided exact sign-flip p value
+is 2/16=0.125. These panels support effect sizes/consistency, not a replacement
+for existing confirmatory main-effect blocks. Request-level exploratory
+uncertainty must not be labeled run-to-run error bars.
+
+The source panel uses the original DeepSpec evaluation JSONL files, first turn,
+non-thinking, temperature 1, c1, output limit 2,048, and native EOS termination.
+The nine caps are GSM8K 500, MATH-500 500, AIME-2025 30, HumanEval 164, MBPP 256,
+LiveCodeBench 500, MT-Bench 80, AlpacaEval 500, Arena-Hard 500: at most 3,030
+requests per model/backend/method/block and 436,320 in total. Shuffle only when
+the official file exceeds its cap; never duplicate short datasets. Official
+block-7/TTT7 checkpoints are separately mapped from the main block-16 drafter.
+All seven draft positions are used; the target bonus is separate. Confidence
+scheduling is disabled, and full legal attention history is retained rather
+than replacing it with a seven/eight-token history window. This is a source
+protocol transfer plus TTS/LightCone adaptation, not an exact original-system
+hardware reproduction.
+
+Qwen3-14B source cells (324) are TP2 and owned by E6 dense-14B transfer; the
+other 972 use individually verified topologies. Existing 14B Target-only and
+three-backend Static/TTS/LightCone transfer evidence is to be routed through
+one E6-owned execution with E0 references, not duplicated. Capacity is recorded
+per model/backend/method/topology: infeasible Full adaptation does not exclude
+Static. Registration/tensor errors require repair, not capacity pruning.
+
+The mechanism panel uses AIME-2025 (all 30 stimuli), MATH-500,
+OlympiadBench-Math and LiveCodeBench (32 fixed stimuli each), c1 and output
+limit 32K. Opt-in diagnostics aggregate by 2,048 generated-token bins and
+retain exposure/reached/accepted counts, target entropy, draft top-1 CE, target
+calls, publications, native ITL and request endings; full-vocabulary logits
+are not stored. Prefix survival divides by exposed positions; conditional
+acceptance divides by positions reached after accepting the previous prefix.
+EOS/length censoring and effective request counts remain visible. Diagnostic
+overhead is excluded from headline performance evidence.
+
+Presentation comprises seven evidence groups: model/backend feasibility and
+efficiency table; E3b long-history curves; mechanism AL/entropy/CE; positional
+acceptance versus prefix survival; E1/E2/E4 update costs/ablations; E5 serving
+frontier and BurstGPT; E5/E6 topology/scale transfer. Only comparable repeated
+runs have run-level error bars; blocked/unmeasured/event-only entries do not.
+
+Implementation/deployment acceptance remains separate from this registration:
+Gemma semantics, complete selected-parameter gradients, active-weight replay,
+TP2 state/KV budgets, immutable replacement/resume and excluded GPU checks
+must pass before new formal source cells are admitted. No new GPU values or
+four-block ETA are inferred from old one-block runtimes.
+
 ## Comparisons and repetition
 
 - E3b primary: LiveCodeBench 32K generated history, five mechanism roles,

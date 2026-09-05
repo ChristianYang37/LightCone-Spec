@@ -181,6 +181,16 @@ def _speculative_canvas(job: Job) -> int:
     return 8 if job.backend == "DSPARK" else int(job.width or 16)
 
 
+def _execution_backend(job: Job) -> str:
+    # Official DFlash b7 predicts seven next tokens from all seven hidden slots;
+    # z-lab DFlash b16 uses a known first slot plus fifteen proposal slots.
+    # Reuse the gamma-aligned engine, never relabel the scientific backend.
+    if (job.backend == "DFLASH"
+            and job.parameters.get("checkpoint_family") == "deepspec_next_token_v1"):
+        return "DSPARK"
+    return job.backend
+
+
 def _request_scoped_adaptation(job: Job) -> bool:
     return job.method in {"tts", "l0_naive"}
 
@@ -271,7 +281,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     payload = {
         "schema_version": 1,
         "method": method,
-        "algorithm": job.backend,
+        "algorithm": _execution_backend(job),
         "parameter_scope": chosen.get("scope", "all"),
         "weight_update_mode": parameterization,
         "rank": rank if parameterization == "lora" else None,
@@ -301,8 +311,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "controlled_candidate_role": chosen.get("controlled_candidate_role"),
         "failure_injection": chosen.get("failure"),
     }
-    scientific_node = str(job.parameters.get("source_node", job.node))
-    if scientific_node == "E1a" and chosen.get("verification") == "fixed_budget":
+    if chosen.get("verification") == "fixed_budget":
         payload["fixed_total_token_budget"] = int(
             chosen.get("proposal_budget", 8)
         ) * _concurrency(job)
@@ -324,6 +333,8 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
             # Historical attempts remain readable, but new DSpark recipes use
             # the seven-position vector above.
             payload["confidence_temperature"] = float(chosen["confidence_temperature"])
+    elif _execution_backend(job) == "DSPARK":
+        payload["confidence_loss_weight"] = 0.0
     if method.startswith("onlinespec_"):
         payload["online_spec"] = {
             "projection_radius": chosen.get("projection_radius"),
@@ -343,9 +354,10 @@ def server_command(
     adaptation: dict[str, Any] | None,
 ) -> list[str]:
     target = config.model_path(job.model)
+    execution_backend = _execution_backend(job)
     tp, dp = _topology(job)
     memory_fraction = config.server.mem_fraction_static
-    if job.backend == "DSPARK" or job.parameters.get("exactness_bootstrap"):
+    if execution_backend == "DSPARK" or job.parameters.get("exactness_bootstrap"):
         memory_fraction = min(memory_fraction, 0.80)
     max_running = _server_capacity(job, adaptation)
     argv = [
@@ -369,7 +381,7 @@ def server_command(
         "--mem-fraction-static",
         str(memory_fraction),
         "--random-seed",
-        str(config.protocol.seed),
+        str(job.parameters.get("sampling_seed", config.protocol.seed)),
         "--skip-server-warmup",
         "--speculative-speed-study-metrics",
     ]
@@ -407,7 +419,7 @@ def server_command(
     argv.extend(
         [
             "--speculative-algorithm",
-            job.backend,
+            execution_backend,
             "--speculative-num-draft-tokens",
             str(_speculative_canvas(job)),
             "--speculative-num-steps",
@@ -416,23 +428,29 @@ def server_command(
                 if job.backend in {"EAGLE3", "NEXTN"}
                 else 1
             ),
-            "--speculative-draft-window-size",
-            str(_speculative_canvas(job)),
             "--speculative-use-rejection-sampling",
         ]
     )
+    if job.parameters.get("checkpoint_family") != "deepspec_next_token_v1":
+        argv.extend(["--speculative-draft-window-size", str(_speculative_canvas(job))])
     # SGLang's EAGLE-family parser requires an explicit single branch whenever
     # rejection sampling is enabled.  With topk=1 it also canonicalizes the
     # proposal count to ``num_steps + 1``.  Keep that count equal to the
     # registered canvas for both native EAGLE3 and the NEXTN alias.
     if job.backend in {"EAGLE3", "NEXTN"}:
         argv.extend(["--speculative-eagle-topk", "1"])
-    if job.backend == "DSPARK":
+    if execution_backend == "DSPARK":
         argv.extend(["--attention-backend", "triton"])
-    draft = None if job.backend == "NEXTN" else config.draft_path(job.model, job.backend)
+    draft_key = job.parameters.get("draft_key")
+    if draft_key is not None:
+        if draft_key not in config.drafts:
+            raise ValueError(f"missing dedicated source checkpoint path: {draft_key}")
+        draft = config.drafts[draft_key]
+    else:
+        draft = None if job.backend == "NEXTN" else config.draft_path(job.model, job.backend)
     if draft is not None:
         argv.extend(["--speculative-draft-model-path", str(draft)])
-    if job.backend == "DSPARK" and config.server.dspark_sps_table is not None:
+    if execution_backend == "DSPARK" and config.server.dspark_sps_table is not None:
         argv.extend(
             [
                 "--speculative-dspark-sps-table-path",
@@ -514,6 +532,9 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
     return (
         job.model,
         job.backend,
+        _execution_backend(job),
+        job.parameters.get("draft_key"),
+        job.job_id if job.parameters.get("clean_server_per_cell") else None,
         job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
         _server_capacity(job, adaptation),
@@ -734,8 +755,19 @@ class ServerProcess:
         environment["PYTHONPATH"] = os.pathsep.join(roots)
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpus))
         environment["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = "false"
-        if self.job.backend == "DSPARK":
+        environment.pop("LIGHTCONE_MECHANISM_BIN_TOKENS", None)
+        if self.job.parameters.get("mechanism_telemetry"):
+            environment["LIGHTCONE_MECHANISM_BIN_TOKENS"] = str(
+                int(self.job.parameters.get("position_bin_tokens", 2048))
+            )
+        if _execution_backend(self.job) == "DSPARK":
             environment["SGLANG_RAGGED_VERIFY_MODE"] = "compact"
+        environment.pop("LIGHTCONE_FIXED_VERIFY_BUDGET_PER_REQUEST", None)
+        if (_execution_backend(self.job) == "DSPARK"
+                and self.job.parameters.get("verification") == "fixed_budget"):
+            environment["LIGHTCONE_FIXED_VERIFY_BUDGET_PER_REQUEST"] = str(
+                int(self.job.parameters.get("proposal_budget", 8))
+            )
         (self.output_dir / "server.stopped").unlink(missing_ok=True)
         self.log = (self.output_dir / "server.log").open("a", encoding="utf-8")
         self.process = subprocess.Popen(

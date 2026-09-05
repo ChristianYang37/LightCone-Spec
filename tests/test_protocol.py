@@ -16,8 +16,10 @@ from lightcone_spec.protocol import (
     Job,
     default_row_counts,
     materialize,
+    mechanism_jobs,
     paper_plan,
     segment_count,
+    source_coverage_jobs,
     uses_formal_adaptation_stride,
 )
 from lightcone_spec.runner import (
@@ -50,6 +52,83 @@ from lightcone_spec.server import (
     server_session_key,
 )
 from lightcone_spec.state import StateStore
+
+
+def test_official_jsonl_keeps_unicode_line_separators_inside_prompts(tmp_path):
+    from lightcone_spec.data import load_source_prompt_records
+
+    path = tmp_path / "official.jsonl"
+    path.write_text(
+        json.dumps({"turns": ["first\u2028second\u2029third", "unused"]}, ensure_ascii=False) + "\n"
+    )
+    rows = load_source_prompt_records(path, max_samples=1, seed=980406)
+    assert rows[0]["prompt"] == "first\u2028second\u2029third"
+    assert rows[0]["turns"] == [rows[0]["prompt"]]
+
+
+def test_coverage_gpu_acceptance_is_excluded_and_does_not_resize_formal_cells():
+    from lightcone_spec.coverage import gpu_acceptance_jobs
+
+    original = source_coverage_jobs(), mechanism_jobs()
+    jobs = gpu_acceptance_jobs()
+    assert len(jobs) == len({job.job_id for job in jobs}) == 41
+    assert {job.parameters["qa_phase"] for job in jobs} == {"gemma", "qwen", "dense14", "panels"}
+    assert all(job.parameters["excluded_from_analysis"] for job in jobs)
+    assert all(job.parameters["execution_request_count"] == 2 for job in jobs)
+    assert all(job.block is None and job.parameters["generation_tokens"] == 512 for job in jobs)
+    assert all(job.gpu_count == 2 for job in jobs if job.model == "Qwen/Qwen3-14B")
+    assert original == (source_coverage_jobs(), mechanism_jobs())
+
+
+def test_four_block_source_and_mechanism_matrix_preserves_public_dag(tmp_path):
+    source, mechanism = source_coverage_jobs(), mechanism_jobs()
+    assert len(source) == 1296
+    assert len(mechanism) == 48
+    assert len(PAPER_NODES) == 21
+    assert sum(job.parameters["execution_request_count"] for job in source) == 436320
+    assert sum(job.model == "Qwen/Qwen3-14B" for job in source) == 324
+    pairs = {}
+    for job in source:
+        assert job.load == "c1" and job.width == 8
+        assert job.parameters["respect_eos"] and job.parameters["verification"] == "fixed_budget"
+        assert job.parameters["generation_tokens"] == 2048
+        assert job.parameters["sampling_seed"] == 980406 + job.block
+        assert job.parameters["topology"] == (
+            "tp2_dp1" if job.model == "Qwen/Qwen3-14B" else "tp1_dp1"
+        )
+        pairs.setdefault((job.parameters["pairing_key"], job.block), []).append(job)
+    assert len(pairs) == 432
+    for jobs in pairs.values():
+        assert {job.method for job in jobs} == {"static", "tts", "lightcone"}
+        assert len({job.parameters["source_checkpoint"] for job in jobs}) == 1
+        assert len({job.parameters["sampling_seed"] for job in jobs}) == 1
+    assert {j.parameters["execution_request_count"] for j in mechanism} == {30, 32}
+    assert all(j.parameters["exclude_from_headline_performance"] for j in mechanism)
+    assert source == source_coverage_jobs() and mechanism == mechanism_jobs()
+    state = StateStore(tmp_path / "run")
+    state.add_internal_jobs(source + mechanism)
+    state.add_internal_jobs(source + mechanism)
+    assert len(state.jobs(source[0].node)) == 1296
+    assert len(state.jobs(mechanism[0].node)) == 48
+
+
+def test_official_source_loader_preserves_first_turn_and_sampling(tmp_path):
+    import random
+
+    from lightcone_spec.data import load_source_prompt_records
+
+    path = tmp_path / "official.jsonl"
+    path.write_text("\n".join(json.dumps({"turns": [str(i), "ignored"]}) for i in range(6)))
+    complete = load_source_prompt_records(path, max_samples=6, seed=980406)
+    assert [row["prompt"] for row in complete] == list(map(str, range(6)))
+    expected = list(range(6))
+    random.Random(980406).shuffle(expected)
+    selected = load_source_prompt_records(path, max_samples=3, seed=980406)
+    assert [row["source_row_index"] for row in selected] == expected[:3]
+    assert all(len(row["turns"]) == 1 for row in selected)
+    with pytest.raises(ValueError, match="incomplete official"):
+        load_source_prompt_records(path, max_samples=7, seed=980406)
+
 
 EXPECTED = {
     "preflight": 10,

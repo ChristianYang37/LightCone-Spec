@@ -426,6 +426,7 @@ class SGLangClient:
         routing_key: str | None = None,
         request_ids: Sequence[str] | None = None,
         timeout_seconds: float | None = None,
+        ignore_eos: bool = True,
     ) -> tuple[tuple[GenerationResult, ...], float]:
         prompt_rows = tuple(prompts)
         if not prompt_rows:
@@ -453,7 +454,7 @@ class SGLangClient:
                     "top_p": 1.0,
                     "min_p": 0.0,
                     "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
+                    "ignore_eos": ignore_eos,
                     "sampling_seed": seed + index,
                 }
                 for index in range(len(prompt_rows))
