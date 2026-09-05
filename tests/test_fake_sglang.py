@@ -26,6 +26,7 @@ from lightcone_spec.nextn import (
     flatten_attention_output,
     grad_enabled_forwards,
     gradient_leaves,
+    native_training_replay,
     needs_tp_gradient_sum,
     ragged_history_locations,
     ragged_kl_loss,
@@ -2367,6 +2368,72 @@ def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
     )
     assert run.returncode == 1
     assert "restore SGLang and reapply patches" in run.stderr
+
+
+@pytest.mark.parametrize("module,class_name,has_model", [
+    ("gemma4_draft", "Gemma4Eagle3Model", True),
+    ("gemma4_draft", "Gemma4DSparkModel", False),
+    ("qwen3_draft_replay", "QwenDraftReplay", True),
+    ("qwen3_draft_replay", "QwenDraftReplay", False),
+])
+def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
+    tree = _coverage_added_module(f"python/sglang/srt/models/{module}.py")
+    original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    forward = next(node for node in original.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+
+    class Native(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+            self.history = False
+            if has_model:
+                self.model = SimpleNamespace()
+
+        @torch.no_grad()
+        def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
+            value = input_ids * self.weight
+            return SimpleNamespace(next_token_logits=value, hidden_states=value)
+
+        def _replay_hidden(self, input_ids, *args):
+            if not self.history:
+                raise RuntimeError("owned full-history KV snapshot required")
+            value = input_ids * self.weight
+            return value, value
+
+        def _replay_logits(self, hidden):
+            return hidden
+
+    wrapper = ast.ClassDef(
+        name=class_name, bases=[ast.Name(id="Native", ctx=ast.Load())],
+        keywords=[], body=[forward], decorator_list=[],
+    )
+    namespace = {"Native": Native, "torch": torch}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "native-forward-mode", "exec"), namespace)
+    model = namespace[class_name]()
+    values = torch.ones(2, 4)
+    assert torch.is_grad_enabled()  # CUDA Graph warm-up may enter this way.
+    result = model(values, None, None)
+    assert not result.hidden_states.requires_grad
+    assert not getattr(model, "_reconstruction_rows", [])
+    with native_training_replay(model, False):
+        assert not model(values, None, None).hidden_states.requires_grad
+    with pytest.raises(RuntimeError, match="owned full-history"):
+        with native_training_replay(model, True):
+            model(values, None, None)
+    assert not hasattr(model, "_lightcone_training_replay")
+    model.history = True
+    with native_training_replay(model, True):
+        assert model(values, None, None).hidden_states.requires_grad
+    with grad_enabled_forwards(model):
+        with grad_enabled_forwards(model):
+            assert model._lightcone_training_replay is True
+        assert model._lightcone_training_replay is True
+        output = model(values, None, None)
+        assert output.hidden_states.requires_grad
+        output.hidden_states.sum().backward()
+    assert model.weight.grad is not None and model.weight.grad.item() != 0
+    assert not hasattr(model, "_lightcone_training_replay")
+    assert not model(values, None, None).hidden_states.requires_grad
 
 
 def test_deepspec_eagle_graph_width_uses_trained_feature_layers():

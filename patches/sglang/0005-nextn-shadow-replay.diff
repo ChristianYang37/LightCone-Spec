@@ -2189,7 +2189,7 @@ index 00000000..86ab081e
 +        return None
 +
 +    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
-+        if not torch.is_grad_enabled():
++        if not (torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False)):
 +            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +        with torch.no_grad():
 +            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
@@ -2204,7 +2204,7 @@ index 00000000..86ab081e
 +
 +    def compute_base_logits_and_hidden(self, hidden):
 +        hidden = hidden.to(self.lm_head.weight.dtype)
-+        if torch.is_grad_enabled():
++        if torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False):
 +            return self._replay_logits(hidden), None, hidden
 +        logits = gather_and_crop_vocab(hidden @ self.lm_head.weight.T, self.lm_head)
 +        logits = gemma_softcap(logits.float(), getattr(self.config, "final_logit_softcapping", None))
@@ -2291,7 +2291,7 @@ index 00000000..86ab081e
 +        GemmaDraftBackbone.load_weights(self, weights)
 +
 +    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
-+        updating = torch.is_grad_enabled()
++        updating = torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False)
 +        with torch.no_grad():
 +            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +        if not updating:
@@ -2402,7 +2402,7 @@ index 00000000..6b43cc41
 +        return norm(backbone.norm, hidden), hidden
 +
 +    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
-+        if not torch.is_grad_enabled():
++        if not (torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False)):
 +            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +        with torch.no_grad():
 +            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
@@ -2425,7 +2425,7 @@ index 00000000..6b43cc41
 +        return native
 +
 +    def compute_base_logits_and_hidden(self, hidden):
-+        if torch.is_grad_enabled():
++        if torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False):
 +            return self._replay_logits(hidden), None, hidden
 +        return super().compute_base_logits_and_hidden(hidden)
 diff --git a/python/sglang/srt/models/qwen3_eagle3.py b/python/sglang/srt/models/qwen3_eagle3.py
@@ -2634,6 +2634,14 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/p
 index 7319db12..9e89de2a 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+@@ -6,6 +6,7 @@ from typing import Optional
+ 
+ import msgspec
+ import torch
++from lightcone_spec.nextn import native_training_replay
+ 
+ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+     SampleStepTokens,
 @@ -231,12 +231,20 @@ def sample_draft_block(
                  sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                  return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
@@ -2661,14 +2669,24 @@ index 7319db12..9e89de2a 100644
      return DraftBlockResult(
          draft_tokens=draft_tokens,
          corrected_logits=corrected_logits,
-@@ -434,6 +442,8 @@ class DraftBlockProposer:
+@@ -331,7 +340,7 @@ class DraftBlockProposer:
+             inference_context = (
+                 torch.inference_mode(not online_update)
+             )
+-            with inference_context, torch.set_grad_enabled(online_update):
++            with inference_context, torch.set_grad_enabled(online_update), native_training_replay(self.draft_model, online_update and hasattr(self.draft_model, "capture_training_context")):
+                 with self._base_logits_context():
+                     base_logits, confidence_tap, head_hidden = compute_dspark_projection(
+                         self.draft_model, fwd.raw_hidden
+@@ -434,6 +443,8 @@ class DraftBlockProposer:
              capture_hidden_mode=CaptureHiddenMode.NULL,
          )
          self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
 +        if online_update and hasattr(self.draft_model, "capture_training_context"):
 +            self.draft_model.capture_training_context(draft_forward_batch, self.draft_model_runner)
          inference_context = torch.inference_mode(not online_update)
-         with inference_context, torch.set_grad_enabled(online_update):
+-        with inference_context, torch.set_grad_enabled(online_update):
++        with inference_context, torch.set_grad_enabled(online_update), native_training_replay(self.draft_model, online_update and hasattr(self.draft_model, "capture_training_context")):
              draft_out = self.draft_model_runner.forward(
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 index 07566165..b2d296b6 100644
@@ -2754,6 +2772,15 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/sr
 index 320b5887..ad886ddd 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -7,7 +7,7 @@ from typing import List, Optional
+ import torch
+ import torch.nn.functional as F
+ 
+-from lightcone_spec.nextn import ragged_kl_loss
++from lightcone_spec.nextn import native_training_replay, ragged_kl_loss
+ from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.environ import envs
 @@ -299,7 +299,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
              ):
                  self.draft_runner.model.set_lm_head_from_target(target_lm_head)
@@ -2766,7 +2793,7 @@ index 320b5887..ad886ddd 100644
              # most cases EAGLE3 models don't share lm_head
              # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
              if (
-@@ -650,9 +653,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -650,11 +653,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
              nextn_replay = (
                  online_update and self._online_adapter.config.algorithm == "NEXTN"
              )
@@ -2788,6 +2815,9 @@ index 320b5887..ad886ddd 100644
                  )
              with (
                  torch.inference_mode(not online_update or nextn_replay),
+                 torch.set_grad_enabled(online_update and not nextn_replay),
++                native_training_replay(self.draft_runner.model, model_replay),
+             ):
 @@ -1277,6 +1291,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                  ):
                      verify_input: EagleVerifyInput = self.draft_worker.draft(batch)

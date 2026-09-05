@@ -26,8 +26,23 @@ def needs_tp_gradient_sum(name: str) -> bool:
 
 
 @contextmanager
+def native_training_replay(model: torch.nn.Module, enabled: bool):
+    """Distinguish registered update forwards from grad-enabled graph warm-up."""
+    missing = object()
+    previous_replay = getattr(model, "_lightcone_training_replay", missing)
+    model._lightcone_training_replay = enabled
+    try:
+        yield
+    finally:
+        if previous_replay is missing:
+            delattr(model, "_lightcone_training_replay")
+        else:
+            model._lightcone_training_replay = previous_replay
+
+
+@contextmanager
 def grad_enabled_forwards(model: torch.nn.Module):
-    """Temporarily bypass model-local no-grad decorators during shadow replay."""
+    """Mark explicit shadow replay and temporarily bypass local no-grad decorators."""
     restored = []
     for module in model.modules():
         forward = module.forward
@@ -37,7 +52,8 @@ def grad_enabled_forwards(model: torch.nn.Module):
         restored.append((module, forward))
         module.forward = types.MethodType(raw, module)
     try:
-        yield
+        with native_training_replay(model, True):
+            yield
     finally:
         for module, forward in reversed(restored):
             module.forward = forward
