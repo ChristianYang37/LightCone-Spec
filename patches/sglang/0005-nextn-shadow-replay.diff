@@ -1696,6 +1696,20 @@ index 95c88763..3ebb7c2f 100644
  
  
  def _resolve_dflash_aux_hidden_state(
+@@ -151,7 +154,12 @@ def _resolve_dflash_aux_hidden_state(
+             dspark_draft_config = parse_dspark_draft_config(
+                 draft_hf_config=draft_model_config.hf_config
+             )
+-            if not dspark_draft_config.require_markov():
++            plain_dflash = (
++                getattr(draft_model_config.hf_config, "markov_rank", None) == 0
++                and getattr(draft_model_config.hf_config, "enable_confidence_head", None) is False
++            )
++            # Match the worker's explicit headless DFlash compatibility path.
++            if not dspark_draft_config.require_markov() and not plain_dflash:
+                 raise ValueError(
+                     "DSPARK requires markov_rank > 0 in the draft config, "
+                     f"got markov_rank={dspark_draft_config.markov_rank}."
 diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
 index 7e1916f0..884231a0 100644
 --- a/python/sglang/srt/models/dspark.py

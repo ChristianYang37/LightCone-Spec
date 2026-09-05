@@ -849,6 +849,41 @@ def test_unified_dspark_model_accepts_markovless_dflash_checkpoint():
     assert "self.draft_model.attach_shared_modules(" in patch
 
 
+@pytest.mark.parametrize("fields,accepted", [
+    ({"markov_rank": 0, "enable_confidence_head": False}, True),
+    ({"markov_rank": 32, "enable_confidence_head": True}, True),
+    ({"markov_rank": 0, "enable_confidence_head": True}, False),
+    ({"markov_rank": 0}, False),
+    ({}, False),
+])
+def test_dflash_headless_aux_and_worker_guards_agree(fields, accepted):
+    import textwrap
+
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    for path in (
+        "python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_config.py",
+    ):
+        chunk = patch.split(f"diff --git a/{path} b/{path}\n", 1)[1].split("\ndiff --git ", 1)[0]
+        added = [line[1:] for line in chunk.splitlines() if line.startswith("+") and not line.startswith("+++")]
+        start = next(i for i, line in enumerate(added) if "plain_dflash = (" in line)
+        stop = next(i for i in range(start, len(added)) if added[i].lstrip().startswith("if not "))
+        lines = added[start:stop + 1]
+        indent = len(lines[-1]) - len(lines[-1].lstrip())
+        code = textwrap.dedent("\n".join(lines + [" " * (indent + 4) + "raise ValueError('missing Markov heads')"]))
+        config = SimpleNamespace(**fields)
+        parsed = SimpleNamespace(require_markov=lambda: fields.get("markov_rank", 0) > 0)
+        namespace = {
+            "draft_model_config": SimpleNamespace(hf_config=config),
+            "draft_hf_config": config, "dspark_draft_config": parsed, "draft_config": parsed,
+        }
+        if accepted:
+            exec(compile(code, path, "exec"), namespace)
+        else:
+            with pytest.raises(ValueError, match="missing Markov heads"):
+                exec(compile(code, path, "exec"), namespace)
+
+
 def test_sglang_terminal_hook_preserves_abort_identity():
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff")
     lines = patch.read_text().splitlines()
