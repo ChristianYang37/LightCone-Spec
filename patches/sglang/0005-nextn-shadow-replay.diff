@@ -1541,6 +1541,54 @@ index accb6bc3..49ac2d23 100644
  
          background_tasks = BackgroundTasks()
          background_tasks.add_task(abort_request)
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -445,40 +445,44 @@
+ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
+     """Width of the target hidden states fed into the draft model.
+ 
+     This is the single source of truth and is derived entirely from config: for
+     EAGLE3 aux mode the draft consumes `num_aux` concatenated target layers
+     (each `target_hidden_size` wide); every other arch consumes the per-layer
+     `spec_hidden_size`.
+ 
+     Do NOT read this off a draft projection's `in_features` (e.g. an `fc`
+     layer): that width is arch-specific.
+ 
+     Note: read entirely from the *draft* `model_runner`'s config. The non-aux
+     branch assumes the draft's `spec_hidden_size` equals the target hidden width
+     fed to the draft (true for standard EAGLE, where the draft mirrors the
+     target hidden size); aux mode reads the explicit `target_hidden_size`.
+     """
+     model_config = model_runner.model_config
+     hf_config = model_config.hf_config
+     eagle_config = getattr(hf_config, "eagle_config", None) or {}
+     get_eagle_config = (
+         eagle_config.get
+         if isinstance(eagle_config, dict)
+         else lambda key, default=None: getattr(eagle_config, key, default)
+     )
+     use_aux = get_eagle_config("use_aux_hidden_state", True)
+     spec_algorithm = model_runner.spec_algorithm
+ 
+     if not (spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux):
+         return model_config.spec_hidden_size
+ 
+     target_hidden = getattr(hf_config, "target_hidden_size", None)
+     if target_hidden is None:
+         target_hidden = model_config.hidden_size
+     num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+     if num_aux is None:
+         layer_ids = get_eagle_config("eagle_aux_hidden_state_layer_ids", None)
+         if layer_ids is None:
+             layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
++        if layer_ids is None:
++            # DeepSpec's trained feature layers use the same top-level field
++            # already consumed by the target capture resolver.
++            layer_ids = getattr(hf_config, "target_layer_ids", None)
+         num_aux = len(layer_ids) if layer_ids else 3
+     return target_hidden * num_aux
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
 index 37566da4..16087355 100644
 --- a/python/sglang/srt/configs/model_config.py

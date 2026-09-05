@@ -2369,6 +2369,49 @@ def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
     assert "restore SGLang and reapply patches" in run.stderr
 
 
+def test_deepspec_eagle_graph_width_uses_trained_feature_layers():
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    section = patch.split(
+        "diff --git a/python/sglang/srt/speculative/eagle_utils.py ", 1
+    )[1].split("\ndiff --git ", 1)[0].split("\n@@ ", 1)[1]
+    source = "\n".join(
+        line[1:] for line in section.splitlines()[1:] if line.startswith(("+", " "))
+    )
+    namespace = {"ModelRunner": object}
+    exec(source, namespace)
+    width = namespace["get_draft_input_from_target_hidden_dim"]
+
+    def runner(hidden, **fields):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(**fields), hidden_size=hidden, spec_hidden_size=hidden,
+            ),
+            spec_algorithm=SimpleNamespace(is_eagle3=lambda: True),
+        )
+
+    for hidden, layers in (
+        (3840, [5, 17, 29, 41, 46]),
+        (2560, [1, 9, 17, 25, 33]),
+        (4096, [1, 9, 17, 25, 33]),
+        (5120, [1, 10, 19, 28, 37]),
+    ):
+        resolved = width(runner(hidden, target_layer_ids=layers))
+        assert resolved == hidden * len(layers)
+        # The same buffer width is used by both draft-extend and prefill graphs.
+        features = torch.zeros(8, resolved)
+        projection = torch.ones(2, hidden * len(layers))
+        assert torch.nn.functional.linear(features, projection).shape == (8, 2)
+    assert width(runner(3840)) == 3840 * 3  # Historical EAGLE defaults unchanged.
+    assert width(runner(3840, target_hidden_size=4096, target_layer_ids=[1, 2])) == 8192
+    assert width(runner(3840, num_aux_hidden_states=2, target_layer_ids=[1] * 5)) == 7680
+    assert width(runner(3840, eagle_aux_hidden_state_layer_ids=[1, 2], target_layer_ids=[1] * 5)) == 7680
+    assert width(runner(3840, eagle_config={"eagle_aux_hidden_state_layer_ids": [1]}, target_layer_ids=[1] * 5)) == 3840
+    assert width(runner(3840, eagle_config={"use_aux_hidden_state": False}, target_layer_ids=[1] * 5)) == 3840
+    non_eagle = runner(3840, target_layer_ids=[1] * 5)
+    non_eagle.spec_algorithm = None
+    assert width(non_eagle) == 3840
+
+
 def test_gemma_draft_allocator_preserves_strict_checkpoint_window():
     import textwrap
 
