@@ -3240,3 +3240,72 @@ diff --git a/python/sglang/srt/entrypoints/openai/serving_tokenize.py b/python/s
  
              if request.messages is not None:
                  token_ids = self._tokenize_chat_request(request)
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -331,6 +331,29 @@
+         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+ 
+ 
++def _dflash_draft_kv_bytes_per_token(kvc) -> int:
++    """Budget the full-capacity draft pool using its own, TP-local geometry."""
++    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
++        return 0
++    from sglang.srt.configs.model_config import ModelConfig
++
++    draft = ModelConfig.from_server_args(
++        kvc.server_args,
++        model_path=kvc.server_args.speculative_draft_model_path,
++        model_revision=kvc.server_args.speculative_draft_model_revision,
++        is_draft_model=True,
++    )
++    elements = (
++        int(kvc.spec_aux_config.dflash_draft_num_layers)
++        * draft.get_num_kv_heads(get_parallel().attn_tp_size)
++        * (draft.head_dim + draft.v_head_dim)
++    )
++    size = elements * torch._utils._element_size(kvc.kv_cache_dtype)
++    if get_model().kv_cache_dtype == "mxfp8":
++        size += elements // 32
++    return size
++
++
+ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
+     """Configurator for hybrid sliding window attention models (Gemma2, Command-R, MiMo).
+ 
+@@ -406,6 +429,11 @@
+                 self._draft_swa_full_layers_num = banded_depths
+                 self._draft_full_layers_num = draft_layers - banded_depths
+ 
++        # DFlash/DSpark allocate a separate full-capacity MHA draft pool,
++        # even when the target uses SWA. Its heads/dimensions need not match
++        # the target's, and it is not bounded by the target's SWA token cap.
++        self._dflash_draft_per_token = _dflash_draft_kv_bytes_per_token(kvc)
++
+         # Bytes per token of max_total_num_tokens.
+         #
+         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
+@@ -418,6 +446,7 @@
+         if self._full_layers_num == 0:
+             self._cell_size = (
+                 self._swa_per_token * self._swa_layers_num
++                + self._dflash_draft_per_token
+                 + self._full_per_token * self._draft_full_layers_num
+                 + self._swa_per_token * self._draft_swa_full_layers_num
+             )
+@@ -425,6 +454,7 @@
+             self._cell_size = (
+                 self._full_per_token
+                 * (self._full_layers_num + self._draft_full_layers_num)
++                + self._dflash_draft_per_token
+                 + self._swa_per_token * self._draft_swa_full_layers_num
+                 + self._swa_full_tokens_ratio
+                 * self._swa_per_token
+@@ -562,6 +592,7 @@
+         fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
+         full_cell_size = (
+             self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
++            + self._dflash_draft_per_token
+             + self._swa_per_token * self._draft_swa_full_layers_num
+         )
+         full_tokens = (

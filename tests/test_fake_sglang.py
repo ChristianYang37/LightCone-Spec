@@ -3059,3 +3059,66 @@ def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     )
     torch.testing.assert_close(proposal.gradient_norms, torch.tensor([9.0]))
     torch.testing.assert_close(proposal.first_moments[0], torch.tensor([1 / 30]))
+
+
+@pytest.mark.parametrize(
+    "tp,heads,dtype",
+    [(1, 8, torch.bfloat16), (2, 8, torch.bfloat16), (2, 1, torch.bfloat16), (2, 8, torch.uint8)],
+)
+def test_hybrid_swa_dflash_budget_uses_draft_geometry(monkeypatch, tp, heads, dtype):
+    import types
+
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    section = patch.split("diff --git a/python/sglang/srt/model_executor/pool_configurator.py", 1)[
+        1
+    ]
+    added = "\n".join(
+        line[1:]
+        for line in section.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    function = added.split("# DFlash/DSpark allocate", 1)[0].rstrip()
+    namespace = {
+        "torch": torch,
+        "get_parallel": lambda: SimpleNamespace(attn_tp_size=tp),
+        "get_model": lambda: SimpleNamespace(kv_cache_dtype="auto"),
+    }
+    calls = []
+    draft = SimpleNamespace(
+        head_dim=128, v_head_dim=256, get_num_kv_heads=lambda n: max(1, heads // n)
+    )
+    module = types.ModuleType("sglang.srt.configs.model_config")
+
+    def load(args, **kwargs):
+        calls.append(kwargs)
+        return draft
+
+    module.ModelConfig = SimpleNamespace(from_server_args=load)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(function, "draft-kv-budget", "exec"), namespace)
+    budget = namespace["_dflash_draft_kv_bytes_per_token"]
+    kvc = SimpleNamespace(
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
+        spec_aux_config=SimpleNamespace(dflash_draft_num_layers=5),
+        server_args=SimpleNamespace(
+            speculative_draft_model_path="official-draft", speculative_draft_model_revision="fixed"
+        ),
+        kv_cache_dtype=dtype,
+    )
+    expected = 5 * max(1, heads // tp) * (128 + 256) * torch.tensor([], dtype=dtype).element_size()
+    assert budget(kvc) == expected
+    assert calls == [
+        {"model_path": "official-draft", "model_revision": "fixed", "is_draft_model": True}
+    ]
+    # Target geometry is deliberately absent: draft cost cannot be inferred
+    # from target full/SWA layers or scaled with the target's token ratio.
+    kvc.is_draft_worker = True
+    assert budget(kvc) == 0  # no double charge when allocating draft itself
+    kvc.is_draft_worker = False
+    kvc.spec_algorithm.is_dflash_family = lambda: False
+    assert budget(kvc) == 0  # Static, EAGLE and NEXTN keep their existing budget
+    assert len(calls) == 1
+    # All-SWA, hybrid ratio, and fixed-cap sizing each include it once.
+    assert section.count("+                + self._dflash_draft_per_token") == 2
+    assert section.count("+            + self._dflash_draft_per_token") == 1
