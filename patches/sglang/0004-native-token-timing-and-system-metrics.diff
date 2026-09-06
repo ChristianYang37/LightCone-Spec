@@ -140,7 +140,7 @@ index 861c13fb4e..e906f2e02a 100644
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4029,6 +4031,112 @@ class Scheduler(
+@@ -4029,6 +4031,116 @@ class Scheduler(
              if info_record is not None:
                  ret["dspark_info_record"] = info_record
  
@@ -249,6 +249,10 @@ index 861c13fb4e..e906f2e02a 100644
 +            for name in ("greedy_token_checks", "greedy_token_mismatches"):
 +                speed[name] = int(verification_counters.get(name, 0))
 +            ret["speed_study_metrics"] = speed
++            if (speed.get("memory_budget") or {}).get("policy") == "method_peak_v1":
++                from lightcone_spec.nextn import tp_memory_snapshot
++
++                speed["tp_memory_metrics"] = tp_memory_snapshot(speed, online, self.tp_group)
 +
          # These fields are not msgpack-serializable (a config object and a bound
          # signal handler); no reader consumes them.

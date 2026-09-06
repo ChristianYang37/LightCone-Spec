@@ -11,6 +11,27 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+
+def tp_memory_snapshot(speed: dict, online: dict, group) -> list[dict]:
+    """Gather compact TP-local evidence at the read-only server-info boundary.
+
+    The HTTP manager returns one scheduler response per replica, not per TP
+    rank. Never copy full token telemetry into this CPU collective.
+    """
+    row = {"tp_rank": group.rank_in_group, **{
+        key: online.get(key, speed.get(key)) for key in (
+            "memory_budget", "measured_update_peak_bytes",
+            "measured_update_peak_upper_bound_bytes", "budget_violations",
+            "disabled_reason", "native_reconstruction", "exactness_violations",
+            "updates_published", "peak_hbm_bytes", "kv_token_capacity",
+        )}}
+    if group.world_size == 1:
+        return [row]
+    rows = [None] * group.world_size
+    torch.distributed.all_gather_object(rows, row, group=group.cpu_group)
+    return rows
+
+
 _TP_PARTIAL_REPLICATED = frozenset(
     {
         "layers.0.q_norm.weight",

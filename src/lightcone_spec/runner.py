@@ -435,7 +435,9 @@ def _validate_greedy_verify_counts(
 
 
 def _validate_update_memory_budget(after: dict[str, Any], output_dir: Path) -> None:
-    if after.get("budget_violations", 0):
+    tp_rows = [row for replica in after.get("rank_local", [])
+               for row in replica.get("tp_memory_metrics", [])]
+    if after.get("budget_violations", 0) or any(row.get("budget_violations", 0) for row in tp_rows):
         # The outer runtime-error handler writes a compact metrics.json. Keep
         # the measured ledger separately before that handler replaces metrics.
         _write_json(output_dir / "memory-budget-failure.json", after)

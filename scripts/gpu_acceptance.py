@@ -1347,7 +1347,10 @@ def memory_pressure(args: argparse.Namespace) -> None:
               and metrics.get("updates_published", 0) >= 2
               and not any(metrics.get(k, 0) for k in SAFETY_COUNTERS))
     native_retractions = _native_kv_retraction_count(directory)
-    ranks = metrics.get("rank_local_after", [])
+    replicas = metrics.get("rank_local_after", [])
+    ranks = [rank for replica in replicas for rank in replica.get("tp_memory_metrics", [replica])]
+    if args.case == "tp2" and (len(ranks) != 2 or {r.get("tp_rank") for r in ranks} != {0, 1}):
+        raise RuntimeError("TP2 pressure QA requires both TP-local memory records, not one replica leader")
     peak_bounds = []
     for rank in ranks:
         upper = rank.get("measured_update_peak_upper_bound_bytes")

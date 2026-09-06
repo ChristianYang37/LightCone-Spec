@@ -3128,6 +3128,35 @@ def test_gemma_frozen_prefix_replay_preserves_suffix_gradients(trainable_layers)
     assert not any(layer._forward_hooks for layer in model.layers)
 
 
+def test_tp_memory_snapshot_retains_nonleader_peak_and_rejects_violation(monkeypatch, tmp_path):
+    from lightcone_spec.nextn import tp_memory_snapshot
+    from lightcone_spec.runner import _validate_update_memory_budget
+
+    group = SimpleNamespace(rank_in_group=0, world_size=2, cpu_group=object())
+    speed = {'memory_budget': {'policy': 'method_peak_v1', 'estimated_peak_bytes': 100},
+             'budget_violations': 0, 'updates_published': 3}
+    online = {'measured_update_peak_upper_bound_bytes': 80,
+              'rounds': ['large telemetry must not be gathered']}
+
+    def gather(rows, row, **kwargs):
+        assert kwargs['group'] is group.cpu_group
+        assert 'rounds' not in row
+        rows[:] = [row, {**row, 'tp_rank': 1, 'budget_violations': 1,
+                        'measured_update_peak_upper_bound_bytes': 120}]
+
+    monkeypatch.setattr(torch.distributed, 'all_gather_object', gather)
+    rows = tp_memory_snapshot(speed, online, group)
+    assert [r['tp_rank'] for r in rows] == [0, 1]
+    assert rows[1]['measured_update_peak_upper_bound_bytes'] == 120
+    after = {'budget_violations': 0, 'rank_local': [{'tp_memory_metrics': rows}]}
+    with pytest.raises(RuntimeError, match='memory estimate exceeded'):
+        _validate_update_memory_budget(after, tmp_path)
+    assert (tmp_path/'memory-budget-failure.json').exists()
+    group.world_size = 1
+    monkeypatch.setattr(torch.distributed, 'all_gather_object', lambda *a, **k: pytest.fail('TP1 collective'))
+    assert len(tp_memory_snapshot(speed, online, group)) == 1
+
+
 def test_excluded_replay_diagnostic_preserves_inputs_and_stops_on_mismatch(monkeypatch, tmp_path):
     from lightcone_spec.replay_diagnostic import (
         capture_native_attention,
