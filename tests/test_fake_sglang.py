@@ -3238,6 +3238,73 @@ def test_disconnected_native_graph_is_runtime_failure_not_scientific_rejection()
     ]})
 
 
+def test_budget_failure_preserves_measurement_before_runtime_error(tmp_path):
+    from lightcone_spec.runner import _validate_update_memory_budget
+
+    state = {"budget_violations": 1, "rank_local": [{"memory_budget": {"estimated_peak_bytes": 30},
+                                                  "measured_update_peak_bytes": 38}]}
+    with pytest.raises(RuntimeError, match="memory estimate exceeded"):
+        _validate_update_memory_budget(state, tmp_path)
+    assert json.loads((tmp_path / "memory-budget-failure.json").read_text()) == state
+    _validate_update_memory_budget({"budget_violations": 0}, tmp_path)
+
+
+@pytest.mark.parametrize("name", ("adam", "adamw", "chronobelief"))
+@pytest.mark.parametrize("clip", (0.0, 1.0))
+def test_adam_budget_covers_live_functional_working_tensors(tmp_path, monkeypatch, name, clip):
+    import os
+    import weakref
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(["git", "apply", f"--include={relative}", str(patch.resolve())],
+                       cwd=tmp_path, check=True, capture_output=True)
+    source = ast.parse((tmp_path / relative).read_text())
+    wanted = {"_clip_fp32_gradients", "ParameterProposal", "ResidentOptimizer",
+              "estimate_functional_optimizer_scratch_bytes"}
+    namespace = {"torch": torch, "math": math, "os": os, "Sequence": Sequence,
+                 "dataclass": dataclass, "OnlineSpecOptimizer": type("NotThisOptimizer", (), {})}
+    exec(compile(ast.Module([n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+                            and n.name in wanted], []), "adam-working-memory", "exec"), namespace)
+    config = SimpleNamespace(name=name, learning_rate=1e-4, beta1=0.9, beta2=0.999,
+                             epsilon=1e-8, weight_decay=0.01, grad_clip=clip, schedule="constant")
+    optimizer = namespace["ResidentOptimizer"]((torch.zeros(96, 128), torch.zeros(64, 96)), config)
+    gradients = tuple(torch.ones_like(p) for p in optimizer.master)
+
+    class Allocations(TorchDispatchMode):
+        def __init__(self):
+            self.live = []
+            self.peak = 0
+            self.external = {t.untyped_storage().data_ptr() for t in (*optimizer.state_tensors, *gradients)}
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for tensor in tree_flatten(result)[0]:
+                if isinstance(tensor, torch.Tensor):
+                    self.live.append(weakref.ref(tensor))
+            self.live = [ref for ref in self.live if ref() is not None]
+            storage = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+                       for ref in self.live if (t := ref()) is not None}
+            self.peak = max(self.peak, sum(size for ptr, size in storage.items() if ptr not in self.external))
+            return result
+
+    with Allocations() as allocations:
+        proposal = optimizer.propose(gradients, feedback_source_version=0, safe_boundary_version=0)
+    assert all(torch.isfinite(t).all() for t in proposal.parameters)
+    estimate = namespace["estimate_functional_optimizer_scratch_bytes"]
+    master = sum(t.nbytes for t in optimizer.master)
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "fixed_reserve_v1")
+    legacy = estimate(optimizer, merge_bytes=0)
+    assert legacy == master + sum(t.nbytes for t in (*optimizer.first, *optimizer.second))
+    assert allocations.peak > legacy  # reproduce why final-candidate-only accounting fails
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "method_peak_v1")
+    assert estimate(optimizer, merge_bytes=0) >= allocations.peak
+    assert estimate(optimizer, merge_bytes=4096) == estimate(optimizer, merge_bytes=0) + 4096
+
+
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
     for patch in sorted(Path("patches/sglang").glob("*.diff")):

@@ -3720,3 +3720,27 @@ index 2d7f229..c4de6c4 100644
              "update_peak_measurement_scope": "excluded synchronized side-update allocator delta",
              "budget_violations": self.budget_violations,
              "optimizer_bytes": self.optimizer_bytes,
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -111,5 +111,19 @@ def estimate_functional_optimizer_scratch_bytes(
+ 
+     master = bytes_of(optimizer.master)
+     moments = bytes_of(optimizer.first) + bytes_of(optimizer.second)
+-    return master + moments + int(merge_bytes)
++    candidate = master + moments + int(merge_bytes)
++    if (os.environ.get("LIGHTCONE_MEMORY_BUDGET_POLICY") == "method_peak_v1"
++            and not isinstance(optimizer, OnlineSpecOptimizer)
++            and optimizer.config.name in {"adam", "adamw", "chronobelief"}):
++        # ResidentOptimizer.propose keeps clipped gradients, bias-corrected
++        # directions and denominators alive alongside the three proposal banks.
++        # Raw incoming gradients are budgeted separately by the backend.
++        clipped = master if optimizer.config.grad_clip else 0
++        residual = master if optimizer.config.name == "chronobelief" else 0
++        # The parameter comprehension additionally holds lr * direction for
++        # one tensor. Count actual TP-local layout, not model-size heuristics.
++        largest = max(value.numel() * value.element_size() for value in optimizer.master)
++        metadata = 64 * (len(optimizer.master) + 1)
++        candidate += clipped + 2 * master + residual + largest + metadata
++    return candidate
+ 

@@ -415,6 +415,14 @@ def _validate_greedy_verify_counts(
     }
 
 
+def _validate_update_memory_budget(after: dict[str, Any], output_dir: Path) -> None:
+    if after.get("budget_violations", 0):
+        # The outer runtime-error handler writes a compact metrics.json. Keep
+        # the measured ledger separately before that handler replaces metrics.
+        _write_json(output_dir / "memory-budget-failure.json", after)
+        raise RuntimeError("method_peak_v1 update memory estimate exceeded; preserve QA diagnostics")
+
+
 def _validate_native_trainable_graph(after: dict[str, Any]) -> None:
     """A broken native replay is an implementation error, not a capacity row."""
     for rank in after.get("rank_local", []):
@@ -1956,8 +1964,7 @@ def _execute_cell(
                 else None
             )
             kv_capacity = after.get("kv_token_capacity")
-            if after.get("budget_violations", 0):
-                raise RuntimeError("method_peak_v1 update memory estimate exceeded; preserve QA diagnostics")
+            _validate_update_memory_budget(after, output_dir)
             native_intervals = [value for result in results for value in result.inter_token_ms]
             native_itl = float(np.quantile(native_intervals, 0.99)) if native_intervals else 0.0
             if peak_hbm <= 0 or not isinstance(kv_capacity, (int, float)) or kv_capacity <= 0:
