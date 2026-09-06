@@ -3609,3 +3609,102 @@ index b2d296b..71b396d 100644
                  teacher_logits = strided_teacher_rows(
                      logits_output.next_token_logits, bs, self.gamma, microbatch
                  )
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d7edb3a..50abbe8 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4121,6 +4121,8 @@ class Scheduler(
+                 "trainable_parameters": online.get("trainable_parameters", 0),
+                 "memory_ledger": online.get("memory_ledger", {}),
+                 "measured_update_peak_bytes": online.get("measured_update_peak_bytes"),
++                "measured_update_peak_upper_bound_bytes": online.get("measured_update_peak_upper_bound_bytes"),
++                "update_peak_upper_bound_scope": online.get("update_peak_upper_bound_scope"),
+                 "update_peak_measurement_scope": online.get("update_peak_measurement_scope"),
+                 "budget_violations": online.get("budget_violations", 0),
+                 "parameter_layout": online.get("parameter_layout"),
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+index 2d7f229..c4de6c4 100644
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -1317,6 +1317,9 @@ class OnlineCohortRuntime:
+         self.resident_bytes = 0
+         self.peak_bytes = 0
+         self.measured_update_peak_bytes = None
++        self.measured_update_peak_upper_bound_bytes = None
++        self._qa_memory_baseline = None
++        self._qa_allocator_peak = 0
+         self.budget_violations = 0
+         self.optimizer_bytes = 0
+         self.trainable_parameters = 0
+@@ -1415,6 +1418,17 @@ class OnlineCohortRuntime:
+         self.parameter_layout = layout
+         return projection_identity
+ 
++    def _begin_memory_probe(self) -> None:
++        # Capture before proposal/replay tensors exist, not only before backward.
++        # The upper bound also counts native inference temporaries; it is not an
++        # exact allocation attribution to the adapter. Never enabled in formal runs.
++        if (os.environ.get("LIGHTCONE_MEMORY_BUDGET_QA") == "1"
++                and self._qa_memory_baseline is None):
++            torch.cuda.synchronize(self.device)
++            self._qa_memory_baseline = torch.cuda.memory_allocated(self.device)
++            self._qa_allocator_peak = self._qa_memory_baseline
++            torch.cuda.reset_peak_memory_stats(self.device)
++
+     @contextmanager
+     def side_update(
+         self, source_tensors: Sequence[torch.Tensor]
+@@ -1423,8 +1437,12 @@ class OnlineCohortRuntime:
+         # must never alter the formal async benchmark path.
+         memory_qa = os.environ.get("LIGHTCONE_MEMORY_BUDGET_QA") == "1"
+         if memory_qa:
++            self._begin_memory_probe()
+             torch.cuda.synchronize(self.device)
+             memory_before = torch.cuda.memory_allocated(self.device)
++            self._qa_allocator_peak = max(
++                self._qa_allocator_peak, torch.cuda.max_memory_allocated(self.device)
++            )
+             torch.cuda.reset_peak_memory_stats(self.device)
+         main = torch.cuda.current_stream(self.device)
+         self.main_ready.record(main)
+@@ -1437,6 +1455,12 @@ class OnlineCohortRuntime:
+             finally:
+                 if memory_qa:
+                     torch.cuda.synchronize(self.device)
++                    self._qa_allocator_peak = max(
++                        self._qa_allocator_peak, torch.cuda.max_memory_allocated(self.device)
++                    )
++                    self.measured_update_peak_upper_bound_bytes = self.resident_bytes + max(
++                        self._qa_allocator_peak - self._qa_memory_baseline, 0
++                    )
+                     observed = self.resident_bytes + max(
+                         torch.cuda.max_memory_allocated(self.device) - memory_before, 0
+                     )
+@@ -1930,6 +1954,7 @@ class OnlineCohortRuntime:
+         *,
+         allow_publish: bool = True,
+     ) -> int:
++        self._begin_memory_probe()
+         request_ids = tuple(request_ids)
+         if not request_ids:
+             raise ValueError("round telemetry requires a non-empty request batch")
+@@ -2151,6 +2176,9 @@ class OnlineCohortRuntime:
+ 
+     def reset(self) -> None:
+         self.side_stream.synchronize()
++        self._qa_memory_baseline = None
++        self._qa_allocator_peak = 0
++        self.measured_update_peak_upper_bound_bytes = None
+         self.epoch += 1
+         self.active_request_id = None
+         self.active_version = 0
+@@ -2480,6 +2508,8 @@ class OnlineCohortRuntime:
+             "peak_bytes": self.peak_bytes,
+             "peak_hbm_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+             "measured_update_peak_bytes": self.measured_update_peak_bytes,
++            "measured_update_peak_upper_bound_bytes": self.measured_update_peak_upper_bound_bytes,
++            "update_peak_upper_bound_scope": "excluded pre-proposal to update completion; includes native inference temporaries",
+             "update_peak_measurement_scope": "excluded synchronized side-update allocator delta",
+             "budget_violations": self.budget_violations,
+             "optimizer_bytes": self.optimizer_bytes,

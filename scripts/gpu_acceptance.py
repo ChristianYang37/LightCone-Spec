@@ -1347,6 +1347,17 @@ def memory_pressure(args: argparse.Namespace) -> None:
               and metrics.get("updates_published", 0) >= 2
               and not any(metrics.get(k, 0) for k in SAFETY_COUNTERS))
     native_retractions = _native_kv_retraction_count(directory)
+    ranks = metrics.get("rank_local_after", [])
+    peak_bounds = []
+    for rank in ranks:
+        upper = rank.get("measured_update_peak_upper_bound_bytes")
+        estimate = (rank.get("memory_budget") or {}).get("estimated_peak_bytes")
+        peak_bounds.append(isinstance(upper, (int, float)) and isinstance(estimate, (int, float))
+                           and 0 < upper <= estimate)
+    # This conservative whole-round bound also contains native inference
+    # temporaries. A value above the estimate needs attribution review, not
+    # an automatic claim that adaptation alone exceeded its budget.
+    passed = passed and bool(peak_bounds) and all(peak_bounds)
     if args.case == "retraction":
         passed = passed and native_retractions > 0
     report = {"case": args.case, "passed": passed, "attempt_dir": str(directory),
@@ -1354,6 +1365,8 @@ def memory_pressure(args: argparse.Namespace) -> None:
               "logical_prefix_retractions": metrics.get("retractions"),
               "memory_budget": metrics.get("memory_budget"),
               "measured_update_peak_bytes": metrics.get("measured_update_peak_bytes"),
+              "measured_update_peak_upper_bound_bytes": metrics.get("measured_update_peak_upper_bound_bytes"),
+              "whole_round_upper_bounds_within_estimates": peak_bounds,
               "rank_local": metrics.get("rank_local_after"),
               "formal_benchmark": False}
     _write(output / f"{args.case}-acceptance.json", report)
@@ -1368,7 +1381,7 @@ def main() -> None:
     pressure = commands.add_parser("memory-pressure")
     pressure.add_argument("--config", type=Path, required=True)
     pressure.add_argument("--output", type=Path, required=True)
-    pressure.add_argument("--case", choices=("long_tts", "long_lightcone", "retraction", "tp2"), required=True)
+    pressure.add_argument("--case", choices=("long_tts", "long_lightcone", "long_gemma_lightcone", "retraction", "tp2"), required=True)
     pressure.set_defaults(handler=memory_pressure)
     for name, handler, default_tokens in (
         ("benchmark", benchmark, 4096),

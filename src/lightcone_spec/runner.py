@@ -1984,6 +1984,8 @@ def _execute_cell(
                 "memory_budget_policy": memory_budget_policy(runtime_job),
                 "memory_budget": after.get("memory_budget"),
                 "measured_update_peak_bytes": after.get("measured_update_peak_bytes"),
+                "measured_update_peak_upper_bound_bytes": after.get("measured_update_peak_upper_bound_bytes"),
+                "update_peak_upper_bound_scope": after.get("update_peak_upper_bound_scope"),
                 "update_peak_measurement_scope": after.get("update_peak_measurement_scope"),
                 "retractions": after.get("retractions", 0) - before.get("retractions", 0),
                 "session_reused": session_reused,

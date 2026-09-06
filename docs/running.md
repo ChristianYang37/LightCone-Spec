@@ -151,17 +151,21 @@ fixed pool; it does not release CUDA memory or permit silent load/context change
 Attempts record policy, ledger, cap/headroom/slack, KV capacities and retractions.
 Session reuse, paired statistics and ETA isolate the two policies.
 
-Excluded adaptive QA synchronizes and samples allocator peaks around side updates;
-this measures incremental side-update allocation above the pre-update baseline,
-not a hardware-wide attribution of all inference allocations. The formal async
-path does not enable this instrumentation. Long-context and retraction acceptance
+Excluded adaptive QA reports both the side-update allocator delta and an upper
+bound measured from before the first proposal to update completion, including
+capture/replay and native inference temporaries. Neither is a hardware-wide
+attribution of allocations to one method. Stress acceptance requires the whole-
+round upper bound to fit the estimated update budget on every rank; an excessive
+upper bound needs attribution review, not an automatic claim that adaptation
+alone exceeded its budget. The formal async path does not enable this
+instrumentation. Long-context and retraction acceptance
 remain required before coverage acceptance, even if short QA passes. Estimated
 versus measured values and any unmeasured components must be reported separately.
 New-policy ETA cannot borrow fixed-reserve timings; missing strata keep the full
 ETA `UNMEASURED`, with a separately labelled priced subset.
 
 Run `scripts/gpu_acceptance.py memory-pressure` only in a drained excluded window,
-with `--case long_tts`, `long_lightcone`, `tp2`, or `retraction`. The first three
+with `--case long_tts`, `long_lightcone`, `long_gemma_lightcone`, `tp2`, or `retraction`. The first four
 retain two complete 32K-output requests. The retraction case retains eight c8
 requests with 8K outputs while capping its diagnostic KV pool at 41,024 slots;
 the minimum full-context guard still applies. It must observe actual native KV

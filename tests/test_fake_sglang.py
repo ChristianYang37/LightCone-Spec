@@ -110,6 +110,48 @@ def test_pressure_acceptance_reads_archived_native_retraction_log(tmp_path):
     assert module._native_kv_retraction_count(tmp_path) == 3
 
 
+def test_update_memory_upper_bound_includes_pre_backward_capture(tmp_path, monkeypatch):
+    import os
+    import types
+    from contextlib import contextmanager, nullcontext
+
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(["git", "apply", f"--include={relative}", str(patch.resolve())],
+                       cwd=tmp_path, check=True, capture_output=True)
+    tree = ast.parse((tmp_path / relative).read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "OnlineCohortRuntime")
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+               and n.name in {"_begin_memory_probe", "side_update"}]
+    fake = SimpleNamespace(allocated=100, peak=100, resets=0)
+    def reset_peak(device):
+        fake.peak = fake.allocated
+        fake.resets += 1
+    cuda = SimpleNamespace(synchronize=lambda device: None,
+                           memory_allocated=lambda device: fake.allocated,
+                           max_memory_allocated=lambda device: fake.peak,
+                           reset_peak_memory_stats=reset_peak,
+                           current_stream=lambda device: None, stream=lambda value: nullcontext())
+    namespace = {"torch": SimpleNamespace(cuda=cuda), "os": os, "contextmanager": contextmanager}
+    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *methods], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "memory-probe", "exec"), namespace)
+    runtime = SimpleNamespace(device=0, _qa_memory_baseline=None, _qa_allocator_peak=0,
+                              resident_bytes=10, peak_bytes=200, measured_update_peak_bytes=None,
+                              main_ready=SimpleNamespace(record=lambda stream: None),
+                              side_stream=SimpleNamespace(wait_event=lambda event: None))
+    runtime._begin_memory_probe = types.MethodType(namespace["_begin_memory_probe"], runtime)
+    monkeypatch.delenv("LIGHTCONE_MEMORY_BUDGET_QA", raising=False)
+    runtime._begin_memory_probe()
+    assert fake.resets == 0 and runtime._qa_memory_baseline is None
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_QA", "1")
+    runtime._begin_memory_probe()
+    fake.allocated, fake.peak = 180, 200
+    with namespace["side_update"](runtime, ()):
+        fake.allocated = fake.peak = 220
+    assert runtime.measured_update_peak_bytes == 50
+    assert runtime.measured_update_peak_upper_bound_bytes == 130
+
+
 def _memory_budget_functions():
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
     section = patch.split("diff --git a/python/sglang/srt/speculative/adaptation_memory_budget.py", 1)[1]

@@ -167,12 +167,12 @@ def gpu_acceptance_jobs() -> tuple[Job, ...]:
 
 def memory_pressure_job(case: str) -> Job:
     """Excluded stress cases, separate from the 41 short acceptance cases."""
-    if case not in {"long_tts", "long_lightcone", "retraction", "tp2"}:
+    if case not in {"long_tts", "long_lightcone", "long_gemma_lightcone", "retraction", "tp2"}:
         raise ValueError(case)
     method = "tts" if case == "long_tts" else "lightcone"
+    model = "Gemma4-12B" if case == "long_gemma_lightcone" else "Qwen/Qwen3-8B"
     source = next(j for j in gpu_acceptance_jobs()
-                  if j.model == "Qwen/Qwen3-8B" and j.backend == "DFLASH"
-                  and j.method == method and j.parameters.get("qa_phase") == "qwen")
+                  if j.model == model and j.backend == "DFLASH" and j.method == method)
     return replace(
         source, job_id=f"qa-memory-{case}",
         load="c8" if case == "retraction" else "c1",
