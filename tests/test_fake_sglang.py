@@ -253,7 +253,7 @@ def test_execution_budget_preserves_inputs_independent_of_dispatcher(
 
 @pytest.mark.parametrize("regime", ["source_native_prompt", "mechanism_native_prompt"])
 def test_native_panel_inputs_extract_token_ids_from_batch_encoding(tmp_path, monkeypatch, regime):
-    from transformers import AutoTokenizer, BatchEncoding
+    from collections import UserDict
 
     records = ({"prompt": "first"}, {"prompt": "second"})
     calls = []
@@ -264,10 +264,13 @@ def test_native_panel_inputs_extract_token_ids_from_batch_encoding(tmp_path, mon
             "tokenize": True, "return_dict": True,
             "add_generation_prompt": True, "enable_thinking": False,
         }
-        return BatchEncoding({"input_ids": [11, 22, len(calls)], "attention_mask": [1, 1, 1]})
+        # BatchEncoding has mapping iteration semantics. Keep the CPU test
+        # independent of the GPU host's optional Transformers installation.
+        return UserDict({"input_ids": [11, 22, len(calls)], "attention_mask": [1, 1, 1]})
 
-    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **k:
-                        SimpleNamespace(apply_chat_template=template))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a, **k:
+            SimpleNamespace(apply_chat_template=template))))
     monkeypatch.setattr("lightcone_spec.runner.load_source_prompt_records", lambda *a, **k: records)
     monkeypatch.setattr("lightcone_spec.runner.load_prompt_records", lambda *a, **k: records)
     config = ExperimentConfig(
