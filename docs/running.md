@@ -133,3 +133,29 @@ priced subset is explicitly not a total ETA. The earlier priority-v2 estimate
 excludes the new source panels and must not be presented as their finish time.
 Summaries and statistical reducers both consume replacement-filtered logical
 cells, including completed siblings beneath superseded bundled parents.
+# Coverage-only memory budget (method_peak_v1)
+
+Only the new 1,296 source cells, 48 mechanism cells and coverage compatibility
+replacements use `method_peak_v1`. Old pending jobs and started paired groups
+retain `fixed_reserve_v1`; immutable job records and raw attempts are not rewritten.
+The 52 GiB adaptation setting is a peak ceiling for the new policy, not an empty
+allocation. Before KV allocation, the constructed TP-local adapter validates its
+resident tensors and scratch categories. Additional headroom is
+`max(estimated_update_peak - resident, 0)`; KV receives free memory minus this
+headroom and the unchanged runtime slack. Both TP ranks must fit.
+
+Unknown adaptive layouts stop; Static alone has zero update reserve. Full/SWA
+and draft pools must hold one complete registered maximum-context request plus
+verification slots. Native prefix eviction/retraction reuses slots within the
+fixed pool; it does not release CUDA memory or permit silent load/context changes.
+Attempts record policy, ledger, cap/headroom/slack, KV capacities and retractions.
+Session reuse, paired statistics and ETA isolate the two policies.
+
+Excluded adaptive QA synchronizes and samples allocator peaks around side updates;
+this measures incremental side-update allocation above the pre-update baseline,
+not a hardware-wide attribution of all inference allocations. The formal async
+path does not enable this instrumentation. Long-context and retraction acceptance
+remain required before coverage acceptance, even if short QA passes. Estimated
+versus measured values and any unmeasured components must be reported separately.
+New-policy ETA cannot borrow fixed-reserve timings; missing strata keep the full
+ETA `UNMEASURED`, with a separately labelled priced subset.

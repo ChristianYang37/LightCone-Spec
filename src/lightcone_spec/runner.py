@@ -84,6 +84,7 @@ from .protocol import (
     e2_candidates,
     materialize,
     mechanism_jobs,
+    memory_budget_policy,
     source_coverage_jobs,
     uses_formal_adaptation_stride,
 )
@@ -1548,6 +1549,7 @@ def _execute_cell(
                 },
             )
             raw_config = runtime_job.to_dict()
+            raw_config["memory_budget_policy"] = memory_budget_policy(runtime_job)
             raw_config["parameters"]["stimulus_id"] = _stimulus_id(runtime_job)
             raw_config["adaptation"] = adaptation_payload(runtime_job, selection)
             _write_json(output_dir / "config.json", raw_config)
@@ -1941,6 +1943,8 @@ def _execute_cell(
                 else None
             )
             kv_capacity = after.get("kv_token_capacity")
+            if after.get("budget_violations", 0):
+                raise RuntimeError("method_peak_v1 update memory estimate exceeded; preserve QA diagnostics")
             native_intervals = [value for result in results for value in result.inter_token_ms]
             native_itl = float(np.quantile(native_intervals, 0.99)) if native_intervals else 0.0
             if peak_hbm <= 0 or not isinstance(kv_capacity, (int, float)) or kv_capacity <= 0:
@@ -1967,6 +1971,11 @@ def _execute_cell(
                 "effective_load": f"c{dispatcher_concurrency}",
                 "metric_semantics": "per_request_native_v2",
                 "session_startup_seconds": session_startup_seconds,
+                "memory_budget_policy": memory_budget_policy(runtime_job),
+                "memory_budget": after.get("memory_budget"),
+                "measured_update_peak_bytes": after.get("measured_update_peak_bytes"),
+                "update_peak_measurement_scope": after.get("update_peak_measurement_scope"),
+                "retractions": after.get("retractions", 0) - before.get("retractions", 0),
                 "session_reused": session_reused,
                 "peak_hbm_bytes": peak_hbm,
                 "allocated_peak_hbm_bytes": peak_hbm,

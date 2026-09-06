@@ -68,6 +68,72 @@ from lightcone_spec.server import (
 from lightcone_spec.state import StateStore
 
 
+def test_coverage_memory_policy_does_not_leak_into_legacy_sessions():
+    from lightcone_spec.protocol import memory_budget_policy, source_coverage_jobs
+    job = materialize("E0-tune")[0]
+    coverage = replace(job, parameters={**job.parameters, "coverage_runtime": True})
+    assert memory_budget_policy(job) == "fixed_reserve_v1"
+    assert memory_budget_policy(coverage) == "method_peak_v1"
+    assert memory_budget_policy(source_coverage_jobs()[0]) == "method_peak_v1"
+    assert server_session_key(job) != server_session_key(coverage)
+    assert adaptation_payload(job) == adaptation_payload(coverage)
+
+
+def _memory_budget_functions():
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    section = patch.split("diff --git a/python/sglang/srt/speculative/adaptation_memory_budget.py", 1)[1]
+    section = section.split("diff --git ", 1)[0]
+    source = "\n".join(line[1:] for line in section.splitlines()
+                       if line.startswith("+") and not line.startswith("+++"))
+    namespace = {}
+    exec(compile(source, "adaptation-memory-budget", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("resident,scratch", [(18 << 30, 12 << 30), (128 << 20, 3 << 30)])
+@pytest.mark.parametrize("tp", [1, 2])
+def test_method_peak_pre_kv_uses_local_layout_once(monkeypatch, resident, scratch, tp):
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "method_peak_v1")
+    resident, scratch = resident // tp, scratch // tp
+    args = SimpleNamespace(speculative_adaptation_config="adaptation.json",
+                           speculative_adaptation_reserve_mb=53248,
+                           _speculative_adaptation_resident_bytes=resident,
+                           _speculative_adaptation_memory_ledger={
+                               "resident_bytes": resident, "peak_bytes": resident + scratch})
+    budget = _memory_budget_functions()["adaptation_budget"]
+    assert budget(args)["headroom_bytes"] == scratch
+    args._speculative_adaptation_memory_ledger["resident_bytes"] += 1
+    with pytest.raises(RuntimeError, match="disagree"):
+        budget(args)
+    args._speculative_adaptation_memory_ledger["resident_bytes"] = resident
+    args._speculative_adaptation_memory_ledger["peak_bytes"] = 53 << 30
+    with pytest.raises(RuntimeError, match="exceeds"):
+        budget(args)
+    args._speculative_adaptation_memory_ledger = None
+    with pytest.raises(RuntimeError, match="before KV"):
+        budget(args)
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "fixed_reserve_v1")
+    assert budget(args)["headroom_bytes"] == (52 << 30) - resident
+
+
+def test_method_peak_static_and_full_swa_minimum(monkeypatch):
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "method_peak_v1")
+    functions = _memory_budget_functions()
+    assert functions["adaptation_budget"](SimpleNamespace())["headroom_bytes"] == 0
+    validate = functions["validate_minimum_kv"]
+    config = SimpleNamespace(max_total_num_tokens=41024, full_max_total_num_tokens=41024,
+                             swa_max_total_num_tokens=1088)
+    kwargs = dict(context=40960, speculative_tokens=8, page_size=64, window=1024)
+    assert validate(config, **kwargs)["minimum_full_tokens"] == 41024
+    config.swa_max_total_num_tokens = 1024
+    with pytest.raises(ValueError, match="capacity infeasible"):
+        validate(config, **kwargs)
+    config.swa_max_total_num_tokens = 1088
+    config.full_max_total_num_tokens = 40960
+    with pytest.raises(ValueError, match="capacity infeasible"):
+        validate(config, **kwargs)
+
+
 @pytest.mark.parametrize("load,method,workload,node,count", [
     ("c1", "static", "ordinary", "E0-final", 16),
     ("c16", "lightcone", "ordinary", "E0-final", 16),
@@ -3071,7 +3137,7 @@ def test_hybrid_swa_dflash_budget_uses_draft_geometry(monkeypatch, tp, heads, dt
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
     section = patch.split("diff --git a/python/sglang/srt/model_executor/pool_configurator.py", 1)[
         1
-    ]
+    ].split("diff --git ", 1)[0]
     added = "\n".join(
         line[1:]
         for line in section.splitlines()

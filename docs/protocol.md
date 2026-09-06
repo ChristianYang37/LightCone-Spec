@@ -227,3 +227,14 @@ bandwidth remain `N/A`; they are not inferred from the proxy.
 Formal evidence is compressed numeric request/cycle data, GPU telemetry,
 configuration, metrics, SQLite state, and source attempt directories. Generated
 text and token trajectories appear only in the excluded implementation smoke.
+# Coverage memory-policy boundary
+
+The additional 1,296 source and 48 mechanism leaves and their compatibility
+replacements use `method_peak_v1`: the unchanged adaptation reserve is an upper
+bound on TP-local update peak, with only nonresident headroom withheld from KV.
+Existing experiments retain `fixed_reserve_v1`. No request, stride, output length,
+method recipe, safety tolerance, paired-block or topology changes accompany this
+policy. Comparison groups share a policy, not necessarily identical KV capacities;
+report method-dependent KV capacity and update costs. Old raw evidence remains
+immutable and cannot price or pair with the new budget strata. GPU acceptance
+and new-policy performance remain `UNMEASURED` until actual validated execution.

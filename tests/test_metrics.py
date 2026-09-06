@@ -39,11 +39,15 @@ def test_coverage_eta_scales_request_budget_without_reusing_unknown_output_costs
 
     job = source_coverage_jobs()[0]
     evidence = [(job, {"hard_feasible": True, "duration_seconds": 100.,
-                       "request_count": 10, "session_startup_seconds": 5.})]
+                       "request_count": 10, "session_startup_seconds": 5.,
+                       "memory_budget_policy": "method_peak_v1"})]
     args = dict(resources={job.job_id: 2}, repetitions=20)
     small = request_budget_eta((job,), evidence, request_counts={job.job_id: 10}, **args)
     large = request_budget_eta((job,), evidence, request_counts={job.job_id: 500}, **args)
     assert small["p50_seconds"] == 105 and large["p50_seconds"] == 5005
+    legacy = {k: v for k, v in evidence[0][1].items() if k != "memory_budget_policy"}
+    assert request_budget_eta((job,), [(job, legacy)],
+                              request_counts={job.job_id: 10}, **args)["priced_leaves"] == 0
     other = replace(job, parameters={**job.parameters, "generation_tokens": 32768})
     unknown = request_budget_eta((other,), evidence, request_counts={job.job_id: 500}, **args)
     assert unknown["status"] == "UNMEASURED" and unknown["p50_seconds"] is None

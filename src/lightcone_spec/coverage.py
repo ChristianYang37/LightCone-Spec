@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .protocol import Job, materialize, mechanism_jobs, source_coverage_jobs
+from .protocol import Job, materialize, mechanism_jobs, memory_budget_policy, source_coverage_jobs
 
 COMPATIBILITY_NODE = "coverage-compatibility-v1"
 DENSE_14B = "Qwen/Qwen3-14B"
@@ -21,11 +21,11 @@ def request_budget_eta(jobs, evidence, *, request_counts, resources, seed=0, rep
     Cells are supplied in execution order. A resource count of two also denotes
     a TP1 cell requiring clean dual-device isolation.
     """
-    def stratum(job):
+    def stratum(job, policy):
         p = job.parameters
         return (job.model, job.backend, job.method, p.get("topology", "tp1_dp1"),
                 job.load, p.get("generation_tokens"), p.get("panel"),
-                p.get("regime"), bool(p.get("respect_eos")))
+                p.get("regime"), bool(p.get("respect_eos")), policy)
 
     pools = {}
     for item, metrics in evidence:
@@ -41,13 +41,14 @@ def request_budget_eta(jobs, evidence, *, request_counts, resources, seed=0, rep
             continue
         if duration <= 0 or count <= 0 or startup < 0:
             continue
-        pools.setdefault(stratum(job), []).append((duration / count, startup))
+        pools.setdefault(stratum(job, metrics.get("memory_budget_policy", "fixed_reserve_v1")),
+                         []).append((duration / count, startup))
     rng = np.random.default_rng(seed)
     clocks = np.zeros((2, repetitions), dtype=float)
     affinities, missing, priced = {}, {}, 0
     samples = np.arange(repetitions)
     for job in jobs:
-        key = stratum(job)
+        key = stratum(job, memory_budget_policy(job))
         pool = pools.get(key)
         if not pool:
             missing[str(key)] = missing.get(str(key), 0) + 1

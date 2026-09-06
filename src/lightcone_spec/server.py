@@ -16,7 +16,12 @@ from typing import Any
 
 from .client import ScheduledRun, SGLangClient
 from .config import ExperimentConfig
-from .protocol import FORMAL_ADAPTATION_STRIDE, Job, uses_formal_adaptation_stride
+from .protocol import (
+    FORMAL_ADAPTATION_STRIDE,
+    Job,
+    memory_budget_policy,
+    uses_formal_adaptation_stride,
+)
 
 ADAPTIVE_METHODS = {
     "tts",
@@ -532,6 +537,7 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
     return (
         job.model,
         job.backend,
+        memory_budget_policy(job),
         _execution_backend(job),
         job.parameters.get("draft_key"),
         job.job_id if job.parameters.get("clean_server_per_cell") else None,
@@ -739,6 +745,14 @@ class ServerProcess:
             json.dumps(argv, indent=2) + "\n", encoding="utf-8"
         )
         environment = dict(os.environ)
+        # Always override inherited values: old experiments must retain their
+        # fixed reservation even when resumed by a coverage-enabled runner.
+        environment["LIGHTCONE_MEMORY_BUDGET_POLICY"] = memory_budget_policy(self.job)
+        environment.pop("LIGHTCONE_MEMORY_BUDGET_QA", None)
+        if (self.job.parameters.get("excluded_from_analysis") is True
+                and memory_budget_policy(self.job) == "method_peak_v1"
+                and self.job.method in ADAPTIVE_METHODS):
+            environment["LIGHTCONE_MEMORY_BUDGET_QA"] = "1"
         if self.config.server.cuda_home is not None:
             cuda_home = self.config.server.cuda_home
             environment["CUDA_HOME"] = str(cuda_home)

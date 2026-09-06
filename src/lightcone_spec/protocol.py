@@ -135,6 +135,14 @@ def source_checkpoint_id(model: str, backend: str) -> str:
     return f"deepseek-ai/{backend.lower()}_{model_name}_{suffix}"
 
 
+def memory_budget_policy(job: Job) -> str:
+    """Execution-only policy; never rewrite immutable historical job configs."""
+    if (job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+            or job.parameters.get("coverage_runtime") is True):
+        return "method_peak_v1"
+    return "fixed_reserve_v1"
+
+
 def source_coverage_jobs() -> tuple[Job, ...]:
     """Immutable extra evidence; do not rewrite already materialized E0 jobs."""
     rows = []

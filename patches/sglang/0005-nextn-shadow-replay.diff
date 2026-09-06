@@ -3309,3 +3309,284 @@ diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sgla
              + self._swa_per_token * self._draft_swa_full_layers_num
          )
          full_tokens = (
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index ad02d7c..d7edb3a 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4102,6 +4102,8 @@ class Scheduler(
+                 "peak_hbm_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+                 "peak_hbm_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)),
+                 "kv_token_capacity": int(self.max_total_num_tokens),
++                "memory_budget": getattr(self.server_args, "_speculative_memory_budget", None),
++                "retractions": int(online.get("retractions", 0)),
+                 "batch_fill": online.get("batch_fill", 0.0),
+                 "queue_occupancy": online.get("queue_occupancy", 0.0),
+                 "exposed_update_ms": online.get("exposed_update_ms", 0.0),
+@@ -4118,6 +4120,9 @@ class Scheduler(
+                 "optimizer_bytes": online.get("optimizer_bytes", 0),
+                 "trainable_parameters": online.get("trainable_parameters", 0),
+                 "memory_ledger": online.get("memory_ledger", {}),
++                "measured_update_peak_bytes": online.get("measured_update_peak_bytes"),
++                "update_peak_measurement_scope": online.get("update_peak_measurement_scope"),
++                "budget_violations": online.get("budget_violations", 0),
+                 "parameter_layout": online.get("parameter_layout"),
+                 "graph_replay_hit_rate": online.get("graph_replay_hit_rate"),
+                 "main_side_overlap_ratio": online.get("main_side_overlap_ratio"),
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index d18d814..b572525 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -61,6 +61,9 @@ from sglang.srt.platforms import current_platform
+ from sglang.srt.runtime_context import get_model, get_parallel
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.srt.speculative.adaptation_memory_budget import (
++    adaptation_budget, memory_policy, validate_minimum_kv,
++)
+ from sglang.srt.utils.common import (
+     get_available_gpu_memory,
+     get_device_memory_capacity,
+@@ -233,6 +236,14 @@ class KVCacheConfigurator:
+             config = self._resolve_memory_pool_config(pre_model_load_memory)
+ 
+         sizes = self._derive_pool_sizes(config=config)
++        if memory_policy() == "method_peak_v1":
++            validate_minimum_kv(
++                sizes,
++                context=int(self.server_args.context_length or self.model_config.context_len),
++                speculative_tokens=int(self.server_args.speculative_num_draft_tokens or 0),
++                page_size=int(self.server_args.page_size),
++                window=self.sliding_window_size,
++            )
+ 
+         pools = self._init_pools(
+             sizes=sizes,
+@@ -1556,34 +1567,35 @@ class KVCacheConfigurator:
+                 )
+                 / 1024,
+             )
+-        adaptation_reserve_bytes = int(
+-            getattr(
+-                self.server_args,
+-                "speculative_adaptation_reserve_mb",
+-                0,
+-            )
+-        ) * 1024 * 1024
+-        adaptation_resident_bytes = int(
+-            getattr(
+-                self.server_args,
+-                "_speculative_adaptation_resident_bytes",
+-                0,
+-            )
+-        )
+-        adaptation_headroom_bytes = max(
+-            adaptation_reserve_bytes - adaptation_resident_bytes, 0
+-        )
++        budget = adaptation_budget(self.server_args)
++        adaptation_headroom_bytes = budget["headroom_bytes"]
+         adaptation_headroom_gb = adaptation_headroom_bytes / (1 << 30)
+         rest_memory = (
+             available_gpu_memory - slack_gb - adaptation_headroom_gb
+         )
+         if self.mambaish_config is not None:
+             rest_memory = self._handle_max_mamba_cache(rest_memory)
++        if budget["policy"] == "method_peak_v1" and get_world_group().world_size > 1:
++            # Both ranks must fit after subtracting their own TP-local ledger,
++            # not just after taking the minimum free memory before headroom.
++            local_bytes = torch.tensor(int(rest_memory * (1 << 30)), dtype=torch.int64)
++            torch.distributed.all_reduce(
++                local_bytes, op=torch.distributed.ReduceOp.MIN,
++                group=get_world_group().cpu_group,
++            )
++            rest_memory = int(local_bytes.item()) / (1 << 30)
++        budget.update(
++            available_bytes=int(available_gpu_memory * (1 << 30)),
++            runtime_slack_bytes=int(slack_gb * (1 << 30)),
++            kv_budget_bytes=int(rest_memory * (1 << 30)),
++        )
++        self.server_args._speculative_memory_budget = budget
++        logger.info("Pre-KV memory budget: %s", budget)
+ 
+         # Loaded weights (target + draft) can exceed the static budget
+         if rest_memory <= 0:
+             minimum_mem_fraction_static = (
+-                1 - available_gpu_memory / pre_model_load_memory
++                1 - (available_gpu_memory - adaptation_headroom_gb) / pre_model_load_memory
+             )
+             suggested_mem_fraction_static = (
+                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
+@@ -1716,6 +1728,14 @@ class KVCacheConfigurator:
+         )
+         configurator = create_memory_pool_configurator(self)
+         config = configurator.finalize_with_max_running_requests(config)
++        if memory_policy() == "method_peak_v1":
++            self.server_args._speculative_memory_budget["kv_capacity"] = validate_minimum_kv(
++                config,
++                context=int(self.server_args.context_length or self.model_config.context_len),
++                speculative_tokens=int(self.server_args.speculative_num_draft_tokens or 0),
++                page_size=int(self.server_args.page_size),
++                window=self.sliding_window_size,
++            )
+         config.mem_fraction_static = self.server_args.mem_fraction_static
+         return config
+ 
+diff --git a/python/sglang/srt/speculative/adaptation_memory_budget.py b/python/sglang/srt/speculative/adaptation_memory_budget.py
+new file mode 100644
+index 0000000..70493fc
+--- /dev/null
++++ b/python/sglang/srt/speculative/adaptation_memory_budget.py
+@@ -0,0 +1,61 @@
++"""Pre-KV budget from the already constructed, TP-local adapter layout."""
++
++import os
++
++
++def memory_policy():
++    policy = os.environ.get("LIGHTCONE_MEMORY_BUDGET_POLICY", "fixed_reserve_v1")
++    if policy not in {"fixed_reserve_v1", "method_peak_v1"}:
++        raise ValueError(f"unknown adaptation memory policy: {policy}")
++    return policy
++
++
++def adaptation_budget(server_args):
++    policy = memory_policy()
++    cap = int(getattr(server_args, "speculative_adaptation_reserve_mb", 0)) * (1 << 20)
++    resident = int(getattr(server_args, "_speculative_adaptation_resident_bytes", 0))
++    ledger = getattr(server_args, "_speculative_adaptation_memory_ledger", None)
++    adaptive = bool(getattr(server_args, "speculative_adaptation_config", None))
++    if policy == "method_peak_v1" and adaptive:
++        if not isinstance(ledger, dict) or not ledger:
++            raise RuntimeError("method_peak_v1 requires the validated adapter ledger before KV")
++        peak = ledger.get("peak_bytes")
++        if (type(peak) is not int or peak < resident or resident <= 0
++                or ledger.get("resident_bytes") != resident):
++            raise RuntimeError("pre-KV adapter layout and memory ledger disagree")
++        if peak > cap:
++            raise RuntimeError(f"method update peak {peak} exceeds budget cap {cap}")
++    elif policy == "method_peak_v1":
++        # Static has no adapter, not an unknown adaptive layout.
++        if resident or ledger:
++            raise RuntimeError("Static server unexpectedly owns adaptation state")
++        peak = 0
++    else:
++        peak = cap
++    return {
++        "policy": policy, "cap_bytes": cap, "resident_bytes": resident,
++        "estimated_peak_bytes": peak,
++        "headroom_bytes": max(peak - resident, 0),
++        "layout": dict(ledger or {}),
++        "measurement_scope": "TP-local pre-KV live tensors plus bounded update scratch",
++    }
++
++
++def validate_minimum_kv(config, *, context, speculative_tokens, page_size, window):
++    """One complete legal request plus verification slots, not the whole load."""
++    if context <= 0 or page_size <= 0:
++        raise RuntimeError("minimum KV budget requires known context and page size")
++    def aligned(tokens):
++        return ((tokens + speculative_tokens + page_size - 1) // page_size) * page_size
++    minimum = aligned(context)
++    full = getattr(config, "full_max_total_num_tokens", None)
++    swa = getattr(config, "swa_max_total_num_tokens", None)
++    full = config.max_total_num_tokens if full is None else full
++    swa_minimum = aligned(min(context, window)) if window and window > 0 else minimum
++    if full < minimum or (swa is not None and swa < swa_minimum):
++        raise ValueError(
++            f"method_peak_v1 KV capacity infeasible: full={full}, minimum={minimum}, "
++            f"swa={swa}, swa_minimum={swa_minimum}; no load/context downgrade"
++        )
++    return {"full_tokens": full, "minimum_full_tokens": minimum,
++            "swa_tokens": swa, "minimum_swa_tokens": swa_minimum if swa is not None else None}
+diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
+index 0b92bba..b9d0d2f 100644
+--- a/python/sglang/srt/speculative/dflash_online_adaptation.py
++++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
+@@ -601,6 +601,7 @@ class DFlashDrafterAdapter:
+             },
+         )
+         server_args._speculative_adaptation_resident_bytes = self.runtime.resident_bytes
++        server_args._speculative_adaptation_memory_ledger = dict(self.runtime.memory_ledger)
+ 
+     def begin_round(self, batch) -> tuple[int, ...]:
+         request_ids = tuple(request.rid for request in batch.reqs)
+diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+index ec588ab..96a3ba4 100644
+--- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
++++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+@@ -521,6 +521,7 @@ class NativeBackendOnlineAdapter:
+             },
+         )
+         server_args._speculative_adaptation_resident_bytes = self.runtime.resident_bytes
++        server_args._speculative_adaptation_memory_ledger = dict(self.runtime.memory_ledger)
+ 
+     @property
+     def source_adapter_version(self) -> int:
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+index d313394..2d7f229 100644
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import math
++import os
+ import time
+ from collections import deque
+ from collections.abc import Callable, Iterator, Sequence
+@@ -1315,6 +1316,8 @@ class OnlineCohortRuntime:
+         }
+         self.resident_bytes = 0
+         self.peak_bytes = 0
++        self.measured_update_peak_bytes = None
++        self.budget_violations = 0
+         self.optimizer_bytes = 0
+         self.trainable_parameters = 0
+         self.memory_ledger: dict[str, int] = {}
+@@ -1416,13 +1419,36 @@ class OnlineCohortRuntime:
+     def side_update(
+         self, source_tensors: Sequence[torch.Tensor]
+     ) -> Iterator[torch.cuda.Stream]:
++        # Synchronizing/resetting allocator statistics is diagnostic-only; it
++        # must never alter the formal async benchmark path.
++        memory_qa = os.environ.get("LIGHTCONE_MEMORY_BUDGET_QA") == "1"
++        if memory_qa:
++            torch.cuda.synchronize(self.device)
++            memory_before = torch.cuda.memory_allocated(self.device)
++            torch.cuda.reset_peak_memory_stats(self.device)
+         main = torch.cuda.current_stream(self.device)
+         self.main_ready.record(main)
+         self.side_stream.wait_event(self.main_ready)
+         for tensor in source_tensors:
+             tensor.record_stream(self.side_stream)
+         with torch.cuda.stream(self.side_stream):
+-            yield self.side_stream
++            try:
++                yield self.side_stream
++            finally:
++                if memory_qa:
++                    torch.cuda.synchronize(self.device)
++                    observed = self.resident_bytes + max(
++                        torch.cuda.max_memory_allocated(self.device) - memory_before, 0
++                    )
++                    self.measured_update_peak_bytes = max(
++                        self.measured_update_peak_bytes or 0, observed
++                    )
++                    if observed > self.peak_bytes:
++                        self.budget_violations += 1
++                        raise RuntimeError(
++                            f"adaptation_budget_underestimate: measured={observed}, "
++                            f"estimated={self.peak_bytes}"
++                        )
+ 
+     @contextmanager
+     def timing(self, name: str) -> Iterator[None]:
+@@ -2453,6 +2479,9 @@ class OnlineCohortRuntime:
+             "resident_bytes": self.resident_bytes,
+             "peak_bytes": self.peak_bytes,
+             "peak_hbm_bytes": int(torch.cuda.max_memory_allocated(self.device)),
++            "measured_update_peak_bytes": self.measured_update_peak_bytes,
++            "update_peak_measurement_scope": "excluded synchronized side-update allocator delta",
++            "budget_violations": self.budget_violations,
+             "optimizer_bytes": self.optimizer_bytes,
+             "trainable_parameters": self.trainable_parameters,
+             "memory_ledger": dict(self.memory_ledger),
