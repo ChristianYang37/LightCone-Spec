@@ -416,8 +416,11 @@ def _validate_greedy_verify_counts(
 
 
 def _validate_native_trainable_graph(after: dict[str, Any]) -> None:
-    """Disconnected autograd is an implementation error, not a capacity row."""
+    """A broken native replay is an implementation error, not a capacity row."""
     for rank in after.get("rank_local", []):
+        reconstruction = rank.get("native_reconstruction") or {}
+        if reconstruction.get("ok") is False:
+            raise RuntimeError(f"native replay reconstruction mismatch: {reconstruction}")
         reason = str(rank.get("disabled_reason") or "")
         if reason.startswith(("native_backend_trainables_disconnected",
                               "native_backend_trainables_partially_disconnected",

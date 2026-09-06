@@ -2328,7 +2328,7 @@ new file mode 100644
 index 00000000..6b43cc41
 --- /dev/null
 +++ b/python/sglang/srt/models/qwen3_draft_replay.py
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,125 @@
 +"""Explicit latest-round Qwen replay; never differentiate through cached kernels."""
 +
 +import torch
@@ -2354,7 +2354,9 @@ index 00000000..6b43cc41
 +
 +        return GemmaReplay._replay_logits(self, hidden)
 +
-+    def _replay_hidden(self, input_ids, positions, forward_batch, input_embeds=None):
++    def _replay_hidden(
++        self, input_ids, positions, forward_batch, input_embeds=None, *, source_hidden=None
++    ):
 +        from sglang.srt.distributed import get_tp_group
 +        from sglang.srt.models.gemma4_draft import _column, _row, _tp_copy
 +
@@ -2370,7 +2372,9 @@ index 00000000..6b43cc41
 +            embeds = (
 +                backbone.embed_tokens(input_ids) if input_embeds is None else input_embeds.detach()
 +            )
-+        hidden = forward_batch.spec_info.hidden_states.detach() if eagle else embeds
++        hidden = (
++            source_hidden if source_hidden is not None else forward_batch.spec_info.hidden_states.detach()
++        ) if eagle else embeds
 +        if eagle and hidden.shape[-1] != self.config.hidden_size:
 +            hidden = F.linear(hidden, backbone.fc.weight, backbone.fc.bias)
 +
@@ -2419,13 +2423,21 @@ index 00000000..6b43cc41
 +        if not (torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False)):
 +            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +        with torch.no_grad():
++            # Native Qwen Eagle fused-add RMSNorm mutates its residual input.
++            # Own the pre-forward source: detach alone still aliases that input.
++            source_hidden = (
++                forward_batch.spec_info.hidden_states.detach().clone()
++                if hasattr(self, "model") else None
++            )
 +            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +            native_logits = (
 +                native.next_token_logits
 +                if hasattr(self, "model")
 +                else self._replay_logits(native.hidden_states)
 +            )
-+        hidden, auxiliary = self._replay_hidden(input_ids, positions, forward_batch, input_embeds)
++        hidden, auxiliary = self._replay_hidden(
++            input_ids, positions, forward_batch, input_embeds, source_hidden=source_hidden
++        )
 +        logits = self._replay_logits(hidden)
 +        rows = getattr(self, "_reconstruction_rows", [])
 +        rows.append((native_logits.detach(), logits.detach()))

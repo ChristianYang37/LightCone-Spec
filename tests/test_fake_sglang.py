@@ -2577,7 +2577,7 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
             value = input_ids * self.weight
             return SimpleNamespace(next_token_logits=value, hidden_states=value)
 
-        def _replay_hidden(self, input_ids, *args):
+        def _replay_hidden(self, input_ids, *args, **kwargs):
             if not self.history:
                 raise RuntimeError("owned full-history KV snapshot required")
             value = input_ids * self.weight
@@ -2594,6 +2594,7 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "native-forward-mode", "exec"), namespace)
     model = namespace[class_name]()
     values = torch.ones(2, 4)
+    batch = SimpleNamespace(spec_info=SimpleNamespace(hidden_states=values))
     assert torch.is_grad_enabled()  # CUDA Graph warm-up may enter this way.
     result = model(values, None, None)
     assert not result.hidden_states.requires_grad
@@ -2602,16 +2603,16 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
         assert not model(values, None, None).hidden_states.requires_grad
     with pytest.raises(RuntimeError, match="owned full-history"):
         with native_training_replay(model, True):
-            model(values, None, None)
+            model(values, None, batch)
     assert not hasattr(model, "_lightcone_training_replay")
     model.history = True
     with native_training_replay(model, True):
-        assert model(values, None, None).hidden_states.requires_grad
+        assert model(values, None, batch).hidden_states.requires_grad
     with grad_enabled_forwards(model):
         with grad_enabled_forwards(model):
             assert model._lightcone_training_replay is True
         assert model._lightcone_training_replay is True
-        output = model(values, None, None)
+        output = model(values, None, batch)
         assert output.hidden_states.requires_grad
         output.hidden_states.sum().backward()
     assert model.weight.grad is not None and model.weight.grad.item() != 0
@@ -2919,6 +2920,52 @@ def test_official_qwen_replay_has_all_layer_gradients(monkeypatch, eagle):
         assert torch.allclose(measured, expected, atol=2e-5, rtol=2e-4)
 
 
+def test_qwen_eagle_replay_owns_source_before_native_fused_residual():
+    tree = _coverage_added_module("python/sglang/srt/models/qwen3_draft_replay.py")
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+    forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+
+    class Native(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace()
+            self.weight = torch.nn.Parameter(torch.tensor([2.0, 3.0]))
+            self._lightcone_training_replay = True
+
+        def forward(self, ids, positions, batch, input_embeds=None, **kwargs):
+            # Qwen Eagle aliases the one-step hidden source as its residual;
+            # native fused-add RMSNorm writes that tensor in place.
+            batch.spec_info.hidden_states.add_(3.0)
+            hidden = batch.spec_info.hidden_states * self.weight
+            return SimpleNamespace(hidden_states=hidden, next_token_logits=hidden)
+
+        def _replay_hidden(self, ids, positions, batch, input_embeds=None, *, source_hidden=None):
+            assert source_hidden.data_ptr() != batch.spec_info.hidden_states.data_ptr()
+            hidden = (source_hidden + 3.0) * self.weight
+            return hidden, hidden
+
+        def _replay_logits(self, hidden):
+            return hidden
+
+    wrapper = ast.ClassDef(name="Replay", bases=[ast.Name(id="Native", ctx=ast.Load())],
+                           keywords=[], body=[forward], decorator_list=[])
+    namespace = {"Native": Native, "torch": torch}
+    exec(compile(ast.fix_missing_locations(ast.Module([wrapper], [])), "qwen-input-ownership", "exec"), namespace)
+    model = namespace["Replay"]()
+    # Two rounds and a fresh request: no stale source or retained alias.
+    for values in (torch.tensor([[1.0, 4.0]]), torch.tensor([[5.0, 7.0]]), torch.zeros(1, 2)):
+        original = values.clone()
+        batch = SimpleNamespace(spec_info=SimpleNamespace(hidden_states=values))
+        output = model(None, None, batch)
+        expected = (original + 3.0) * model.weight
+        torch.testing.assert_close(output.next_token_logits, expected)
+        native, replay = model._reconstruction_rows[-1]
+        torch.testing.assert_close(native, replay)
+        torch.testing.assert_close(values, original + 3.0)  # native behavior unchanged
+        measured = torch.autograd.grad(output.next_token_logits.sum(), model.weight)[0]
+        torch.testing.assert_close(measured, (original + 3.0).sum(0))
+
+
 def _gemma_tp_gradient_worker(rank, init_path):
     """Actual two-process collectives, not forward-only simulated sharding."""
     import types
@@ -3181,6 +3228,14 @@ def test_disconnected_native_graph_is_runtime_failure_not_scientific_rejection()
             {"disabled_reason": None},
             {"disabled_reason": "native_backend_trainables_disconnected"},
         ]})
+    # Request reset can clear disabled_reason; the native/replay evidence persists.
+    with pytest.raises(RuntimeError, match="native replay reconstruction mismatch"):
+        _validate_native_trainable_graph({"rank_local": [
+            {"disabled_reason": None, "native_reconstruction": {"ok": False, "kl": 0.29989}},
+        ]})
+    _validate_native_trainable_graph({"rank_local": [
+        {"native_reconstruction": {"ok": True}, "fallbacks": 1},
+    ]})
 
 
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
