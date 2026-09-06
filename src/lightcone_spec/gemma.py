@@ -6,8 +6,44 @@ state. KV replication/sharding belongs to the SGLang linear-layer wrapper.
 
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
+
+
+@contextlib.contextmanager
+def capture_frozen_prefix(model):
+    """Reuse the actual constant prefix; only the trainable suffix needs replay.
+
+    Re-evaluating frozen layers with another attention kernel accumulates BF16
+    rounding differences without supplying any parameter derivatives. Never
+    detach a frozen layer downstream of a trainable one: its input Jacobian is
+    still required. Full/all therefore captures no prefix.
+    """
+    first = next(
+        (i for i, layer in enumerate(model.layers)
+         if any(p.requires_grad for p in layer.parameters())),
+        len(model.layers),
+    )
+    model._native_frozen_prefix = None
+    handle = None
+    if first:
+        def capture(module, args, output):
+            hidden, residual = output
+            if residual is not None:
+                raise RuntimeError("Gemma frozen prefix requires explicit residual output")
+            model._native_frozen_prefix = (first, hidden.detach().clone())
+
+        handle = model.layers[first - 1].register_forward_hook(capture)
+    try:
+        yield
+    except BaseException:
+        model._native_frozen_prefix = None
+        raise
+    finally:
+        if handle is not None:
+            handle.remove()
 
 
 def gemma_rms(

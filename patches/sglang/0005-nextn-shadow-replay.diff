@@ -1787,7 +1787,7 @@ new file mode 100644
 index 00000000..86ab081e
 --- /dev/null
 +++ b/python/sglang/srt/models/gemma4_draft.py
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,543 @@
 +"""DeepSpec Gemma4 draft backbone. No Qwen aliases or copied trainable V weights."""
 +
 +import copy
@@ -1811,7 +1811,7 @@ index 00000000..86ab081e
 +from sglang.srt.runtime_context import get_parallel, get_server_args
 +from torch import nn
 +
-+from lightcone_spec.gemma import gemma_canvas_attention, gemma_rms, gemma_rotary, gemma_softcap
++from lightcone_spec.gemma import capture_frozen_prefix, gemma_canvas_attention, gemma_rms, gemma_rotary, gemma_softcap
 +from lightcone_spec.replay_diagnostic import capture_native_attention, record_replay_attention, finish_reconstruction_diagnostic
 +
 +
@@ -1922,7 +1922,12 @@ index 00000000..86ab081e
 +                hidden = F.linear(hidden, backbone.fc.weight)
 +        else:
 +            hidden = embeds
-+        for layer, history in zip(backbone.layers, histories, strict=True):
++        prefix = getattr(self, "_native_frozen_prefix", None) if not eagle else None
++        self._native_frozen_prefix = None
++        start = 0
++        if prefix is not None:
++            start, hidden = prefix
++        for layer, history in zip(backbone.layers[start:], histories[start:], strict=True):
 +            inputs = (
 +                torch.cat((layer.input_layernorm(embeds), layer.hidden_norm(hidden)), dim=-1)
 +                if eagle
@@ -2208,7 +2213,7 @@ index 00000000..86ab081e
 +    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
 +        if not (torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False)):
 +            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
-+        with torch.no_grad(), capture_native_attention(self):
++        with torch.no_grad(), capture_native_attention(self), capture_frozen_prefix(self):
 +            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +            native_logits = self._replay_logits(native.hidden_states)
 +        replay, _ = self._replay_hidden(input_ids, positions, forward_batch, input_embeds)

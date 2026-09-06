@@ -2645,6 +2645,7 @@ def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
     ("qwen3_draft_replay", "QwenDraftReplay", False),
 ])
 def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
+    from lightcone_spec.gemma import capture_frozen_prefix
     from lightcone_spec.replay_diagnostic import capture_native_attention
 
     tree = _coverage_added_module(f"python/sglang/srt/models/{module}.py")
@@ -2655,6 +2656,7 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(2.0))
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
             self.history = False
             if has_model:
                 self.model = SimpleNamespace()
@@ -2679,6 +2681,7 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
     )
     namespace = {"Native": Native, "torch": torch}
     namespace["capture_native_attention"] = capture_native_attention
+    namespace["capture_frozen_prefix"] = capture_frozen_prefix
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "native-forward-mode", "exec"), namespace)
     model = namespace[class_name]()
     values = torch.ones(2, 4)
@@ -3052,6 +3055,77 @@ def test_qwen_eagle_replay_owns_source_before_native_fused_residual():
         torch.testing.assert_close(values, original + 3.0)  # native behavior unchanged
         measured = torch.autograd.grad(output.next_token_logits.sum(), model.weight)[0]
         torch.testing.assert_close(measured, (original + 3.0).sum(0))
+
+
+@pytest.mark.parametrize("trainable_layers", [(2,), (0, 2), (1,), ()])
+def test_gemma_frozen_prefix_replay_preserves_suffix_gradients(trainable_layers):
+    from lightcone_spec.gemma import capture_frozen_prefix
+
+    class Layer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.self_attn = torch.nn.Linear(3, 3, bias=False).double()
+            self.mlp = torch.nn.Linear(3, 3, bias=False).double()
+            for name in ("input_layernorm", "post_attention_layernorm",
+                         "post_feedforward_layernorm", "pre_feedforward_layernorm"):
+                setattr(self, name, torch.nn.Identity())
+            self.layer_scalar = 0.9
+            self.native_offset = 0.01 if index < min(trainable_layers, default=3) else 0
+            self.requires_grad_(index in trainable_layers)
+
+        def forward(self, hidden):
+            hidden = hidden + self.self_attn(hidden)
+            hidden = hidden + self.mlp(hidden)
+            return hidden * self.layer_scalar + self.native_offset, None
+
+    tree = _coverage_added_module("python/sglang/srt/models/gemma4_draft.py")
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GemmaReplay")
+    replay = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_replay_hidden")
+    namespace = {"torch": torch,
+                 "_replay_attention": lambda layer, hidden, *args, **kwargs: layer(hidden),
+                 "_replay_mlp": lambda layer, hidden: layer(hidden)}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[replay], type_ignores=[])),
+                 "gemma-prefix-replay", "exec"), namespace)
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([Layer(i) for i in range(3)])
+    model.embed_tokens = torch.nn.Identity()
+    model.norm = torch.nn.Identity()
+    model.config = SimpleNamespace(hidden_size=1)
+    inputs = torch.ones(2, 3, dtype=torch.float64)
+    reference = inputs
+    for layer in model.layers:
+        reference, _ = layer(reference)
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    expected = torch.autograd.grad(reference.sum(), parameters) if parameters else ()
+    with torch.no_grad(), capture_frozen_prefix(model):
+        native = inputs
+        for layer in model.layers:
+            native, _ = layer(native)
+    assert not any(layer._forward_hooks for layer in model.layers)
+    if trainable_layers and min(trainable_layers) == 0:
+        assert model._native_frozen_prefix is None  # Full/all: no detachment.
+    else:
+        boundary, saved = model._native_frozen_prefix
+        assert boundary == min(trainable_layers, default=3)
+        assert not saved.requires_grad
+        saved_copy = saved.clone()
+        native.add_(123)  # Prefix owns its tensor, independent of later writes.
+        torch.testing.assert_close(saved, saved_copy)
+    model._training_histories = [None] * 3
+    actual, _ = namespace["_replay_hidden"](model, inputs, None, None)
+    torch.testing.assert_close(actual, reference)
+    if parameters:
+        gradients = torch.autograd.grad(actual.sum(), parameters)
+        for measured, wanted in zip(gradients, expected, strict=True):
+            torch.testing.assert_close(measured, wanted)
+    assert model._native_frozen_prefix is None
+    assert model._training_histories is None
+    with pytest.raises(RuntimeError, match="reset interruption"):
+        with capture_frozen_prefix(model):
+            assert model._native_frozen_prefix is None
+            raise RuntimeError("reset interruption")
+    assert not any(layer._forward_hooks for layer in model.layers)
 
 
 def test_excluded_replay_diagnostic_preserves_inputs_and_stops_on_mismatch(monkeypatch, tmp_path):
