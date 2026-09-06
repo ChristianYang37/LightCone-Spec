@@ -251,6 +251,45 @@ def test_execution_budget_preserves_inputs_independent_of_dispatcher(
         assert _dispatcher_concurrency(job) == 1
 
 
+@pytest.mark.parametrize("regime", ["source_native_prompt", "mechanism_native_prompt"])
+def test_native_panel_inputs_extract_token_ids_from_batch_encoding(tmp_path, monkeypatch, regime):
+    from transformers import AutoTokenizer, BatchEncoding
+
+    records = ({"prompt": "first"}, {"prompt": "second"})
+    calls = []
+
+    def template(messages, **kwargs):
+        calls.append((messages, kwargs))
+        assert kwargs == {
+            "tokenize": True, "return_dict": True,
+            "add_generation_prompt": True, "enable_thinking": False,
+        }
+        return BatchEncoding({"input_ids": [11, 22, len(calls)], "attention_mask": [1, 1, 1]})
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **k:
+                        SimpleNamespace(apply_chat_template=template))
+    monkeypatch.setattr("lightcone_spec.runner.load_source_prompt_records", lambda *a, **k: records)
+    monkeypatch.setattr("lightcone_spec.runner.load_prompt_records", lambda *a, **k: records)
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml", run_name="native-inputs", sglang_root=tmp_path,
+        results_root=tmp_path, models={"Qwen/Qwen3-8B": tmp_path}, drafts={},
+        datasets={"source": tmp_path}, gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"), protocol=ProtocolConfig(),
+    )
+    job = Job(job_id="native", ordinal=0, node="E0-source-four-block-v1",
+              method="lightcone", model="Qwen/Qwen3-8B", backend="DFLASH",
+              task="AIME-2025", load="c1", context=40960,
+              parameters={"regime": regime, "dataset_key": "source", "sampling_seed": 42,
+                          "stimulus_selection_seed": 0, "execution_request_count": 2,
+                          "generation_tokens": 2048})
+    inputs, budget, metadata = _cell_inputs(config, StateStore(config.run_dir), None, job)
+    assert inputs == ((11, 22, 1), (11, 22, 2))
+    assert budget == 2048
+    assert metadata["execution_request_count"] == 2
+    assert metadata["respect_eos"] is True
+    assert [messages[0]["content"] for messages, _ in calls] == ["first", "second"]
+
+
 def test_dp2_system_concurrency_does_not_double_request_budget(tmp_path):
     config = ExperimentConfig(
         source=tmp_path / "paper.yaml",

@@ -852,9 +852,10 @@ def _cell_inputs(
                 tokenizer.apply_chat_template(
                     [{"role": "user", "content": row["prompt"]}],
                     tokenize=True,
+                    return_dict=True,
                     add_generation_prompt=True,
                     enable_thinking=False,
-                )
+                )["input_ids"]
             )
             for row in records
         )
