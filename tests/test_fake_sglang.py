@@ -86,6 +86,7 @@ def test_coverage_memory_policy_does_not_leak_into_legacy_sessions():
 
 def test_memory_pressure_has_long_context_and_only_excluded_kv_cap():
     from lightcone_spec.coverage import gpu_acceptance_jobs, memory_pressure_job
+    from lightcone_spec.server import _qa_retraction_environment
     assert len(gpu_acceptance_jobs()) == 41
     long = memory_pressure_job("long_tts")
     assert long.parameters["generation_tokens"] == 32768
@@ -95,6 +96,15 @@ def test_memory_pressure_has_long_context_and_only_excluded_kv_cap():
     assert pressure.load == "c8" and pressure.parameters["execution_request_count"] == 8
     assert pressure.parameters["qa_kv_token_cap"] >= pressure.context + 8
     assert pressure.parameters["excluded_from_analysis"] is True
+    assert pressure.job_id == "qa-memory-retraction-native-hook-v1"
+    env = {"SGLANG_TEST_RETRACT": "1"}
+    _qa_retraction_environment(long, env)
+    assert not env
+    _qa_retraction_environment(pressure, env)
+    assert env == {"SGLANG_TEST_RETRACT": "1", "SGLANG_TEST_RETRACT_INTERVAL": "500"}
+    formal = replace(pressure, parameters={**pressure.parameters, "excluded_from_analysis": False})
+    with pytest.raises(ValueError, match="restricted to excluded"):
+        _qa_retraction_environment(formal, env)
     assert memory_pressure_job("tp2").parameters["topology"] == "tp2_dp1"
 
 

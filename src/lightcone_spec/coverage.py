@@ -174,7 +174,7 @@ def memory_pressure_job(case: str) -> Job:
     source = next(j for j in gpu_acceptance_jobs()
                   if j.model == model and j.backend == "DFLASH" and j.method == method)
     return replace(
-        source, job_id=f"qa-memory-{case}",
+        source, job_id=("qa-memory-retraction-native-hook-v1" if case == "retraction" else f"qa-memory-{case}"),
         load="c8" if case == "retraction" else "c1",
         gpu_count=2 if case == "tp2" else 1,
         parameters={
@@ -183,7 +183,8 @@ def memory_pressure_job(case: str) -> Job:
             "generation_tokens": 8192 if case == "retraction" else 32768,
             "execution_request_count": 8 if case == "retraction" else 2,
             "respect_eos": False,
-            **({"qa_kv_token_cap": 41024} if case == "retraction" else {}),
+            **({"qa_kv_token_cap": 41024, "qa_native_retraction_interval": 500}
+               if case == "retraction" else {}),
         },
     )
 

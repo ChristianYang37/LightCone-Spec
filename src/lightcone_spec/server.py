@@ -23,6 +23,21 @@ from .protocol import (
     uses_formal_adaptation_stride,
 )
 
+
+def _qa_retraction_environment(job: Job, environment: dict[str, str]) -> None:
+    # Prevent an inherited test switch from contaminating a formal server.
+    for name in ("SGLANG_TEST_RETRACT", "SGLANG_TEST_RETRACT_INTERVAL"):
+        environment.pop(name, None)
+    interval = job.parameters.get("qa_native_retraction_interval")
+    if interval is not None:
+        if (job.parameters.get("excluded_from_analysis") is not True
+                or job.parameters.get("memory_pressure_case") != "retraction"
+                or type(interval) is not int or interval <= 0):
+            raise ValueError("native retraction injection is restricted to excluded pressure QA")
+        environment["SGLANG_TEST_RETRACT"] = "1"
+        environment["SGLANG_TEST_RETRACT_INTERVAL"] = str(interval)
+
+
 ADAPTIVE_METHODS = {
     "tts",
     "tts_lora_batched",
@@ -749,6 +764,7 @@ class ServerProcess:
             json.dumps(argv, indent=2) + "\n", encoding="utf-8"
         )
         environment = dict(os.environ)
+        _qa_retraction_environment(self.job, environment)
         # Always override inherited values: old experiments must retain their
         # fixed reservation even when resumed by a coverage-enabled runner.
         environment["LIGHTCONE_MEMORY_BUDGET_POLICY"] = memory_budget_policy(self.job)

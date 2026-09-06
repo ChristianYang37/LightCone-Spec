@@ -1307,7 +1307,7 @@ def _native_kv_retraction_count(directory: Path) -> int:
 
 
 def memory_pressure(args: argparse.Namespace) -> None:
-    """Long requests and real fixed-pool pressure, never formal performance data."""
+    """Long requests and explicit native-retraction QA, never formal performance data."""
     import sqlite3
     import threading
 
@@ -1364,6 +1364,8 @@ def memory_pressure(args: argparse.Namespace) -> None:
     if args.case == "retraction":
         passed = passed and native_retractions > 0
     report = {"case": args.case, "passed": passed, "attempt_dir": str(directory),
+              "retraction_trigger": ("upstream_test_hook_interval_500"
+                                     if args.case == "retraction" else "not_injected"),
               "native_kv_retractions": native_retractions,
               "logical_prefix_retractions": metrics.get("retractions"),
               "memory_budget": metrics.get("memory_budget"),
