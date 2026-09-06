@@ -165,6 +165,29 @@ def gpu_acceptance_jobs() -> tuple[Job, ...]:
     return tuple(jobs)
 
 
+def memory_pressure_job(case: str) -> Job:
+    """Excluded stress cases, separate from the 41 short acceptance cases."""
+    if case not in {"long_tts", "long_lightcone", "retraction", "tp2"}:
+        raise ValueError(case)
+    method = "tts" if case == "long_tts" else "lightcone"
+    source = next(j for j in gpu_acceptance_jobs()
+                  if j.model == "Qwen/Qwen3-8B" and j.backend == "DFLASH"
+                  and j.method == method and j.parameters.get("qa_phase") == "qwen")
+    return replace(
+        source, job_id=f"qa-memory-{case}",
+        load="c8" if case == "retraction" else "c1",
+        gpu_count=2 if case == "tp2" else 1,
+        parameters={
+            **source.parameters, "memory_pressure_case": case,
+            "topology": "tp2_dp1" if case == "tp2" else "tp1_dp1",
+            "generation_tokens": 8192 if case == "retraction" else 32768,
+            "execution_request_count": 8 if case == "retraction" else 2,
+            "respect_eos": False,
+            **({"qa_kv_token_cap": 41024} if case == "retraction" else {}),
+        },
+    )
+
+
 def compatibility_replacements(rows: list[tuple[Job, dict[str, Any]]]) -> tuple[Job, ...]:
     """Replace proven registration faults per method, not an entire backend.
 

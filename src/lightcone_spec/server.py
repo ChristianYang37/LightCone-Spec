@@ -392,6 +392,10 @@ def server_command(
     ]
     if job.parameters.get("deterministic_exactness"):
         argv.append("--enable-deterministic-inference")
+    if "qa_kv_token_cap" in job.parameters:
+        if job.parameters.get("excluded_from_analysis") is not True:
+            raise ValueError("KV pressure cap is restricted to excluded acceptance")
+        argv.extend(("--max-total-tokens", str(int(job.parameters["qa_kv_token_cap"]))))
     if job.parameters.get("regime") != "multi_turn_shared_prefix" and not job.parameters.get(
         "prefix_reuse"
     ):

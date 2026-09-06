@@ -79,6 +79,20 @@ def test_coverage_memory_policy_does_not_leak_into_legacy_sessions():
     assert adaptation_payload(job) == adaptation_payload(coverage)
 
 
+def test_memory_pressure_has_long_context_and_only_excluded_kv_cap():
+    from lightcone_spec.coverage import gpu_acceptance_jobs, memory_pressure_job
+    assert len(gpu_acceptance_jobs()) == 41
+    long = memory_pressure_job("long_tts")
+    assert long.parameters["generation_tokens"] == 32768
+    assert long.parameters["execution_request_count"] == 2
+    assert long.parameters["respect_eos"] is False
+    pressure = memory_pressure_job("retraction")
+    assert pressure.load == "c8" and pressure.parameters["execution_request_count"] == 8
+    assert pressure.parameters["qa_kv_token_cap"] >= pressure.context + 8
+    assert pressure.parameters["excluded_from_analysis"] is True
+    assert memory_pressure_job("tp2").parameters["topology"] == "tp2_dp1"
+
+
 def _memory_budget_functions():
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
     section = patch.split("diff --git a/python/sglang/srt/speculative/adaptation_memory_budget.py", 1)[1]

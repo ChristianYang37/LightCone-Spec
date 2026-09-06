@@ -1293,9 +1293,73 @@ def coverage(args: argparse.Namespace) -> None:
     )
 
 
+def memory_pressure(args: argparse.Namespace) -> None:
+    """Long requests and real fixed-pool pressure, never formal performance data."""
+    import re
+    import sqlite3
+    import threading
+
+    from lightcone_spec.coverage import memory_pressure_job
+    from lightcone_spec.runner import _run_pending_jobs
+    from lightcone_spec.state import StateStore
+
+    formal = ExperimentConfig.load(args.config)
+    output = args.output.resolve()
+    if output == formal.run_dir.resolve() or output.is_relative_to(formal.run_dir.resolve()):
+        raise ValueError("pressure acceptance must not write into the formal run")
+    for path in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            argv = path.read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if b"run" in argv and any(Path(v.decode(errors="replace")).name == "lightcone-spec"
+                                  for v in argv if v):
+            raise RuntimeError("formal runner is active")
+    config = replace(formal, results_root=output, run_name="excluded-memory-pressure")
+    state = StateStore(config.run_dir)
+    if not state.selection("qa_formal_selection_snapshot", False):
+        with sqlite3.connect(f"file:{formal.run_dir / 'state.sqlite'}?mode=ro", uri=True) as source:
+            for name, value in source.execute("SELECT name,value_json FROM selections"):
+                state.set_selection(name, json.loads(value))
+        state.set_selection("qa_formal_selection_snapshot", True)
+    job = memory_pressure_job(args.case)
+    state.add_internal_jobs((job,), storage_node=f"memory-pressure-{args.case}")
+    if state.job_status(job.job_id) == "pending":
+        _run_pending_jobs(config, state, f"memory-pressure-{args.case}", threading.Event(), (job,))
+    directory = state.completed_attempt_dir(job.job_id)
+    if directory is None:
+        raise RuntimeError(f"pressure QA needs diagnosis: {job.job_id}")
+    metrics = json.loads((directory / "metrics.json").read_text())
+    passed = (metrics.get("hard_feasible") is True
+              and metrics.get("memory_budget_policy") == "method_peak_v1"
+              and metrics.get("updates_published", 0) >= 2
+              and not any(metrics.get(k, 0) for k in SAFETY_COUNTERS))
+    native_retractions = sum(map(int, re.findall(
+        r"#retracted_reqs: (\d+)", (directory / "server.log").read_text()
+    )))
+    if args.case == "retraction":
+        passed = passed and native_retractions > 0
+    report = {"case": args.case, "passed": passed, "attempt_dir": str(directory),
+              "native_kv_retractions": native_retractions,
+              "logical_prefix_retractions": metrics.get("retractions"),
+              "memory_budget": metrics.get("memory_budget"),
+              "measured_update_peak_bytes": metrics.get("measured_update_peak_bytes"),
+              "rank_local": metrics.get("rank_local_after"),
+              "formal_benchmark": False}
+    _write(output / f"{args.case}-acceptance.json", report)
+    if not passed:
+        raise RuntimeError(f"pressure acceptance did not pass: {args.case}; inspect saved evidence")
+    print(json.dumps({"case": args.case, "passed": True, "native_kv_retractions": native_retractions}))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
+    pressure = commands.add_parser("memory-pressure")
+    pressure.add_argument("--config", type=Path, required=True)
+    pressure.add_argument("--output", type=Path, required=True)
+    pressure.add_argument("--case", choices=("long_tts", "long_lightcone", "retraction", "tp2"), required=True)
+    pressure.set_defaults(handler=memory_pressure)
     for name, handler, default_tokens in (
         ("benchmark", benchmark, 4096),
         ("smoke", smoke, 128),
