@@ -196,7 +196,8 @@ def test_method_peak_static_and_full_swa_minimum(monkeypatch):
     validate = functions["validate_minimum_kv"]
     config = SimpleNamespace(max_total_num_tokens=41024, full_max_total_num_tokens=41024,
                              swa_max_total_num_tokens=1088)
-    kwargs = dict(context=40960, speculative_tokens=8, page_size=64, window=1024)
+    kwargs = dict(context=40960, speculative_tokens=8, page_size=64, window=1024,
+                  chunked_prefill_size=512)
     assert validate(config, **kwargs)["minimum_full_tokens"] == 41024
     config.swa_max_total_num_tokens = 1024
     with pytest.raises(ValueError, match="capacity infeasible"):
@@ -205,6 +206,48 @@ def test_method_peak_static_and_full_swa_minimum(monkeypatch):
     config.full_max_total_num_tokens = 40960
     with pytest.raises(ValueError, match="capacity infeasible"):
         validate(config, **kwargs)
+
+
+def test_method_peak_swa_unchunked_prefill_needs_complete_prompt(monkeypatch):
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "method_peak_v1")
+    functions = _memory_budget_functions()
+    cap = functions["use_swa_chunk_cap"]
+    assert not cap(-1) and not cap(0) and not cap(None)
+    assert cap(512)
+    config = SimpleNamespace(max_total_num_tokens=1286140,
+        full_max_total_num_tokens=1286140, swa_max_total_num_tokens=2063)
+    kwargs = dict(context=40960, speculative_tokens=8, page_size=1, window=1024,
+                  chunked_prefill_size=-1)
+    with pytest.raises(ValueError, match="swa_minimum=40968"):
+        functions["validate_minimum_kv"](config, **kwargs)
+    config.swa_max_total_num_tokens = 40968
+    assert functions["validate_minimum_kv"](config, **kwargs)["minimum_swa_tokens"] == 40968
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "fixed_reserve_v1")
+    assert cap(-1) and cap(0) and cap(512) and not cap(None)
+
+
+def test_stream_abort_preserves_original_server_cause():
+    from lightcone_spec.client import _consume_stream
+
+    chunk = {"output_ids": [5], "meta_info": {"completion_tokens": 2060,
+        "finish_reason": {"type": "abort", "message": "Out of memory after retraction"}}}
+    with pytest.raises(RuntimeError, match="SGLang request aborted: Out of memory after retraction"):
+        _consume_stream([("data: " + json.dumps(chunk)).encode()], ("rid",), time.perf_counter())
+
+
+def test_attempt_archive_survives_session_restart(tmp_path):
+    import gzip
+
+    from lightcone_spec.runner import _archive_session_files
+
+    source = tmp_path / "server.log"
+    source.write_text("old cell\noriginal error\n")
+    files, offsets = {"server.log": source}, {"server.log": len("old cell\n")}
+    output = tmp_path / "attempt"
+    _archive_session_files(output, files, offsets)
+    source.write_text("new server startup\n")
+    _archive_session_files(output, files, offsets)
+    assert gzip.decompress((output / "server.log.gz").read_bytes()) == b"original error\n"
 
 
 @pytest.mark.parametrize("load,method,workload,node,count", [

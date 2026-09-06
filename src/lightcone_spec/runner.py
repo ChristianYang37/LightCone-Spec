@@ -281,6 +281,25 @@ def _all_jobs_completed(counts: dict[str, int]) -> bool:
     )
 
 
+def _archive_session_files(output_dir, session_files, session_offsets):
+    """Archive before restart truncates session files; never replace that snapshot."""
+    for name, source in session_files.items():
+        target = output_dir / f"{name}.gz"
+        if not source.exists() or target.exists():
+            continue
+        with source.open("rb") as stream:
+            stream.seek(session_offsets[name])
+            payload = stream.read()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if name.endswith("gpu.csv") and not payload.startswith(b"timestamp,"):
+            payload = (
+                b"timestamp,index,memory_used_mb,gpu_util_pct,"
+                b"memory_util_pct,power_w,energy_mj,temperature_c,"
+                b"sm_clock_mhz,pstate,throttle\n" + payload
+            )
+        target.write_bytes(gzip.compress(payload))
+
+
 def _capacity_infeasible(
     error: Exception,
     server_log: Path | None = None,
@@ -2368,6 +2387,7 @@ def _execute_cell(
                     },
                 )
                 state.complete(job.job_id, attempt)
+                _archive_session_files(output_dir, session_files, session_offsets)
                 server.restart()
                 return
             retry = (
@@ -2391,27 +2411,10 @@ def _execute_cell(
             state.fail(job.job_id, attempt, f"{type(error).__name__}: {error}", retry=retry)
             if not retry:
                 return
+            _archive_session_files(output_dir, session_files, session_offsets)
             server.restart()
         finally:
-            for name, source in session_files.items():
-                if not source.exists():
-                    continue
-                with source.open("rb") as stream:
-                    stream.seek(session_offsets[name])
-                    payload = stream.read()
-                target = output_dir / f"{name}.gz"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if name.endswith("gpu.csv"):
-                    header = (
-                        b"timestamp,index,memory_used_mb,gpu_util_pct,"
-                        b"memory_util_pct,power_w,energy_mj,temperature_c,"
-                        b"sm_clock_mhz,pstate,throttle\n"
-                    )
-                    if payload.startswith(b"timestamp,"):
-                        header = b""
-                    target.write_bytes(gzip.compress(header + payload))
-                else:
-                    target.write_bytes(gzip.compress(payload))
+            _archive_session_files(output_dir, session_files, session_offsets)
 
 
 def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:

@@ -273,6 +273,11 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float) -> t
         meta = chunk.get("meta_info")
         if not isinstance(meta, dict):
             raise RuntimeError("stream response is missing metadata")
+        reason = meta.get("finish_reason")
+        if isinstance(reason, dict) and reason.get("type") == "abort":
+            # Abort responses may intentionally contain only the final token.
+            # Preserve the server's cause instead of reporting a trajectory gap.
+            raise RuntimeError(f"SGLang request aborted: {reason.get('message') or reason}")
         index = chunk.get("index", 0)
         if not isinstance(index, int) or not 0 <= index < count:
             raise RuntimeError("stream response has an invalid batch index")
