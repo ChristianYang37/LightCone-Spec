@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import gzip
 import json
 import math
 import os
 import pickle
+import re
 import signal
 import statistics
 import subprocess
@@ -1293,9 +1295,19 @@ def coverage(args: argparse.Namespace) -> None:
     )
 
 
+def _native_kv_retraction_count(directory: Path) -> int:
+    """Runner archives attempt logs before the acceptance reducer reads them."""
+    path = directory / "server.log"
+    if path.exists():
+        text = path.read_text()
+    else:
+        with gzip.open(directory / "server.log.gz", "rt") as stream:
+            text = stream.read()
+    return sum(map(int, re.findall(r"#retracted_reqs: (\d+)", text)))
+
+
 def memory_pressure(args: argparse.Namespace) -> None:
     """Long requests and real fixed-pool pressure, never formal performance data."""
-    import re
     import sqlite3
     import threading
 
@@ -1334,9 +1346,7 @@ def memory_pressure(args: argparse.Namespace) -> None:
               and metrics.get("memory_budget_policy") == "method_peak_v1"
               and metrics.get("updates_published", 0) >= 2
               and not any(metrics.get(k, 0) for k in SAFETY_COUNTERS))
-    native_retractions = sum(map(int, re.findall(
-        r"#retracted_reqs: (\d+)", (directory / "server.log").read_text()
-    )))
+    native_retractions = _native_kv_retraction_count(directory)
     if args.case == "retraction":
         passed = passed and native_retractions > 0
     report = {"case": args.case, "passed": passed, "attempt_dir": str(directory),

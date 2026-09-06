@@ -415,6 +415,16 @@ def _validate_greedy_verify_counts(
     }
 
 
+def _validate_native_trainable_graph(after: dict[str, Any]) -> None:
+    """Disconnected autograd is an implementation error, not a capacity row."""
+    for rank in after.get("rank_local", []):
+        reason = str(rank.get("disabled_reason") or "")
+        if reason.startswith(("native_backend_trainables_disconnected",
+                              "native_backend_trainables_partially_disconnected",
+                              "native_backend_loss_not_differentiable")):
+            raise RuntimeError(f"native adaptation graph failure: {reason}")
+
+
 def _speed_metrics(
     server_info: dict[str, object],
     topology: str,
@@ -2186,6 +2196,7 @@ def _execute_cell(
                 metrics["expected_action_passed"] = _fault_action_passed(
                     failure_name, fault_action_passed, metrics
                 )
+            _validate_native_trainable_graph(after)
             if (
                 job.parameters.get("workload") != "failure_injection"
                 and runtime_job.method
@@ -7731,6 +7742,17 @@ def _coverage_e0_gaps(state: StateStore) -> tuple[Job, ...]:
     """Leaf replacements preserve completed siblings and original paired seeds."""
     output = []
     for node in ("E0-pilot", "E0-final"):
+        with state.connect() as connection:
+            started_rows = connection.execute(
+                "SELECT config_json FROM jobs WHERE node IN (?,?) AND attempt_count>0",
+                (node, f"{node}-segments"),
+            ).fetchall()
+        started_blocks = set()
+        for row in started_rows:
+            item = json.loads(row["config_json"])
+            if item["block"] is not None:
+                started_blocks.add((item["model"], item["backend"], item["block"],
+                                    item["parameters"].get("topology", "tp1_dp1")))
 
         def key(job):
             return job.model, job.backend, job.method, job.block
@@ -7786,6 +7808,10 @@ def _coverage_e0_gaps(state: StateStore) -> tuple[Job, ...]:
                     panel="dense_14b_transfer" if dense else "coverage_restoration",
                     original_parent_job_id=parent.job_id,
                 )
+                if (leaf.model, leaf.backend, leaf.block, parameters["topology"]) in started_blocks:
+                    # This is frozen when the replacement plan is materialized.
+                    # A new TP2 group does not inherit a started TP1 group's budget.
+                    parameters["budget_preserved_started_block"] = True
                 if leaf.job_id in children:
                     parameters["replaces_job_id"] = leaf.job_id
                 output.append(

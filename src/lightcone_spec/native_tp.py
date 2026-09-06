@@ -87,3 +87,16 @@ def strided_teacher_rows(logits, batch_size, gamma, microbatch):
     if not 0 < microbatch <= batch_size:
         raise ValueError("invalid teacher microbatch")
     return logits.reshape(batch_size, gamma + 1, -1)[:microbatch, :gamma]
+
+
+def native_training_rows(logits, microbatch):
+    """Preserve the live proposal graph inside an inference-mode scheduler.
+
+    A view made under inference_mode can retain requires_grad=True while
+    losing its producer edge. Merely enabling grad for the later loss is
+    too late; the microbatch view itself must be created with grad enabled.
+    """
+    if not 0 < microbatch <= logits.shape[0]:
+        raise ValueError("invalid live proposal microbatch")
+    with torch.inference_mode(False), torch.enable_grad():
+        return logits[:microbatch]

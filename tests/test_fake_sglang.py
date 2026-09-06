@@ -77,6 +77,11 @@ def test_coverage_memory_policy_does_not_leak_into_legacy_sessions():
     assert memory_budget_policy(source_coverage_jobs()[0]) == "method_peak_v1"
     assert server_session_key(job) != server_session_key(coverage)
     assert adaptation_payload(job) == adaptation_payload(coverage)
+    continued = replace(coverage, parameters={
+        **coverage.parameters, "budget_preserved_started_block": True,
+    })
+    assert memory_budget_policy(continued) == "fixed_reserve_v1"
+    assert server_session_key(continued) == server_session_key(job)
 
 
 def test_memory_pressure_has_long_context_and_only_excluded_kv_cap():
@@ -91,6 +96,18 @@ def test_memory_pressure_has_long_context_and_only_excluded_kv_cap():
     assert pressure.parameters["qa_kv_token_cap"] >= pressure.context + 8
     assert pressure.parameters["excluded_from_analysis"] is True
     assert memory_pressure_job("tp2").parameters["topology"] == "tp2_dp1"
+
+
+def test_pressure_acceptance_reads_archived_native_retraction_log(tmp_path):
+    import gzip
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pressure_qa", "scripts/gpu_acceptance.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with gzip.open(tmp_path / "server.log.gz", "wt") as stream:
+        stream.write("KV cache pool is full. #retracted_reqs: 2\n#retracted_reqs: 1\n")
+    assert module._native_kv_retraction_count(tmp_path) == 3
 
 
 def _memory_budget_functions():
@@ -3091,6 +3108,37 @@ def test_compact_verifier_teacher_remains_strided_and_bonus_is_not_a_draft():
     assert 7 not in teacher and 15 not in teacher
     with pytest.raises(ValueError, match="RID stride"):
         strided_teacher_rows(logits[:11], 2, 7, 2)
+
+
+def test_native_training_microbatch_preserves_graph_inside_inference_mode():
+    from lightcone_spec.native_tp import native_training_rows
+
+    for microbatch in (1, 2):
+        weight = torch.randn(3, 5, requires_grad=True)
+        hidden = torch.randn(2, 7, 3)
+        with torch.inference_mode():
+            with torch.inference_mode(False), torch.enable_grad():
+                logits = hidden @ weight
+            old_view = logits[:microbatch]
+            actual = native_training_rows(logits, microbatch)
+            with torch.inference_mode(False), torch.enable_grad():
+                assert torch.equal(actual, old_view)
+                assert old_view.requires_grad and old_view.grad_fn is None
+                assert torch.autograd.grad(old_view.sum(), weight, allow_unused=True)[0] is None
+                gradient = torch.autograd.grad(actual.sum(), weight)[0]
+                expected = hidden[:microbatch].sum((0, 1))[:, None].expand_as(weight)
+                torch.testing.assert_close(gradient, expected)
+
+
+def test_disconnected_native_graph_is_runtime_failure_not_scientific_rejection():
+    from lightcone_spec.runner import _validate_native_trainable_graph
+
+    _validate_native_trainable_graph({"rank_local": [{"disabled_reason": None}]})
+    with pytest.raises(RuntimeError, match="native adaptation graph failure"):
+        _validate_native_trainable_graph({"rank_local": [
+            {"disabled_reason": None},
+            {"disabled_reason": "native_backend_trainables_disconnected"},
+        ]})
 
 
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):

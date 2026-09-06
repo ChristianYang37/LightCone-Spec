@@ -137,8 +137,10 @@ def source_checkpoint_id(model: str, backend: str) -> str:
 
 def memory_budget_policy(job: Job) -> str:
     """Execution-only policy; never rewrite immutable historical job configs."""
-    if (job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
-            or job.parameters.get("coverage_runtime") is True):
+    if job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}:
+        return "method_peak_v1"
+    if (job.parameters.get("coverage_runtime") is True
+            and not job.parameters.get("budget_preserved_started_block")):
         return "method_peak_v1"
     return "fixed_reserve_v1"
 

@@ -3590,3 +3590,22 @@ index d313394..2d7f229 100644
              "optimizer_bytes": self.optimizer_bytes,
              "trainable_parameters": self.trainable_parameters,
              "memory_ledger": dict(self.memory_ledger),
+
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index b2d296b..71b396d 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -805,11 +805,11 @@ class DSparkWorkerV2(BaseSpecWorker):
+                 microbatch = min(
+                     bs, online_adapter.config.adaptation_microbatch_size
+                 )
+-                corrected = draft_block.corrected_logits[:microbatch]
+                 # Both eager compact verification and graph epilogue scatter
+                 # into the same fixed (gamma + bonus) stride before returning.
+                 # Compact qo_indptr therefore must never index this tensor.
+-                from lightcone_spec.native_tp import strided_teacher_rows
++                from lightcone_spec.native_tp import native_training_rows, strided_teacher_rows
++                corrected = native_training_rows(draft_block.corrected_logits, microbatch)
+                 teacher_logits = strided_teacher_rows(
+                     logits_output.next_token_logits, bs, self.gamma, microbatch
+                 )

@@ -178,6 +178,8 @@ def test_coverage_e0_gap_plan_preserves_finished_sibling_and_dense_budget(tmp_pa
         job for job in planned if job.parameters["original_parent_job_id"] == original.job_id
     ]
     assert len(siblings) == len(children) - 1
+    from lightcone_spec.protocol import memory_budget_policy
+    assert all(memory_budget_policy(job) == "fixed_reserve_v1" for job in siblings)
     assert all(
         job.block == original.block and job.parameters["source_node"] == original.node
         for job in siblings
@@ -187,6 +189,7 @@ def test_coverage_e0_gap_plan_preserves_finished_sibling_and_dense_budget(tmp_pa
         job.gpu_count == 2 and job.parameters["topology"] == "tp2_dp1" for job in dense
     )
     assert all(job.parameters["evidence_owner"] == "E6" for job in dense)
+    assert all(memory_budget_policy(job) == "method_peak_v1" for job in dense)
     assert planned == module._coverage_e0_gaps(state)
 
 
