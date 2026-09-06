@@ -159,3 +159,12 @@ remain required before coverage acceptance, even if short QA passes. Estimated
 versus measured values and any unmeasured components must be reported separately.
 New-policy ETA cannot borrow fixed-reserve timings; missing strata keep the full
 ETA `UNMEASURED`, with a separately labelled priced subset.
+
+Run `scripts/gpu_acceptance.py memory-pressure` only in a drained excluded window,
+with `--case long_tts`, `long_lightcone`, `tp2`, or `retraction`. The first three
+retain two complete 32K-output requests. The retraction case retains eight c8
+requests with 8K outputs while capping its diagnostic KV pool at 41,024 slots;
+the minimum full-context guard still applies. It must observe actual native KV
+retractions in the server log and zero logical-prefix/safety violations, not just
+complete a short request. It is separate from the 41 short QA identities, and its
+timings never price the formal ETA.

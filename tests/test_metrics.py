@@ -196,6 +196,9 @@ def test_four_block_reducer_preserves_negative_rows_and_excludes_legacy_bca():
     )
     assert comparison["status"] == "measured"
     assert len(comparison["raw_blocks"]["lightcone"]) == 4
+    mixed = [(c, {**m, "memory_budget_policy": "method_peak_v1"}
+              if c["method"] == "lightcone" else m) for c, m in rows]
+    assert not any(r["status"] == "measured" for r in four_block_panel_statistics(mixed))
     rows[-1][1]["hard_feasible"] = False
     result = four_block_panel_statistics(rows)
     assert all("ratio_ci95" not in row for row in result)
@@ -232,6 +235,10 @@ def test_mechanism_four_block_ci_uses_run_points_and_keeps_censored_zero(tmp_pat
     result = four_block_mechanism_statistics(rows)
     measured = [row for row in result if row["metric"] == "target_entropy"]
     assert len(measured) == 3 and all(row["status"] == "measured" for row in measured)
+    mixed = [(c, {**m, "memory_budget_policy": "method_peak_v1"}
+              if c["method"] == "lightcone" else m) for c, m in rows]
+    assert not any(r["status"] == "measured" and r["candidate_method"] == "lightcone"
+                   for r in four_block_mechanism_statistics(mixed))
     assert all(
         len(row["raw_blocks"]["lightcone"]) == 4
         for row in measured

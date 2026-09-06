@@ -347,6 +347,7 @@ def four_block_mechanism_statistics(rows):
             }
             point = {
                 **bucket,
+                "memory_budget_policy": metrics.get("memory_budget_policy", "fixed_reserve_v1"),
                 "hard_feasible": metrics.get("hard_feasible", False),
                 "source_attempt_dir": metrics.get("source_attempt_dir"),
             }
