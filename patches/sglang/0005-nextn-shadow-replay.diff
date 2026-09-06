@@ -1787,7 +1787,7 @@ new file mode 100644
 index 00000000..86ab081e
 --- /dev/null
 +++ b/python/sglang/srt/models/gemma4_draft.py
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,538 @@
 +"""DeepSpec Gemma4 draft backbone. No Qwen aliases or copied trainable V weights."""
 +
 +import copy
@@ -1812,6 +1812,7 @@ index 00000000..86ab081e
 +from torch import nn
 +
 +from lightcone_spec.gemma import gemma_canvas_attention, gemma_rms, gemma_rotary, gemma_softcap
++from lightcone_spec.replay_diagnostic import capture_native_attention, record_replay_attention, finish_reconstruction_diagnostic
 +
 +
 +def _tp_copy(value):
@@ -1859,6 +1860,7 @@ index 00000000..86ab081e
 +    cache = attention.rotary_emb.cos_sin_cache
 +    query, key = gemma_rotary(query, positions, cache), gemma_rotary(key, positions, cache)
 +    attended = gemma_canvas_attention(query, key, value, *history, causal_canvas=eagle)
++    record_replay_attention(attention, query, key, value, history, attended)
 +    return _row(attention.o_proj, attended.reshape(-1, attention.q_size))
 +
 +
@@ -1972,6 +1974,7 @@ index 00000000..86ab081e
 +                strict=True,
 +            )
 +        )
++        finish_reconstruction_diagnostic(self, self._last_reconstruction)
 +        return bool(stats[0].item())
 +
 +
@@ -2205,7 +2208,7 @@ index 00000000..86ab081e
 +    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
 +        if not (torch.is_grad_enabled() and getattr(self, "_lightcone_training_replay", False)):
 +            return super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
-+        with torch.no_grad():
++        with torch.no_grad(), capture_native_attention(self):
 +            native = super().forward(input_ids, positions, forward_batch, input_embeds, **kwargs)
 +            native_logits = self._replay_logits(native.hidden_states)
 +        replay, _ = self._replay_hidden(input_ids, positions, forward_batch, input_embeds)

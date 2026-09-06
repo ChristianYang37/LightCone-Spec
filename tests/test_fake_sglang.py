@@ -2645,6 +2645,8 @@ def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
     ("qwen3_draft_replay", "QwenDraftReplay", False),
 ])
 def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
+    from lightcone_spec.replay_diagnostic import capture_native_attention
+
     tree = _coverage_added_module(f"python/sglang/srt/models/{module}.py")
     original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
     forward = next(node for node in original.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
@@ -2676,6 +2678,7 @@ def test_native_warmup_is_not_shadow_training(module, class_name, has_model):
         keywords=[], body=[forward], decorator_list=[],
     )
     namespace = {"Native": Native, "torch": torch}
+    namespace["capture_native_attention"] = capture_native_attention
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "native-forward-mode", "exec"), namespace)
     model = namespace[class_name]()
     values = torch.ones(2, 4)
@@ -3051,6 +3054,38 @@ def test_qwen_eagle_replay_owns_source_before_native_fused_residual():
         torch.testing.assert_close(measured, (original + 3.0).sum(0))
 
 
+def test_excluded_replay_diagnostic_preserves_inputs_and_stops_on_mismatch(monkeypatch, tmp_path):
+    from lightcone_spec.replay_diagnostic import (
+        capture_native_attention,
+        finish_reconstruction_diagnostic,
+        record_replay_attention,
+    )
+
+    class Attention(torch.nn.Module):
+        def forward(self, q, k, v):
+            q.add_(1)
+            return q + k + v
+
+    attention = SimpleNamespace(attn=Attention())
+    model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)])
+    with capture_native_attention(model):
+        pass
+    assert not hasattr(model, "_replay_diagnostic_layers")
+    monkeypatch.setenv("LIGHTCONE_REPLAY_DIAGNOSTIC_DIR", str(tmp_path))
+    q, k, v = (torch.ones(2, 2) for _ in range(3))
+    with capture_native_attention(model):
+        output = attention.attn(q, k, v)
+    torch.testing.assert_close(model._replay_diagnostic_layers[0]["native_q"], torch.ones(2, 2))
+    assert not attention.attn._forward_hooks and not attention.attn._forward_pre_hooks
+    record_replay_attention(attention, q, k, v, (k, v, torch.ones(2, dtype=torch.bool)), output)
+    with pytest.raises(RuntimeError, match="diagnostic saved"):
+        finish_reconstruction_diagnostic(model, {"ok": False})
+    saved = torch.load(next(tmp_path.glob("*.pt")), weights_only=True)
+    assert saved["stats"] == {"ok": False}
+    assert "history_k" in saved["layers"][0]
+    assert attention._replay_diagnostic is None
+
+
 def _gemma_tp_gradient_worker(rank, init_path):
     """Actual two-process collectives, not forward-only simulated sharding."""
     import types
@@ -3059,6 +3094,7 @@ def _gemma_tp_gradient_worker(rank, init_path):
     import torch.nn.functional as functional
 
     from lightcone_spec.gemma import gemma_canvas_attention, gemma_rms, gemma_rotary
+    from lightcone_spec.replay_diagnostic import record_replay_attention
 
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=2)
@@ -3103,6 +3139,7 @@ def _gemma_tp_gradient_worker(rank, init_path):
         ]
         namespace.update(
             F=functional,
+            record_replay_attention=record_replay_attention,
             gemma_rms=gemma_rms,
             gemma_rotary=gemma_rotary,
             gemma_canvas_attention=gemma_canvas_attention,
