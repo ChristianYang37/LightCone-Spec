@@ -7936,7 +7936,10 @@ def _run_coverage_recovery(
         return
     plan = state.selection("formal_coverage_recovery_plan_v1", None)
     if plan is None:
-        rows = [(Job(**item), metrics) for item, metrics in _metric_rows(state, "E0-tune")]
+        rows = [
+            (_job_from_metric_config(item), metrics)
+            for item, metrics in _metric_rows(state, "E0-tune")
+        ]
         jobs = (*compatibility_replacements(rows), *_coverage_e0_gaps(state))
         plan = [job.to_dict() for job in jobs]
         state.set_selection("formal_coverage_recovery_plan_v1", plan)
@@ -7981,7 +7984,9 @@ def _run_coverage_recovery(
         if stop_event.is_set():
             return
         _require_internal_jobs(state, node)
-    rows = [(Job(**item), metrics) for item, metrics in _metric_rows(state, "E0-tune")]
+    rows = [
+        (_job_from_metric_config(item), metrics) for item, metrics in _metric_rows(state, "E0-tune")
+    ]
     matrix = method_feasibility(rows)
     audit = {
         "status": "completed",

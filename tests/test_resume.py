@@ -232,6 +232,71 @@ def test_coverage_e1a_refits_after_capture_once_and_preserves_geometry(tmp_path,
     assert state.selection("formal_coverage_e1a_v1")["dspark_available"]
 
 
+@pytest.mark.parametrize("restore_saved_plan", [False, True])
+def test_coverage_recovery_reads_enriched_attempt_config_once(
+    tmp_path, monkeypatch, restore_saved_plan
+):
+    import lightcone_spec.runner as module
+    from lightcone_spec.coverage import compatibility_replacements
+
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("formal_coverage_runtime_v1", {"status": "accepted"})
+    state.set_selection("formal_coverage_e1a_v1", {"status": "completed"})
+    original = next(
+        job for job in materialize("E0-tune")
+        if job.parameters.get("pair_calibration")
+        and job.model == "Gemma4-12B" and job.backend == "EAGLE3" and job.method == "static"
+    )
+    failed_metrics = {
+        "hard_feasible": False,
+        "error": "Gemma4Eagle3Model is not a registered model",
+    }
+
+    def complete(job, metrics):
+        directory = config.run_dir / "jobs" / job.job_id / "attempt-01"
+        directory.mkdir(parents=True)
+        # Real attempt payloads contain execution fields beyond the Job schema.
+        (directory / "config.json").write_text(json.dumps({
+            **job.to_dict(), "adaptation": {"stride": 10},
+            "declared_concurrency": 2, "execution_gpu_ids": [0],
+        }))
+        (directory / "metrics.json").write_text(json.dumps(metrics))
+        attempt = state.start(job, (0,), directory)
+        state.complete(job.job_id, attempt)
+        return directory
+
+    state.add_internal_jobs((original,), storage_node="E0-tune")
+    old = complete(original, failed_metrics)
+    original_bytes = (old / "config.json").read_bytes()
+    repairs = compatibility_replacements([(original, failed_metrics)])
+    if restore_saved_plan:
+        state.set_selection("formal_coverage_recovery_plan_v1", [j.to_dict() for j in repairs])
+    monkeypatch.setattr(module, "_coverage_e0_gaps", lambda state: ())
+    monkeypatch.setattr(
+        module, "summarize_metric_rows", lambda rows, output: output.mkdir(parents=True, exist_ok=True)
+    )
+    monkeypatch.setattr(module, "paired_block_statistics", lambda *args: {})
+    monkeypatch.setattr(module, "_write_coverage_eta", lambda *args: None)
+    claims = []
+
+    def execute(config, state, node, stop, pending):
+        for job in pending:
+            claims.append(job.job_id)
+            complete(job, {"hard_feasible": True})
+
+    monkeypatch.setattr(module, "_run_pending_jobs", execute)
+    module._run_coverage_recovery(config, state, threading.Event())
+    module._run_coverage_recovery(config, state, threading.Event())
+    assert claims == [repairs[0].job_id]
+    audit = state.selection("formal_coverage_recovery_v1")
+    assert audit["status"] == "completed"
+    assert audit["method_feasibility"]["Gemma4-12B|EAGLE3|static|tp1_dp1"]["hard_feasible"]
+    assert original.job_id in state.selection("formal_evidence_exclusions")
+    assert (old / "config.json").read_bytes() == original_bytes
+    assert state.job_status(original.job_id) == "completed"
+
+
 def _config(tmp_path: Path) -> ExperimentConfig:
     return ExperimentConfig(
         source=tmp_path / "paper.yaml",
