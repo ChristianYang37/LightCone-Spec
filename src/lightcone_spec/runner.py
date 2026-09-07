@@ -2696,7 +2696,11 @@ def _automatic_work_units(
         if pin and not set(pin).issubset(config.gpu_ids):
             raise RuntimeError(f"started-unit GPU allocation unavailable: {identity}: {pin}")
         legacy = bool(prior) and policies != {"automatic_units_v3"}
-        isolation = legacy or any(any(job.parameters.get(name) for name in (
+        legacy_isolation = legacy and len(pin) > 1 and all(
+            job.parameters.get("topology", "tp1_dp1") == "tp1_dp1"
+            and not job.node.startswith("E6") for job in rows
+        )
+        isolation = legacy_isolation or any(any(job.parameters.get(name) for name in (
             "profiler", "failure", "controlled_replay", "controlled_pair_baseline",
             "requires_isolation",
         )) for job in rows)

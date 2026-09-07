@@ -1095,6 +1095,14 @@ def test_automatic_unit_keys_keep_models_topologies_and_replacements_separate(tm
     assert len(units) == 2
     assert units[0].pin == (1,) and units[0].devices == 1
     assert units[1].pin == () and units[1].devices == 2
+    # Missing the new policy label does not turn an explicitly single-device
+    # historical lease into a fresh two-device reservation.
+    (directory / "config.json").write_text(json.dumps({"parameters": {
+        "execution_gpu_ids": [1], "execution_cpu_affinity": [8, 9],
+    }}))
+    legacy = _automatic_work_units(config, state, (replacement,))[0]
+    assert legacy.pin == (1,) and legacy.devices == 1 and not legacy.isolated
+    assert legacy.execution_policy == "legacy_affinity_v1" and legacy.legacy_cpus == (8, 9)
     source = replace(base, parameters={"pairing_key": "source|8b|dflash|math"})
     assert logical_unit_key(source) != logical_unit_key(replace(source, block=1))
     state.set_selection("tp1_resource_parallel_v2", {"enabled": True})
