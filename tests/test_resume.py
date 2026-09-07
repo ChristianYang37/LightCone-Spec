@@ -277,7 +277,6 @@ def test_coverage_recovery_reads_enriched_attempt_config_once(
         module, "summarize_metric_rows", lambda rows, output: output.mkdir(parents=True, exist_ok=True)
     )
     monkeypatch.setattr(module, "paired_block_statistics", lambda *args: {})
-    monkeypatch.setattr(module, "_write_coverage_eta", lambda *args: None)
     claims = []
 
     def execute(config, state, node, stop, pending):
@@ -295,6 +294,7 @@ def test_coverage_recovery_reads_enriched_attempt_config_once(
     assert original.job_id in state.selection("formal_evidence_exclusions")
     assert (old / "config.json").read_bytes() == original_bytes
     assert state.job_status(original.job_id) == "completed"
+    assert state.selection("formal_coverage_eta_v1")["status"] == "UNMEASURED"
 
 
 def _config(tmp_path: Path) -> ExperimentConfig:

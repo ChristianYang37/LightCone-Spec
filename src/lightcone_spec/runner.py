@@ -7556,8 +7556,9 @@ def _write_coverage_eta(config, state):
              SOURCE_COVERAGE_NODE, MECHANISM_NODE, "E5-pilot", "E5-final"]
     remaining = tuple(sorted(remaining, key=lambda j: (
         order.index(j.node) if j.node in order else len(order), j.ordinal)))
-    evidence = [row for node in (*PAPER_NODES, SOURCE_COVERAGE_NODE, MECHANISM_NODE)
-                for row in _metric_rows(state, node)]
+    evidence = [(_job_from_metric_config(item), metrics)
+                for node in (*PAPER_NODES, SOURCE_COVERAGE_NODE, MECHANISM_NODE)
+                for item, metrics in _metric_rows(state, node)]
     isolated = not state.selection("tp1_resource_parallel_v2", {}).get("enabled")
     audit = request_budget_eta(
         remaining, evidence,
