@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -44,6 +45,8 @@ def main():
     parser.add_argument("--gpu", required=True, type=int)
     parser.add_argument("--variant", required=True, choices=("target", "static", "frozen", "active"))
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--verify-trace", action="store_true", help="Excluded synchronized verification trace")
+    parser.add_argument("--reference", type=Path, help="Prior successful capture whose output IDs must match")
     args = parser.parse_args()
     config = ExperimentConfig.load(args.config)
     if args.gpu not in config.gpu_ids or not 1 <= args.max_tokens <= 32768:
@@ -68,10 +71,22 @@ def main():
     if args.variant == "frozen" and adaptation_payload(job, selection)["stride"] != args.max_tokens * 8 + 1:
         raise RuntimeError("frozen control stride was overridden before launch")
     (args.output / "server").mkdir()
+    if args.verify_trace:
+        if args.variant == "target" or args.reference is None:
+            raise ValueError("verification trace requires a DFlash path and a prior output reference")
+        os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
+            "output_directory": str((args.output / "server").resolve()),
+            "request_suffix": "-2-00000", "start": 620, "end": 660,
+        })
+        os.environ["PYTHONPATH"] = os.pathsep.join((
+            str(Path(__file__).resolve().parent / "preview_verify_trace"),
+            os.environ.get("PYTHONPATH", ""),
+        ))
     (args.output / "config.json").write_text(json.dumps({"job": job.to_dict(),
         "adaptation": adaptation_payload(job, selection), "excluded": True,
         "capture_scope": "first three original requests, original seed/order, bounded output; not performance evidence",
-        "diagnostic_top_logprobs": diagnostic_logprobs(args.variant)}, indent=2))
+        "diagnostic_top_logprobs": diagnostic_logprobs(args.variant),
+        "verification_trace": args.verify_trace}, indent=2))
     process = ServerProcess(config, job, gpus=(args.gpu,), port=config.server.base_port + 30 + args.gpu,
                             output_dir=args.output / "server", selection=selection)
     with process as client:
@@ -90,6 +105,12 @@ def main():
             records.extend(r.to_dict() for r in result)
             (args.output / "requests.json").write_text(json.dumps(records))
         after = _speed_metrics(client.server_info(), "tp1_dp1")
+        if args.verify_trace:
+            if not list((args.output / "server").glob("verify-*.jsonl")):
+                raise RuntimeError("verification trace hook produced no evidence")
+            prior = json.loads(args.reference.read_text())
+            if [r["output_ids"] for r in records] != [r["output_ids"] for r in prior]:
+                raise RuntimeError("verification tracing perturbed the reference trajectory; do not accept")
         if args.variant == "frozen" and after["updates_published"] != before["updates_published"]:
             raise RuntimeError("frozen control unexpectedly published an update")
         (args.output / "result.json").write_text(json.dumps({"status": "captured_not_reviewed",

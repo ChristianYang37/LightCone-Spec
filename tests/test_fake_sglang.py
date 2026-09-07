@@ -3790,3 +3790,51 @@ def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
                                     "--output", str(tmp_path / "video"), "--method-index", "0", "--gpu", "0"])
     with pytest.raises(ReachedServer):
         runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/record_preview.py"), run_name="__main__")
+
+
+def test_excluded_verification_trace_is_read_only_and_windowed(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from lightcone_spec.verification_diagnostic import install, verification_snapshot
+
+    logits = torch.tensor([[0., 1., 2., 2.], [2., 1., 0., -1.]])
+    values = {
+        "self": SimpleNamespace(block_size=2, _need_mamba_verify_commit=False),
+        "batch": SimpleNamespace(reqs=[SimpleNamespace(rid="diag-active-2-00000",
+            origin_input_ids=[1]*100, output_ids=[2]*640)], seq_lens=torch.tensor([740])),
+        "logits_output": SimpleNamespace(next_token_logits=logits),
+        "prefix_lens": torch.tensor([740]), "positions": torch.tensor([740, 741]),
+        "verify_out_cache_loc_2d": torch.tensor([[10, 11]]),
+        "draft_tokens": torch.tensor([[3, 2]]), "target_predict": torch.tensor([[2, 0]]),
+        "commit_lens": torch.tensor([1]), "out_tokens": torch.tensor([[2, 4]]),
+        "accept_len": torch.tensor([0]), "bonus": torch.tensor([2]),
+        "online_adapter": SimpleNamespace(runtime=SimpleNamespace(active_version=10, round=100)),
+    }
+    before = logits.clone()
+    result = verification_snapshot(values, 0)
+    assert result["committed_matches_verify_argmax"] is True
+    assert result["target_top2_logits"][0] == [2., 2.]
+    assert result["generated_offset"] == 640 and result["active_version"] == 10
+    assert torch.equal(logits, before)
+    values["out_tokens"][0, 0] = 3
+    assert verification_snapshot(values, 0)["committed_matches_verify_argmax"] is False
+    values["out_tokens"][0, 0] = 2
+    source = "def forward_batch_generation(" + ",".join(values) + "):\n    if self._need_mamba_verify_commit:\n        pass\n    return out_tokens\n"
+    path = tmp_path / "speculative/dflash_worker_v2.py"
+    path.parent.mkdir()
+    path.write_text(source)
+    namespace = {}
+    exec(compile(source, str(path), "exec"), namespace)
+    monkeypatch.setenv("LIGHTCONE_EXCLUDED_VERIFY_TRACE", json.dumps({
+        "output_directory": str(tmp_path), "request_suffix": "-2-00000", "start": 620, "end": 660}))
+    previous = sys.gettrace()
+    try:
+        install()
+        assert torch.equal(namespace["forward_batch_generation"](**values), values["out_tokens"])
+        values["prefix_lens"] = torch.tensor([900])
+        namespace["forward_batch_generation"](**values)
+    finally:
+        sys.settrace(previous)
+    rows = [json.loads(line) for p in tmp_path.glob("verify-*.jsonl") for line in p.read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["commit_count"] == 1

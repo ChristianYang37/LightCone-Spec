@@ -51,6 +51,13 @@ DFlash rejects `return_logprob`; only target-only captures top-2 probabilities.
 The first common prefix is scored through target-only; verification-side logits
 need separate instrumentation if that does not explain the difference.
 Generated text stays private. No captured run is an automatic pass.
+The optional `--verify-trace --reference <prior requests.json>` diagnostic
+loads an excluded-only Python trace hook. It records verification top-2 logits,
+argmax/committed/bonus IDs, positions, KV locations and adapter versions only
+around request 2 output positions 620--660. It changes no SGLang patch or
+sampler. Synchronization can perturb execution: a missing trace or any output-ID
+change from the successful uninstrumented capture rejects that diagnostic.
+Its timings must never be used for performance claims.
 Review verification/bonus/stop indices, target state, KV/version/reset, and
 numeric margins before declaring a root cause or accepting speedup claims.
 The diagnostic output cap is not a change to any formal request budget.
