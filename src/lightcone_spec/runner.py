@@ -4124,7 +4124,7 @@ def _run_pending_jobs(
                     if (
                         _screening_job(first_job)
                         or first_job.parameters.get("coverage_runtime")
-                        or first_job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+                        or first_job.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE, *PREVIEW_NODES}
                     ) and _capacity_infeasible(error, session_dir / "server.log"):
                         _terminalize_pending_session_rows(
                             state,

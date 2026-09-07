@@ -132,6 +132,44 @@ def test_preview_remapped_units_keep_each_registered_order(monkeypatch, tmp_path
     assert state.status_counts("E3b-preview-v1") == {"completed": 6}
 
 
+def test_preview_startup_capacity_is_terminal_and_sibling_continues(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("tp1_resource_parallel_v3", {"enabled": True})
+    jobs = tuple(Job(job_id=f"preview-cap-{method}", node="E5-preview-v1", ordinal=i,
+                     model="Qwen/Qwen3-8B", backend="DSPARK", method=method,
+                     task="LiveCodeBench", context=40928, load="closed_loop_c8", width=16,
+                     block=0, gpu_count=1, parameters={"panel": "preview_v1", "pairing_key": "cap-pair"})
+                 for i, method in enumerate(("lightcone", "static")))
+    state.add_internal_jobs(jobs, storage_node="E5-preview-v1")
+
+    class Server:
+        def __init__(self, config, job, **kwargs):
+            self.job = job
+
+        def __enter__(self):
+            if self.job.method == "lightcone":
+                raise MemoryError("adaptation peak 67 exceeds pre-KV reserve 55")
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def execute(config, state, job, *, gpus, **kwargs):
+        attempt = state.start(job, gpus, tmp_path / job.job_id)
+        state.complete(job.job_id, attempt)
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", Server)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda c, s, j: j)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    monkeypatch.setattr("lightcone_spec.runner._write_preview_status", lambda *_: None)
+    _run_pending_jobs(config, state, "E5-preview-v1", threading.Event(), jobs)
+    assert state.status_counts("E5-preview-v1") == {"completed": 2}
+    metrics = json.loads((config.run_dir / "jobs/preview-cap-lightcone/attempt-01/metrics.json").read_text())
+    assert metrics["scientific_outcome"] == "infeasible" and not metrics["hard_feasible"]
+
+
 def test_coverage_repair_is_method_specific_and_dense_transfer_preserves_workload():
     from lightcone_spec.coverage import (
         compatibility_replacements,
