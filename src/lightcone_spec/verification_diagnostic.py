@@ -51,6 +51,8 @@ def install():
     line_numbers = {}
     captured = 0
     state_audit = None
+    reset_count = 0
+    reset_reference = None
 
     def local_trace(frame, event, arg):
         nonlocal captured
@@ -72,8 +74,30 @@ def install():
         return local_trace
 
     def dispatch(frame, event, arg):
-        nonlocal state_audit
+        nonlocal state_audit, reset_count, reset_reference
         code = frame.f_code
+        if (event == "call" and settings.get("reset_audit") and code.co_name == "reset"
+                and code.co_filename.endswith("/speculative/dflash_online_adaptation.py")):
+            adapter = frame.f_locals["self"]
+
+            def finish_reset(frame, event, arg):
+                nonlocal reset_count, reset_reference
+                if event == "return":
+                    from lightcone_spec.reset_diagnostic import reset_snapshot
+
+                    reset_count += 1
+                    if reset_count > 4:
+                        raise RuntimeError("excluded reset audit exceeded its bound")
+                    record = reset_snapshot(adapter)
+                    if reset_reference is None:
+                        reset_reference = record["state"]
+                    record["matches_first_reset"] = record["state"] == reset_reference
+                    (output / f"reset-{os.getpid()}-{reset_count}.json").write_text(json.dumps(record))
+                    if not record["passed"] or not record["matches_first_reset"]:
+                        raise RuntimeError("excluded reset fingerprint mismatch")
+                return finish_reset
+
+            return finish_reset
         if (event == "call" and settings.get("target_state_audit")
                 and code.co_name == "maybe_launch"
                 and code.co_filename.endswith("/speculative/dflash_online_adaptation.py")

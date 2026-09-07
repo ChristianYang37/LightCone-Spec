@@ -77,6 +77,13 @@ excluded pressure testing, not the normal-EOS benchmark. A separate GPU process
 checks actual Adam experts against native Adam, rejection transactionality,
 cumulative Hedge and reset, then exits before server memory measurements.
 Short passing requests cannot stand in for full-condition common-TP acceptance.
+The separate `--reset-diagnostic <original QA directory>` mode runs only the two
+512-token requests, fingerprints post-reset optimizer/master/active/staging and
+target state, and traces verification offsets 150--190. It never writes a passing
+QA result or formal acceptance. It records whether instrumentation preserves each
+original trajectory; synchronized traces that change an async publication schedule
+cannot establish the cause of an uninstrumented divergence. Epoch/generation IDs
+are recorded separately from byte-equality checks because they intentionally advance.
 
 ## Metrics, memory and release
 

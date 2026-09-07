@@ -3808,6 +3808,54 @@ def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
         runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/record_preview.py"), run_name="__main__")
 
 
+def test_excluded_reset_fingerprints_detect_state_not_output(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace as NS
+
+    from lightcone_spec.reset_diagnostic import reset_snapshot
+    from lightcone_spec.verification_diagnostic import install
+
+    initial = (torch.tensor([.2, .3]),)
+    base = torch.tensor([1., 2.])
+    optimizer = NS(master=tuple(t.clone() for t in initial), first=(torch.zeros(2),),
+                   second=(torch.zeros(2),), metadata_tensors=(torch.tensor(0),), step=0)
+    runtime = NS(pending=None, reserved=None, requests={}, device_commits={}, latest_device_lengths={},
+                 update_traces=[], round_traces=[], active_round_rows={}, counters={"fallbacks": 0},
+                 active_version=0, round=0, active_request_id=None, epoch=1, slot_generation=1)
+    target = torch.nn.Linear(2, 2)
+    adapter = NS(config=NS(weight_update_mode="lora"), request_slots=None, device="cpu",
+                 runtime=runtime, optimizer=optimizer, initial_trainable=initial, base={"w": base},
+                 names=("w",), inference=NS(active=(base.clone(),), staging=(base.clone(),)),
+                 worker=NS(target_worker=NS(model_runner=NS(model=target))))
+    first = reset_snapshot(adapter)
+    assert first["passed"]
+    runtime.epoch += 1
+    assert reset_snapshot(adapter)["state"] == first["state"]
+    optimizer.first[0][0] = 1.
+    assert not reset_snapshot(adapter)["checks"]["moments_zero"]
+    optimizer.first[0].zero_()
+    adapter.inference.active[0][0] = 3.
+    assert not reset_snapshot(adapter)["checks"]["active_restored"]
+    adapter.inference.active[0].copy_(base)
+    source = "def reset(self):\n    self.runtime.epoch += 1\n"
+    path = tmp_path / "speculative/dflash_online_adaptation.py"
+    path.parent.mkdir()
+    path.write_text(source)
+    namespace = {}
+    exec(compile(source, str(path), "exec"), namespace)
+    monkeypatch.setenv("LIGHTCONE_EXCLUDED_VERIFY_TRACE", json.dumps({
+        "output_directory": str(tmp_path), "request_suffix": "-00000", "start": 150, "end": 190, "reset_audit": True}))
+    previous = sys.gettrace()
+    try:
+        install()
+        namespace["reset"](adapter)
+        namespace["reset"](adapter)
+    finally:
+        sys.settrace(previous)
+    records = [json.loads(p.read_text()) for p in tmp_path.glob("reset-*.json")]
+    assert len(records) == 2 and all(r["matches_first_reset"] and r["passed"] for r in records)
+
+
 def test_excluded_verification_trace_is_read_only_and_windowed(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace

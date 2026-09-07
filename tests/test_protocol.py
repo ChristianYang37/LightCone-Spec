@@ -117,6 +117,12 @@ def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     ens, _ = qa["update_qa_job"](source, "ensemble")
     assert ens.parameters["stride"] == 10 and ens.parameters["generation_tokens"] == 512
     assert ens.parameters["frozen_recipe"]["ensemble_optimizer"] == "adam_preview_v3"
+    ens_tp2, _ = qa["update_qa_job"](source, "ensemble", 2)
+    assert ens_tp2.gpu_count == 2 and ens_tp2.parameters["topology"] == "tp2_dp1"
+    assert ens_tp2.parameters["execution_request_count"] == ens.parameters["execution_request_count"]
+    assert ens_tp2.parameters["frozen_recipe"] == ens.parameters["frozen_recipe"]
+    with pytest.raises(ValueError, match="TP1/TP2"):
+        qa["update_qa_job"](source, "ensemble", 4)
     assert json.dumps(source.to_dict(), sort_keys=True) == before
 
 
