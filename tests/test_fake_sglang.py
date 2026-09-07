@@ -134,6 +134,7 @@ def test_update_memory_upper_bound_includes_pre_backward_capture(tmp_path, monke
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                and n.name in {"_begin_memory_probe", "side_update"}]
     fake = SimpleNamespace(allocated=100, peak=100, resets=0)
+    traces = []
     def reset_peak(device):
         fake.peak = fake.allocated
         fake.resets += 1
@@ -141,18 +142,22 @@ def test_update_memory_upper_bound_includes_pre_backward_capture(tmp_path, monke
                            memory_allocated=lambda device: fake.allocated,
                            max_memory_allocated=lambda device: fake.peak,
                            reset_peak_memory_stats=reset_peak,
-                           current_stream=lambda device: None, stream=lambda value: nullcontext())
+                           current_stream=lambda device: None, stream=lambda value: nullcontext(),
+                           memory=SimpleNamespace(
+                               _record_memory_history=lambda **kw: traces.append(kw),
+                               _dump_snapshot=lambda path: traces.append(Path(path).name)))
     namespace = {"torch": SimpleNamespace(cuda=cuda), "os": os, "contextmanager": contextmanager}
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *methods], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "memory-probe", "exec"), namespace)
     runtime = SimpleNamespace(device=0, _qa_memory_baseline=None, _qa_allocator_peak=0,
-                              resident_bytes=10, peak_bytes=200, measured_update_peak_bytes=None,
+                              resident_bytes=10, peak_bytes=120, measured_update_peak_bytes=None, epoch=1,
                               main_ready=SimpleNamespace(record=lambda stream: None),
                               side_stream=SimpleNamespace(wait_event=lambda event: None))
     runtime._begin_memory_probe = types.MethodType(namespace["_begin_memory_probe"], runtime)
     monkeypatch.delenv("LIGHTCONE_MEMORY_BUDGET_QA", raising=False)
+    monkeypatch.setenv("LIGHTCONE_QA_ALLOCATOR_TRACE_DIR", str(tmp_path))
     runtime._begin_memory_probe()
-    assert fake.resets == 0 and runtime._qa_memory_baseline is None
+    assert fake.resets == 0 and runtime._qa_memory_baseline is None and not traces
     monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_QA", "1")
     runtime._begin_memory_probe()
     fake.allocated, fake.peak = 180, 200
@@ -160,6 +165,11 @@ def test_update_memory_upper_bound_includes_pre_backward_capture(tmp_path, monke
         fake.allocated = fake.peak = 220
     assert runtime.measured_update_peak_bytes == 50
     assert runtime.measured_update_peak_upper_bound_bytes == 130
+    assert traces[0] == {"max_entries": 200000, "stacks": "python"}
+    assert traces[1].startswith("allocator-baseline-")
+    assert traces[2].startswith("allocator-upper-bound-")
+    assert traces[3] == {"enabled": None}
+    assert runtime._qa_allocator_trace_saved
 
 
 def _memory_budget_functions():

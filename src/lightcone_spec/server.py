@@ -769,10 +769,13 @@ class ServerProcess:
         # fixed reservation even when resumed by a coverage-enabled runner.
         environment["LIGHTCONE_MEMORY_BUDGET_POLICY"] = memory_budget_policy(self.job)
         environment.pop("LIGHTCONE_MEMORY_BUDGET_QA", None)
+        environment.pop("LIGHTCONE_QA_ALLOCATOR_TRACE_DIR", None)
         if (self.job.parameters.get("excluded_from_analysis") is True
                 and memory_budget_policy(self.job) == "method_peak_v1"
                 and self.job.method in ADAPTIVE_METHODS):
             environment["LIGHTCONE_MEMORY_BUDGET_QA"] = "1"
+            if self.job.parameters.get("memory_pressure_case") == "retraction":
+                environment["LIGHTCONE_QA_ALLOCATOR_TRACE_DIR"] = str(self.output_dir)
         if self.config.server.cuda_home is not None:
             cuda_home = self.config.server.cuda_home
             environment["CUDA_HOME"] = str(cuda_home)

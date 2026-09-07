@@ -3669,7 +3669,7 @@ index 2d7f229..c4de6c4 100644
          self.budget_violations = 0
          self.optimizer_bytes = 0
          self.trainable_parameters = 0
-@@ -1415,6 +1418,17 @@ class OnlineCohortRuntime:
+@@ -1415,6 +1418,24 @@ class OnlineCohortRuntime:
          self.parameter_layout = layout
          return projection_identity
  
@@ -3683,6 +3683,13 @@ index 2d7f229..c4de6c4 100644
 +            self._qa_memory_baseline = torch.cuda.memory_allocated(self.device)
 +            self._qa_allocator_peak = self._qa_memory_baseline
 +            torch.cuda.reset_peak_memory_stats(self.device)
++            trace_dir = os.environ.get("LIGHTCONE_QA_ALLOCATOR_TRACE_DIR")
++            if trace_dir:
++                torch.cuda.memory._record_memory_history(max_entries=200000, stacks="python")
++                torch.cuda.memory._dump_snapshot(os.path.join(
++                    trace_dir, f"allocator-baseline-{os.getpid()}-{self.epoch}.pickle"
++                ))
++                self._qa_allocator_trace_saved = False
 +
      @contextmanager
      def side_update(
@@ -3700,7 +3707,7 @@ index 2d7f229..c4de6c4 100644
              torch.cuda.reset_peak_memory_stats(self.device)
          main = torch.cuda.current_stream(self.device)
          self.main_ready.record(main)
-@@ -1437,6 +1455,12 @@ class OnlineCohortRuntime:
+@@ -1437,6 +1455,23 @@ class OnlineCohortRuntime:
              finally:
                  if memory_qa:
                      torch.cuda.synchronize(self.device)
@@ -3710,6 +3717,17 @@ index 2d7f229..c4de6c4 100644
 +                    self.measured_update_peak_upper_bound_bytes = self.resident_bytes + max(
 +                        self._qa_allocator_peak - self._qa_memory_baseline, 0
 +                    )
++                    trace_dir = os.environ.get("LIGHTCONE_QA_ALLOCATOR_TRACE_DIR")
++                    if (trace_dir and not self._qa_allocator_trace_saved
++                            and self.measured_update_peak_upper_bound_bytes > self.peak_bytes):
++                        # The whole-round bound includes inference allocations.
++                        # Preserve stacks for attribution; never relax the budget.
++                        torch.cuda.memory._dump_snapshot(os.path.join(
++                            trace_dir, f"allocator-upper-bound-{os.getpid()}-{self.epoch}.pickle"
++                        ))
++                        self._qa_allocator_trace_saved = True
++                        torch.cuda.memory._record_memory_history(enabled=None)
++
                      observed = self.resident_bytes + max(
                          torch.cuda.max_memory_allocated(self.device) - memory_before, 0
                      )
