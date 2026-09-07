@@ -1983,6 +1983,22 @@ def test_preview_ensemble_really_uses_independent_adam_and_transactional_reset()
     assert all(torch.count_nonzero(t) == 0 for t in optimizer.second)
 
 
+def test_preview_gpu_transaction_recipe_check_has_cpu_reference():
+    import runpy
+
+    qa = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/validate_preview_updates.py"))
+    config = _online_config("onlinespec_ens")
+    config.online_spec.ensemble_optimizer = "adam_preview_v3"
+    config.online_spec.additional_learning_rates = (2e-4, 4e-4)
+    config.online_spec.hedge_learning_rate = 10.
+    config.optimizer.learning_rate = 1e-4
+    config.optimizer.beta1, config.optimizer.beta2 = .9, .95
+    config.optimizer.epsilon, config.optimizer.grad_clip = 1e-8, .5
+    result = qa["adam_transaction_check"](_patched_online_optimizer(), config, torch.device("cpu"))
+    assert result["status"] == "passed" and result["before_reset"]["step"] == 3
+    assert result["before_reset"]["learning_rates"] == [1e-4, 2e-4, 4e-4]
+
+
 def test_cosine_horizon_and_e1a_fixed_settings():
     job = materialize("E2-r2")[0]
     job = job.__class__(

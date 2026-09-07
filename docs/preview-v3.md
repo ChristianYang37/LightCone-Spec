@@ -69,6 +69,15 @@ Review verification/bonus/stop indices, target state, KV/version/reset, and
 numeric margins before declaring a root cause or accepting speedup claims.
 The diagnostic output cap is not a change to any formal request budget.
 
+`scripts/validate_preview_updates.py` separately validates the proposed update
+paths without accepting any formal node. It uses one frozen 8B MATH prompt,
+two 512-token greedy reset repetitions, then either a forced-32K S1 pressure
+request or a 512-token sampled ensemble request. The forced EOS override is
+excluded pressure testing, not the normal-EOS benchmark. A separate GPU process
+checks actual Adam experts against native Adam, rejection transactionality,
+cumulative Hedge and reset, then exits before server memory measurements.
+Short passing requests cannot stand in for full-condition common-TP acceptance.
+
 ## Metrics, memory and release
 
 Four raw block points and block-level paired log-ratio t95% intervals (df=3) are

@@ -105,6 +105,19 @@ def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     assert all(j.parameters["execution_request_count"] == 32 for j in serving)
     assert len({json.dumps(j.parameters["preview_prompt_records"]) for j in serving}) == 1
     assert len(VIDEO_METHODS) == 6 and all(method != "tts" for _, method, _ in VIDEO_METHODS)
+    import runpy
+    qa = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/validate_preview_updates.py"))
+    source = next(j for j in jobs if j.method == "lightcone" and j.backend == "DFLASH")
+    before = json.dumps(source.to_dict(), sort_keys=True)
+    s1, recipe = qa["update_qa_job"](source, "s1-long")
+    assert s1.parameters["generation_tokens"] == 32768 and s1.parameters["stride"] == 1
+    assert s1.parameters["execution_request_count"] == 1 and s1.parameters["excluded_from_analysis"]
+    assert s1.parameters["preview_prompt_records"] == source.parameters["preview_prompt_records"]
+    assert s1.block is None and s1.gpu_count == 1 and recipe["rank"] == 8
+    ens, _ = qa["update_qa_job"](source, "ensemble")
+    assert ens.parameters["stride"] == 10 and ens.parameters["generation_tokens"] == 512
+    assert ens.parameters["frozen_recipe"]["ensemble_optimizer"] == "adam_preview_v3"
+    assert json.dumps(source.to_dict(), sort_keys=True) == before
 
 
 def test_qwen38_preview_exact_24_native_mtp_and_common_tp():
