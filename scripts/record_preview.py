@@ -200,7 +200,7 @@ def main():
                 self.end_headers()
 
         (args.output / "job.json").write_text(json.dumps(job.to_dict(), indent=2))
-        print(f"Recording ready on loopback port {args.port}; connect via SSH tunnel", flush=True)
+        print(f"Recording ready on loopback port {args.port}; run capture/Chromium on this SSH host", flush=True)
         http = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
         try:
             http.serve_forever()

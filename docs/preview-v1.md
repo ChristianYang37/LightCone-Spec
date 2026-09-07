@@ -117,14 +117,15 @@ Methods: Target-only, Static EAGLE3, Static DFlash, Native DSpark,
 TTS-LoRA-Batched (DFlash), LightCone (DFlash). All actually submit eight requests
 at once. Video TTS is NOT original Full TTS. Each receives the same deterministic
 eight 16K-token constructed long inputs, maximum 1,024 output tokens, normal EOS.
-One method at a time, same GPU. GPU budgets and backend-specific widths are
+One method at a time, same validated TP/GPU set. GPU budgets and backend-specific widths are
 recorded. Save events and requests locally; dataset text is not a public asset
 unless its redistribution rights have separately been checked.
 
 The browser displays actual received chunks, not simulated token-by-token text.
 The observer is disabled during normal benchmarks. Overflow or disk failure
 invalidates the recording. Native timing differs from browser/network lag.
-Use a loopback SSH tunnel and `scripts/capture_preview.cjs` with Playwright.
+Run `scripts/capture_preview.cjs` and Playwright on the SSH server itself,
+using its loopback HTTP URL; copy the recordings back only after completion.
 Keep uncut originals; one take per method unless an explicit technical failure
 requires a documented retry. The composite is 1x with an on-screen independent-
 runs/time-aligned disclosure, never a claim of simultaneous six-way execution.
