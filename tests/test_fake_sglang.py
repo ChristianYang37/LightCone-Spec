@@ -3838,3 +3838,114 @@ def test_excluded_verification_trace_is_read_only_and_windowed(tmp_path, monkeyp
         sys.settrace(previous)
     rows = [json.loads(line) for p in tmp_path.glob("verify-*.jsonl") for line in p.read_text().splitlines()]
     assert len(rows) == 1 and rows[0]["commit_count"] == 1
+    calls = []
+
+    class StateAudit:
+        def __init__(self, worker, output):
+            self.worker, self.adapter, self.done = worker, values["online_adapter"], False
+            calls.append("baseline")
+
+        def before_update(self, parent, row):
+            assert parent["self"] is self.worker and row == 0
+            calls.append("before")
+
+        def after_update(self, parent, row):
+            calls.append("after")
+            self.done = True
+
+    monkeypatch.setattr("lightcone_spec.target_state_diagnostic.TargetStateAudit", StateAudit)
+    adapter_namespace = {}
+    exec(compile("def maybe_launch(self):\n    return 1\n",
+                 str(tmp_path / "speculative/dflash_online_adaptation.py"), "exec"), adapter_namespace)
+    adapter = values["online_adapter"]
+    # No lambda frame between adapter and caller: hook deliberately checks its
+    # native DFlash parent to avoid auditing unrelated invocation contexts.
+    import types
+    adapter.maybe_launch = types.MethodType(adapter_namespace["maybe_launch"], adapter)
+    adapter.runtime.update_due = lambda: False
+    values["prefix_lens"] = torch.tensor([740])
+    source = source.replace("    return out_tokens", "    online_adapter.maybe_launch()\n    return out_tokens")
+    path.write_text(source)
+    exec(compile(source, str(path), "exec"), namespace)
+    monkeypatch.setenv("LIGHTCONE_EXCLUDED_VERIFY_TRACE", json.dumps({
+        "output_directory": str(tmp_path), "request_suffix": "-2-00000", "start": 620, "end": 660,
+        "target_state_audit": True}))
+    try:
+        install()
+        namespace["forward_batch_generation"](**values)
+        assert calls == ["baseline"]
+        adapter.runtime.update_due = lambda: True
+        namespace["forward_batch_generation"](**values)
+        namespace["forward_batch_generation"](**values)
+    finally:
+        sys.settrace(previous)
+    assert calls == ["baseline", "before", "after"]
+
+
+def test_excluded_target_state_audit_detects_byte_alias_and_kv_mutation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from lightcone_spec.target_state_diagnostic import (
+        TargetStateAudit,
+        assert_disjoint_target_storage,
+        tensor_digest,
+    )
+
+    model = torch.nn.Linear(3, 2, bias=False).to(torch.bfloat16)
+    draft = torch.ones(2, 3)
+    adapter = SimpleNamespace(inference=SimpleNamespace(active=(draft,), staging=(draft.clone(),)),
+        optimizer=SimpleNamespace(master=(draft.clone(),), moments={"m": (draft.clone(),)}),
+        runtime=SimpleNamespace(round=880))
+    assert assert_disjoint_target_storage(model, adapter) == 4
+    adapter.inference.active = (model.weight.detach().view(-1)[1:],)
+    with pytest.raises(RuntimeError, match="aliases target"):
+        assert_disjoint_target_storage(model, adapter)
+    adapter.inference.active = (draft,)
+    with pytest.raises(ValueError, match="contiguous"):
+        tensor_digest(draft.T)
+    before = tensor_digest(model.weight)
+    with torch.no_grad():
+        model.weight[0, 0] += 1
+    assert tensor_digest(model.weight) != before
+
+    class MHATokenToKVPool:
+        is_quantized_kv_cache = False
+        layer_transfer_counter = None
+        start_layer, end_layer = 0, 1
+
+        def __init__(self):
+            self.buffers = [(torch.ones(12, 1, 2), torch.ones(12, 1, 2)) for _ in range(2)]
+
+        def get_kv_buffer(self, layer):
+            return self.buffers[layer]
+
+    pool = MHATokenToKVPool()
+    runner = SimpleNamespace(model=model, token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(12).view(1, -1)))
+    worker = SimpleNamespace(target_worker=SimpleNamespace(model_runner=runner), model_runner=runner,
+        _online_drafter_adapter=adapter, device="cpu")
+    values = {"self": worker, "batch": SimpleNamespace(req_pool_indices=torch.tensor([0])),
+              "prefix_lens": torch.tensor([4])}
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    audit = TargetStateAudit(worker, tmp_path / "pass.json")
+    audit.before_update(values, 0)
+    draft.add_(1)  # legitimate independent draft publication is allowed
+    pool.buffers[0][0][9] += 1  # outside this request's committed prefix
+    audit.after_update(values, 0)
+    evidence = json.loads((tmp_path / "pass.json").read_text())
+    assert evidence["target_parameters_unchanged"]
+    assert evidence["committed_prefix_kv_unchanged_during_update"]
+    assert len(evidence["prefix_kv_before"]["layers"]) == 2
+    audit = TargetStateAudit(worker, tmp_path / "kv-fail.json")
+    audit.before_update(values, 0)
+    pool.buffers[1][1][2] += 1
+    with pytest.raises(RuntimeError, match="KV mutation"):
+        audit.after_update(values, 0)
+    assert not json.loads((tmp_path / "kv-fail.json").read_text())["committed_prefix_kv_unchanged_during_update"]
+    audit = TargetStateAudit(worker, tmp_path / "weight-fail.json")
+    audit.before_update(values, 0)
+    with torch.no_grad():
+        model.weight[1, 1] += 1
+    with pytest.raises(RuntimeError, match="parameter"):
+        audit.after_update(values, 0)
+    assert not json.loads((tmp_path / "weight-fail.json").read_text())["target_parameters_unchanged"]

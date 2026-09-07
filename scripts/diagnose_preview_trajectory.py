@@ -46,8 +46,11 @@ def main():
     parser.add_argument("--variant", required=True, choices=("target", "static", "frozen", "active"))
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--verify-trace", action="store_true", help="Excluded synchronized verification trace")
+    parser.add_argument("--target-state-audit", action="store_true", help="Excluded exact target/KV fingerprints")
     parser.add_argument("--reference", type=Path, help="Prior successful capture whose output IDs must match")
     args = parser.parse_args()
+    if args.target_state_audit and (not args.verify_trace or args.variant != "active"):
+        raise ValueError("target state audit requires the active verification trace and reference")
     config = ExperimentConfig.load(args.config)
     if args.gpu not in config.gpu_ids or not 1 <= args.max_tokens <= 32768:
         raise ValueError("invalid GPU or diagnostic bound")
@@ -77,6 +80,7 @@ def main():
         os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
             "output_directory": str((args.output / "server").resolve()),
             "request_suffix": "-2-00000", "start": 620, "end": 660,
+            "target_state_audit": args.target_state_audit,
         })
         os.environ["PYTHONPATH"] = os.pathsep.join((
             str(Path(__file__).resolve().parent / "preview_verify_trace"),
@@ -86,7 +90,8 @@ def main():
         "adaptation": adaptation_payload(job, selection), "excluded": True,
         "capture_scope": "first three original requests, original seed/order, bounded output; not performance evidence",
         "diagnostic_top_logprobs": diagnostic_logprobs(args.variant),
-        "verification_trace": args.verify_trace}, indent=2))
+        "verification_trace": args.verify_trace,
+        "target_state_audit": args.target_state_audit}, indent=2))
     process = ServerProcess(config, job, gpus=(args.gpu,), port=config.server.base_port + 30 + args.gpu,
                             output_dir=args.output / "server", selection=selection)
     with process as client:
@@ -111,6 +116,12 @@ def main():
             prior = json.loads(args.reference.read_text())
             if [r["output_ids"] for r in records] != [r["output_ids"] for r in prior]:
                 raise RuntimeError("verification tracing perturbed the reference trajectory; do not accept")
+        if args.target_state_audit:
+            audits = list((args.output / "server").glob("target-state-*.json"))
+            if not audits or not all(json.loads(p.read_text())["target_parameters_unchanged"]
+                                     and json.loads(p.read_text())["committed_prefix_kv_unchanged_during_update"]
+                                     for p in audits):
+                raise RuntimeError("target state audit missing or failed; do not accept")
         if args.variant == "frozen" and after["updates_published"] != before["updates_published"]:
             raise RuntimeError("frozen control unexpectedly published an update")
         (args.output / "result.json").write_text(json.dumps({"status": "captured_not_reviewed",

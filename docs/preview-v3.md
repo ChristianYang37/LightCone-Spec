@@ -58,6 +58,13 @@ around request 2 output positions 620--660. It changes no SGLang patch or
 sampler. Synchronization can perturb execution: a missing trace or any output-ID
 change from the successful uninstrumented capture rejects that diagnostic.
 Its timings must never be used for performance claims.
+The additional active-only `--target-state-audit` checks exact target-parameter
+bytes from first decode to a due update in that window, publication/optimizer
+storage disjointness, and the request's committed target KV before/after that
+update. It supports only unquantized token-major MHA, synchronizes explicitly,
+hashes host chunks without retaining weights, and fails on unsupported layouts.
+It does not prove all-request/all-time KV invariance. Missing evidence or output
+changes from the uninstrumented reference reject the capture.
 Review verification/bonus/stop indices, target state, KV/version/reset, and
 numeric margins before declaring a root cause or accepting speedup claims.
 The diagnostic output cap is not a change to any formal request budget.

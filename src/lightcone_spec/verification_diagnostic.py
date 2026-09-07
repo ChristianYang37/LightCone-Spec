@@ -50,6 +50,7 @@ def install():
         raise RuntimeError("do not replace another debugger or trace hook")
     line_numbers = {}
     captured = 0
+    state_audit = None
 
     def local_trace(frame, event, arg):
         nonlocal captured
@@ -71,10 +72,33 @@ def install():
         return local_trace
 
     def dispatch(frame, event, arg):
+        nonlocal state_audit
         code = frame.f_code
+        if (event == "call" and settings.get("target_state_audit")
+                and code.co_name == "maybe_launch"
+                and code.co_filename.endswith("/speculative/dflash_online_adaptation.py")
+                and state_audit is not None and not state_audit.done):
+            parent = frame.f_back.f_locals
+            if parent.get("self") is state_audit.worker and state_audit.adapter.runtime.update_due():
+                for row, request in enumerate(parent["batch"].reqs):
+                    offset = int(parent["prefix_lens"][row].item()) - len(request.origin_input_ids)
+                    if (request.rid.endswith(settings["request_suffix"])
+                            and settings["start"] <= offset <= settings["end"]):
+                        state_audit.before_update(parent, row)
+
+                        def finish_update(frame, event, arg, values=parent, row=row):
+                            if event == "return":
+                                state_audit.after_update(values, row)
+                            return finish_update
+
+                        return finish_update
         if (event != "call" or code.co_name != "forward_batch_generation"
                 or not code.co_filename.endswith("/speculative/dflash_worker_v2.py")):
             return None
+        if settings.get("target_state_audit") and state_audit is None:
+            from lightcone_spec.target_state_diagnostic import TargetStateAudit
+
+            state_audit = TargetStateAudit(frame.f_locals["self"], output / f"target-state-{os.getpid()}.json")
         if code not in line_numbers:
             candidates = [index + 1 for index, line in enumerate(linecache.getlines(code.co_filename))
                           if index + 1 >= code.co_firstlineno
