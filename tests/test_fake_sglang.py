@@ -3706,3 +3706,36 @@ def test_hybrid_swa_dflash_budget_uses_draft_geometry(monkeypatch, tp, heads, dt
     # All-SWA, hybrid ratio, and fixed-cap sizing each include it once.
     assert section.count("+                + self._dflash_draft_per_token") == 2
     assert section.count("+            + self._dflash_draft_per_token") == 1
+def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
+    import runpy
+    import sys
+    from types import SimpleNamespace
+
+    import pytest
+
+    from lightcone_spec.config import ExperimentConfig
+
+    config = SimpleNamespace(gpu_ids=(0, 1), run_dir=tmp_path / "state",
+                             server=SimpleNamespace(base_port=30000))
+    monkeypatch.setattr(ExperimentConfig, "load", lambda _: config)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda c, s, j: j)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda s, j: None)
+
+    class ReachedServer(Exception):
+        pass
+
+    class Server:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["output_dir"].is_dir()
+
+        def __enter__(self):
+            raise ReachedServer
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr("lightcone_spec.server.ServerProcess", Server)
+    monkeypatch.setattr(sys, "argv", ["record_preview.py", "--config", str(tmp_path / "paper.yaml"),
+                                    "--output", str(tmp_path / "video"), "--method-index", "0", "--gpu", "0"])
+    with pytest.raises(ReachedServer):
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/record_preview.py"), run_name="__main__")

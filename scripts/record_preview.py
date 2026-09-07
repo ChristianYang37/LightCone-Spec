@@ -50,6 +50,7 @@ def main():
     selection = _selection_for_job(state, job)
     if method in {"lightcone", "tts_lora_batched"} and not selection:
         raise RuntimeError("video requires frozen adaptation recipe")
+    (args.output / "server").mkdir()
     process = ServerProcess(config, job, gpus=(args.gpu,), port=config.server.base_port + 20,
                             output_dir=args.output / "server", selection=selection)
     with process as client:
