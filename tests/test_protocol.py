@@ -105,6 +105,22 @@ def test_preview_heldout_deterministic_and_no_duplicates():
     with pytest.raises(ValueError, match="distinct held-out"):
         held_out_pool(records, calibration, 11)
 
+
+def test_preview_ci_workflow_parses_and_has_read_only_pinned_actions():
+    import re
+
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/quality.yml").read_text())
+    assert workflow["permissions"] == {"contents": "read"}
+    assert {"cpu", "patched-compile", "live-ui"}.issubset(workflow["jobs"])
+    for job in workflow["jobs"].values():
+        for step in job["steps"]:
+            if "run" in step:
+                assert isinstance(step["run"], str)
+            if "uses" in step:
+                assert re.fullmatch(r"[\w/-]+@[a-f0-9]{40}", step["uses"])
+
 def test_official_jsonl_keeps_unicode_line_separators_inside_prompts(tmp_path):
     from lightcone_spec.data import load_source_prompt_records
 

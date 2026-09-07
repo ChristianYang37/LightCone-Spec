@@ -31,7 +31,8 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: python -c 'import os,re; assert re.match(r"^(feat|fix|test|docs|chore|refactor|perf|build|ci)(\([a-zA-Z0-9_-]+\))?!?: .+", os.environ["PR_TITLE"]), "Use a Conventional Commit PR title"'
+        run: |
+          python -c 'import os,re; assert re.match(r"^(feat|fix|test|docs|chore|refactor|perf|build|ci)(\([a-zA-Z0-9_-]+\))?!?: .+", os.environ["PR_TITLE"]), "Use a Conventional Commit PR title"'
   patched-compile:
     runs-on: ubuntu-latest
     timeout-minutes: 10
