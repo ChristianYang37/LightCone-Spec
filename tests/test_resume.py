@@ -93,6 +93,26 @@ def test_preview_frozen_selection_and_atomic_resume(tmp_path):
         _e5_reference(state, trace)
     assert _records_scientific_rejection(trace)
 
+def test_preview_v3_cannot_reuse_legacy_acceptance_or_execute_tts(tmp_path):
+    from types import SimpleNamespace
+
+    from lightcone_spec.runner import _run_preview_v1, _run_preview_v3
+
+    state = StateStore(tmp_path / "state")
+    state.set_selection("formal_preview_v1", {"enabled": True})
+    state.set_selection("formal_preview_v3", {"enabled": True})
+    config = SimpleNamespace(run_dir=tmp_path / "state")
+    stop = threading.Event()
+    _run_preview_v1(config, state, stop)  # cannot materialize legacy TTS
+    assert state.jobs("E3b-preview-v1") == ()
+    with pytest.raises(RuntimeError, match="revision-3 manifest"):
+        _run_preview_v3(config, state, stop)
+    state.set_selection("formal_preview_manifest_v3", {"version": 3})
+    state.set_selection("formal_preview_qwen38_acceptance_v1", {"status": "accepted"})
+    with pytest.raises(RuntimeError, match="reviewed output divergence"):
+        _run_preview_v3(config, state, stop)
+
+
 def test_preview_remapped_units_keep_each_registered_order(monkeypatch, tmp_path):
     config = _config(tmp_path)
     state = StateStore(tmp_path / "preview-state")

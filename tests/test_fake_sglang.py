@@ -1633,6 +1633,16 @@ def test_request_scoped_generation_is_serial(fake_server):
     assert Handler.batch_sizes[-3:] == [1, 1, 1]
 
 
+def test_diagnostic_top2_requires_capture_and_native_trajectory(fake_server):
+    client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
+    with pytest.raises(ValueError, match="observer"):
+        client.run_batch(("a",), max_new_tokens=2, seed=0, diagnostic_top_logprobs=2)
+    events = []
+    client.stream_observer = events.append
+    results, _ = client.run_batch(("a",), max_new_tokens=2, seed=0, diagnostic_top_logprobs=2)
+    assert tuple(t for event in events for t in event["token_ids"]) == results[0].output_ids
+
+
 def test_bounded_and_closed_loop_enforce_real_concurrency(fake_server):
     Handler.delay = 0.03
     client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
@@ -1940,6 +1950,37 @@ def test_onlinespec_ensemble_experts_and_hedge_weights_remain_independent():
     assert probabilities is not None
     assert torch.isfinite(probabilities).all()
     assert probabilities.sum().item() == pytest.approx(1.0)
+
+
+def test_preview_ensemble_really_uses_independent_adam_and_transactional_reset():
+    config = _online_config("onlinespec_ens")
+    config.online_spec.ensemble_optimizer = "adam_preview_v3"
+    config.online_spec.hedge_learning_rate = 10.
+    config.optimizer.beta1, config.optimizer.beta2 = .9, .95
+    config.optimizer.epsilon = 1e-8
+    config.optimizer.grad_clip = 0.
+    optimizer = _patched_online_optimizer()((torch.tensor([.4, -.2]),), config)
+    reference = [torch.tensor([.4, -.2], requires_grad=True) for _ in range(3)]
+    adam = [torch.optim.Adam([p], lr=lr, betas=(.9, .95))
+            for p, lr in zip(reference, optimizer.learning_rates)]
+    for step in range(3):
+        gradients = tuple((torch.tensor([.2 + step + i, -.3 - i]),) for i in range(3))
+        before = tuple(p.clone() for p in optimizer.state_tensors)
+        proposal = optimizer.propose_ensemble(torch.tensor([.1, .3, .2]), gradients)
+        optimizer.commit(proposal, valid=torch.tensor(False))
+        assert all(torch.equal(a, b) for a, b in zip(before, optimizer.state_tensors))
+        for index, (p, opt) in enumerate(zip(reference, adam)):
+            p.grad = gradients[index][0]
+            opt.step()
+        optimizer.commit(proposal)
+        for expected, actual in zip(reference, optimizer.experts):
+            torch.testing.assert_close(actual[0], expected, atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(optimizer.expert_probabilities,
+                                   torch.softmax(-10 * (step + 1) * torch.tensor([.1, .3, .2]), 0))
+    assert len(optimizer.second) == 7  # cumulative losses + three pairs of moments
+    optimizer.reset((torch.tensor([.4, -.2]),))
+    assert optimizer.step == 0
+    assert all(torch.count_nonzero(t) == 0 for t in optimizer.second)
 
 
 def test_cosine_horizon_and_e1a_fixed_settings():
@@ -3723,10 +3764,10 @@ def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
     config = SimpleNamespace(gpu_ids=(0, 1), run_dir=tmp_path / "state",
                              server=SimpleNamespace(base_port=30000))
     state = StateStore(config.run_dir)
-    state.set_selection("formal_preview_video_acceptance_v2", {
-        "Qwen/Qwen3-8B": {"status": "accepted", "tp": 1}})
-    state.set_selection("formal_preview_manifest_v1", {
-        "prompts": {"LiveCodeBench": [{"prompt": str(i)} for i in range(8)]}})
+    manifest = {"version": 3, "prompts": {"LiveCodeBench": [{"prompt": str(i)} for i in range(8)]}}
+    state.set_selection("formal_preview_video_acceptance_v3", {
+        "Qwen/Qwen3-8B": {"status": "accepted", "tp": 1, "manifest": manifest}})
+    state.set_selection("formal_preview_manifest_v3", manifest)
     monkeypatch.setattr(ExperimentConfig, "load", lambda _: config)
     monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda c, s, j: j)
     monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda s, j: None)

@@ -35,22 +35,25 @@ QWEN38_METHODS = (
     ("DFLASH", "tts", "Full TTS (DFlash2 transfer)"),
     ("DFLASH", "lightcone", "LightCone (DFlash2 transfer)"),
 )
-QWEN38_VIDEO_METHODS = tuple(
-    (backend, "tts_lora_batched", "TTS-LoRA-Batched (DFlash2)") if method == "tts"
-    else (backend, method, label) for backend, method, label in QWEN38_METHODS
-)
 VIDEO_METHODS = (
     ("NONE", "target_only", "Target-only"),
     ("EAGLE3", "static", "Static EAGLE3"),
     ("DFLASH", "static", "Static DFlash"),
     ("DSPARK", "static", "Native DSpark"),
-    ("DFLASH", "tts_lora_batched", "TTS-LoRA-Batched (DFlash)"),
+    ("DFLASH", "onlinespec_ens", "OnlineSPEC-Ensemble (DFlash transfer)"),
     ("DFLASH", "lightcone", "LightCone (DFlash)"),
+)
+QWEN38_VIDEO_METHODS = tuple(
+    (backend, "onlinespec_ens", "OnlineSPEC-Ensemble (DFlash2 transfer)") if method == "tts"
+    else (backend, method, label) for backend, method, label in QWEN38_METHODS
 )
 
 
 def preview_jobs(manifest: dict) -> tuple[Job, ...]:
     """All mutable selections and prompt/trace decisions are frozen once upstream."""
+    if manifest.get("version") == 3:
+        from .preview_revision import revision_jobs
+        return revision_jobs(manifest)
     jobs = []
     for block in range(4):
         conditions = [
@@ -222,6 +225,10 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
         "duration_seconds", "session_startup_seconds", "request_count", "itl_p99_ms", "ttft_p50_ms", "ttft_p99_ms",
         "hard_feasible", "capacity_feasible", "scientific_outcome", "request_outcomes",
         "updates_published", "resolved_stride", "peak_hbm_bytes",
+        "allocated_peak_hbm_bytes", "reserved_peak_hbm_bytes", "nvml_peak_hbm_bytes",
+        "memory_budget", "measured_update_peak_bytes", "measured_update_peak_upper_bound_bytes",
+        "update_peak_measurement_scope", "update_peak_upper_bound_scope", "kv_capacity",
+        "rank_memory", "memory_peak_scope", "sum_rank_peak_hbm_bytes",
     )
     for config, metrics in evidence:
         if config.get("job_id") not in expected or config.get("parameters", {}).get("panel") != "preview_v1":
@@ -235,6 +242,8 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
         ))
         if isinstance(calls, (int, float)) and calls > 0 and isinstance(accepted, (int, float)):
             measured[identity]["accepted_drafts_per_target_call"] = accepted / calls
+        if expected[identity].method == "target_only":
+            measured[identity]["accepted_drafts_per_target_call"] = None
         measured[identity]["accepted_verified_ratio"] = (
             accepted / verified if isinstance(accepted, (int, float))
             and isinstance(verified, (int, float)) and verified > 0 else None
@@ -265,7 +274,9 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
         backend = "DFLASH" if condition[0] in {"long_generation", "qwen38_transfer"} else "DSPARK"
         baselines = (("static", backend), ("tts", backend)) if condition[0] == "long_generation" else (("static", backend),)
         if condition[0] == "qwen38_transfer":
-            baselines = tuple((method, b) for b, method, _ in QWEN38_METHODS if method != "lightcone")
+            baselines = tuple(sorted({(method, b) for method, b, _ in data if method != "lightcone"}))
+        if condition[0] == "long_generation" and any(j.parameters.get("preview_revision") == 3 for j in expected.values()):
+            baselines = (("target_only", "NONE"), ("static", "EAGLE3"), ("static", "DFLASH"), ("onlinespec_ens", "DFLASH"))
         for (baseline, baseline_backend), metric in itertools.product(
             baselines,
             ("goodput", "accepted_drafts_per_target_call", "per_user_generation_speed"),
@@ -294,7 +305,7 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
                 "ratio_ci95": [math.exp(mean-radius), math.exp(mean+radius)] if complete else None,
             })
     result = {
-        "panel": "preview_v1", "expected_cells": len(expected),
+        "panel": "preview_v3" if any(j.parameters.get("preview_revision") == 3 for j in expected.values()) else "preview_v1", "expected_cells": len(expected),
         "counts": dict(Counter(row["status"] for row in rows)), "rows": rows, "effects": effects,
         "uncertainty": "four independent paired blocks; log-ratio Student t, df=3; approximate normality",
         "AL_definition": "accepted draft tokens / target verification calls; bonus token excluded",
@@ -311,6 +322,7 @@ def preview_eta(evidence, remaining_jobs, *, repetitions=10000) -> dict:
         return (job.model, job.backend, job.method, job.task, job.load, job.context,
                 job.parameters.get("generation_tokens"), job.parameters.get("topology", "tp1_dp1"),
                 job.parameters["preview_panel"],
+                job.parameters.get("preview_revision", 1), job.parameters.get("stride"),
                 job.parameters.get("memory_budget_policy"), policy)
 
     pools = defaultdict(list)

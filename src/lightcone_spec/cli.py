@@ -61,8 +61,8 @@ def _plan(config: ExperimentConfig) -> None:
     print("node\trows\tgpus\tdescription")
     for row in paper_plan():
         print(f"{row.name}\t{row.rows}\t{row.gpu_count}\t{row.description}")
-    print("\npreview_v1 supplemental leaves\t56\tdeployment-enabled; 24 long + 24 serving + 8 trace; video excluded")
-    print("qwen38 preview supplemental leaves\t24\tacceptance-enabled; six methods x four blocks; combined preview 80")
+    print("\npreview_v3 supplemental leaves\t96\t40 long + 24 serving + 8 trace + 24 Qwen38; QA/video excluded")
+    print("legacy preview_v1/v2\t56/80\taudit only when v3 enabled; raw evidence retained")
     pairs = tuple(zip(config.gpu_ids[::2], config.gpu_ids[1::2], strict=True))
     print(f"\ngpu_pairs\t{len(pairs)}\t{pairs}")
     print(f"max_parallel_blocks\t{len(pairs)}\tone clean block per TP2 pair")

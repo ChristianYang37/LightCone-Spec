@@ -260,6 +260,10 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     if uses_formal_adaptation_stride(job):
         chosen["stride"] = FORMAL_ADAPTATION_STRIDE
     stride = int(chosen.get("stride", FORMAL_ADAPTATION_STRIDE))
+    if job.parameters.get("preview_revision") == 3:
+        expected_stride = 1 if job.method == "lightcone" else 10
+        if stride != expected_stride:
+            raise ValueError("preview-v3 stride differs from frozen method recipe")
     if uses_formal_adaptation_stride(job) and stride != FORMAL_ADAPTATION_STRIDE:
         raise ValueError("formal adaptive jobs must resolve to stride S=10")
     coalescing = int(chosen.get("coalescing", 1))
@@ -366,6 +370,10 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
             "hedge_learning_rate": chosen.get("hedge_learning_rate"),
             "hint_momentum": chosen.get("hint_momentum", 0.9),
         }
+        if chosen.get("ensemble_optimizer") is not None:
+            if job.parameters.get("preview_revision") != 3:
+                raise ValueError("Adam ensemble transfer is preview-v3 only")
+            payload["online_spec"]["ensemble_optimizer"] = chosen["ensemble_optimizer"]
     return payload
 
 
@@ -556,11 +564,13 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
             adaptation["rank"],
             optimizer_state,
             len(online.get("additional_learning_rates", ())),
+            online.get("ensemble_optimizer", "ogd"),
             adaptation["telemetry_round_items"],
         )
     return (
         job.model,
         job.backend,
+        job.parameters.get("preview_revision"),
         memory_budget_policy(job),
         _execution_backend(job),
         job.parameters.get("draft_key"),

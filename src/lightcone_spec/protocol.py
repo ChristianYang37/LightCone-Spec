@@ -293,6 +293,8 @@ def uses_formal_adaptation_stride(job: Job) -> bool:
     return (
         job.method in FORMAL_ADAPTIVE_METHODS
         and job.parameters.get("workload") not in EXPLORATORY_STRIDE_WORKLOADS
+        and not (job.parameters.get("panel") == "preview_v1"
+                 and job.parameters.get("preview_revision") == 3)
     )
 
 

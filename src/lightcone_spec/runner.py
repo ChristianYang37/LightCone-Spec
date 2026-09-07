@@ -215,6 +215,7 @@ def _records_scientific_rejection(job: Job) -> bool:
     """
     return (
         job.node in PREVIEW_NODES
+        or job.parameters.get("preview_revision") == 3
         or job.node == "S10-reconciliation"
         or job.node == "bugfix-reconciliation-v1"
         or job.node in {"soft-gate-width-v1", "profile-proxy-v1"}
@@ -1996,6 +1997,9 @@ def _execute_cell(
                     {"policy": "target_only", **result.to_dict()} for result in controlled
                 ]
             request_rows = [_request_metrics(result) for result in results]
+            if runtime_job.parameters.get("preview_revision") == 3:
+                for row, result in zip(request_rows, results, strict=True):
+                    row["output_ids"] = list(result.output_ids)
             measured_user_speed = per_user_generation_speed(request_rows)
             outcome_rows = (
                 [outcome.to_dict() for outcome in scheduled.outcomes]
@@ -2123,6 +2127,12 @@ def _execute_cell(
                 "allocated_peak_hbm_bytes": peak_hbm,
                 "reserved_peak_hbm_bytes": reserved_hbm,
                 "nvml_peak_hbm_bytes": nvml_hbm,
+                "memory_peak_scope": "since_last_cache_reset; absolute resident plus execution allocation",
+                "rank_memory": [{key: row.get(key) for key in (
+                    "peak_hbm_bytes", "peak_hbm_reserved_bytes", "kv_token_capacity",
+                    "memory_ledger", "memory_budget", "measured_update_peak_bytes",
+                )} for row in after.get("rank_local", [])],
+                "sum_rank_peak_hbm_bytes": sum(int(row["peak_hbm_bytes"]) for row in after.get("rank_local", [])),
                 "kv_capacity": int(kv_capacity),
                 "request_count": len(results),
                 "request_outcomes": {
@@ -7545,20 +7555,25 @@ def _run_priority_paper_node(
 
 
 def _write_preview_status(config: ExperimentConfig, state: StateStore) -> None:
-    manifest = state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
+    from .preview_revision import PREVIEW_V3_NODES
+    manifest = state.selection("formal_preview_manifest_v3", None) or state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
     if manifest is None:
         return
     jobs = preview_jobs(manifest)
-    evidence = [row for node in PREVIEW_NODES for row in _metric_rows(state, node)]
+    nodes = PREVIEW_V3_NODES if manifest.get("version") == 3 else PREVIEW_NODES
+    evidence = [row for node in nodes for row in _metric_rows(state, node)]
     remaining = tuple(job for job in jobs if state.job_status(job.job_id) != "completed")
     # Worker-local reports avoid concurrent writes of the same JSON file.
-    output = config.run_dir / "stages" / "preview-v1" / f"worker-{threading.get_ident()}"
+    version = "preview-v3" if manifest.get("version") == 3 else "preview-v1"
+    output = config.run_dir / "stages" / version / f"worker-{threading.get_ident()}"
     preview_summary(evidence, jobs, output)
-    state.set_selection("formal_preview_eta_v1", preview_eta(evidence, remaining))
+    state.set_selection("formal_preview_eta_v3" if manifest.get("version") == 3 else "formal_preview_eta_v1", preview_eta(evidence, remaining))
 
 
 def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> None:
     """Deployment enables this once after excluded QA; no public DAG migration."""
+    if state.selection("formal_preview_v3", {}).get("enabled"):
+        return
     enabled = state.selection("formal_preview_v1", {})
     if not enabled.get("enabled") or enabled.get("status") == "completed":
         return
@@ -7646,6 +7661,42 @@ def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: thr
             raise RuntimeError(f"preview runtime failures remain: {node}: {counts}")
         state.set_stage_status(node, "completed", row_count=len(rows))
     state.set_selection("formal_preview_v1", {**enabled, "status": "completed", "leaf_cells": len(jobs)})
+
+
+def _run_preview_v3(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> bool:
+    """A versioned deployment gate; old acceptance cannot authorize new recipes."""
+    from .preview_revision import PREVIEW_V3_NODES
+    enabled = state.selection("formal_preview_v3", {})
+    if not enabled.get("enabled") or enabled.get("status") == "completed":
+        return False
+    manifest = state.selection("formal_preview_manifest_v3", {})
+    if manifest.get("version") != 3:
+        raise RuntimeError("preview-v3 requires a frozen revision-3 manifest")
+    acceptance = state.selection("formal_preview_acceptance_v3", {})
+    if acceptance.get("manifest") != manifest or acceptance.get("trajectory_diagnosis") != "reviewed":
+        raise RuntimeError("preview-v3 lacks matching acceptance and reviewed output divergence")
+    jobs = preview_jobs(manifest)
+    for node in PREVIEW_V3_NODES:
+        rows = tuple(j for j in jobs if j.node == node)
+        if not rows:
+            continue
+        if acceptance.get("nodes", {}).get(node) != "accepted":
+            state.set_selection("formal_preview_v3", {**enabled, "status": "awaiting_acceptance", "node": node})
+            return True
+        state.add_internal_jobs(rows, storage_node=node)
+        state.set_stage_status(node, "running", row_count=len(rows))
+        _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
+        evidence = [row for name in PREVIEW_V3_NODES for row in _metric_rows(state, name)]
+        report = preview_summary(evidence, jobs, config.run_dir / "stages/preview-v3")
+        state.set_selection("formal_preview_progress_v3", report["counts"])
+        if stop_event.is_set():
+            return True
+        counts = state.status_counts(node)
+        if any(counts.get(s) for s in ("failed", "running", "pending")):
+            raise RuntimeError(f"preview-v3 runtime failures: {node}: {counts}")
+        state.set_stage_status(node, "completed", row_count=len(rows))
+    state.set_selection("formal_preview_v3", {**enabled, "status": "completed", "leaf_cells": len(jobs)})
+    return False
 
 
 def _run_priority_window_v1(
@@ -8669,6 +8720,8 @@ class PaperRunner:
         old_term = signal.signal(signal.SIGTERM, self._signal)
         old_int = signal.signal(signal.SIGINT, self._signal)
         try:
+            if _run_preview_v3(self.config, self.state, self.stop_event):
+                return
             _run_preview_v1(self.config, self.state, self.stop_event)
             if self.stop_event.is_set():
                 return

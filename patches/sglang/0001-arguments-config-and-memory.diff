@@ -151,7 +151,7 @@ new file mode 100644
 index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,299 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -212,6 +212,7 @@ index 00000000..8ec8b2c7
 +    additional_learning_rates: tuple[float, ...]
 +    hedge_learning_rate: float | None
 +    hint_momentum: float
++    ensemble_optimizer: str = "ogd"
 +
 +
 +@dataclass(frozen=True)
@@ -313,7 +314,12 @@ index 00000000..8ec8b2c7
 +                additional_learning_rates=tuple(float(item) for item in online.get("additional_learning_rates", ())),
 +                hedge_learning_rate=online.get("hedge_learning_rate"),
 +                hint_momentum=_finite(online.get("hint_momentum", 0.9), "hint_momentum"),
++                ensemble_optimizer=str(online.get("ensemble_optimizer", "ogd")),
 +            )
++            if online_spec.ensemble_optimizer not in {"ogd", "adam_preview_v3"}:
++                raise ValueError("unknown ensemble optimizer")
++            if online_spec.ensemble_optimizer == "adam_preview_v3" and method != "onlinespec_ens":
++                raise ValueError("Adam experts require the ensemble method")
 +            if not 0 <= online_spec.hint_momentum < 1:
 +                raise ValueError("OnlineSPEC hint momentum must be in [0, 1)")
 +        stride = int(value.get("stride", 10))

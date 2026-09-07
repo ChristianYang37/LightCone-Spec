@@ -23,8 +23,8 @@ def main():
                         help="Optional local ai-paper-figures-tables figstyle.py; not redistributed")
     args = parser.parse_args()
     evidence = json.loads(args.evidence.read_text())
-    if evidence.get("expected_cells") not in {56, 80} or evidence["counts"].get("UNMEASURED", 0):
-        raise RuntimeError("all registered 56/80 terminal outcomes are required before release figures")
+    if evidence.get("expected_cells") not in {56, 72, 80, 96} or evidence["counts"].get("UNMEASURED", 0):
+        raise RuntimeError("all registered terminal outcomes are required before release figures")
     if len({row["job_id"] for row in evidence["rows"]}) != evidence["expected_cells"]:
         raise RuntimeError("preview evidence has missing or duplicate logical cells")
     if args.style_helper:
@@ -41,6 +41,15 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     labels = {"static": "Static", "tts": "Full TTS", "lightcone": "LightCone"}
     colors = {"static": "#D55E00", "tts": "#009E73", "lightcone": "#0072B2"}
+    labels.update(target_only="Target-only", static_EAGLE3="Static EAGLE3",
+                  static_DFLASH="Static DFlash", onlinespec_ens="OnlineSPEC ensemble transfer")
+    colors.update(target_only="#666666", static_EAGLE3="#CC79A7",
+                  static_DFLASH="#D55E00", onlinespec_ens="#009E73")
+
+    def method_key(row):
+        if row["panel"] == "long_generation" and row["method"] == "static":
+            return "static_" + row["backend"]
+        return row["method"]
     captions = []
     for panel, metrics in (
         ("long_generation", ("accepted_drafts_per_target_call", "goodput")),
@@ -53,10 +62,10 @@ def main():
         ncols = len(metrics) + int(panel == "serving")
         fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 2.8), squeeze=False)
         for ax, metric in zip(axes[0][:len(metrics)], metrics, strict=True):
-            for method in sorted({row["method"] for row in all_rows}):
+            for method in sorted({method_key(row) for row in all_rows}):
                 centers, lows, highs = [], [], []
                 for index, condition in enumerate(conditions):
-                    group = [row for row in all_rows if row["method"] == method and
+                    group = [row for row in all_rows if method_key(row) == method and
                              (row["task"] if panel == "long_generation" else row["load"]) == condition]
                     values = [row["metrics"].get(metric) for row in group if row["status"] == "measured"]
                     values = [v for v in values if isinstance(v, (int, float)) and np.isfinite(v)]
@@ -119,6 +128,9 @@ def main():
                 ("static", "DFLASH"), ("tts", "DFLASH"), ("lightcone", "DFLASH")]
         names = ["Target-only", "Native MTP", "Community DSpark", "Community DFlash2",
                  "Full TTS–DFlash2", "LightCone–DFlash2"]
+        if evidence.get("panel") == "preview_v3":
+            keys[4] = ("onlinespec_ens", "DFLASH")
+            names[4] = "OnlineSPEC–DFlash2 transfer"
         palette = ["#666666", "#CC79A7", "#E69F00", "#D55E00", "#009E73", "#0072B2"]
         metrics = [("accepted_drafts_per_target_call", "AL (bonus excluded)"),
                    ("goodput", "Committed tokens/s"),

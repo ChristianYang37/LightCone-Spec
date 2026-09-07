@@ -2,11 +2,13 @@
 
 ## First preview (registered; results UNMEASURED)
 
-The [56-cell formal supplement](docs/preview-v1.md) prioritizes paired AL and
-throughput evidence against Full TTS and native DSpark without replacing the
-full experiment. Four independent blocks, all outcomes, and honest uncertainty
-are required before publishing effect claims. The separate real c8 streaming
-video uses **TTS-LoRA-Batched**, not original Full TTS.
+The [96-cell preview v3](docs/preview-v3.md) compares Target-only, distinct
+static drafters, OnlineSPEC-Ensemble transfer, and LightCone without changing
+the full experiment. Four independent blocks, all outcomes, and reviewed
+output correctness are required before publishing effect claims. Preview
+LightCone uses the specified S=1 configuration, not a measured optimum.
+TTS is excluded from new preview schedules and videos; historical raw evidence
+and the formal experiment remain unchanged.
 
 New authorized contributions use the source-available terms in [LICENSE](LICENSE);
 historical Apache-2.0 and third-party rights remain intact. This is not a

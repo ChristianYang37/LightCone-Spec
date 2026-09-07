@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from lightcone_spec.config import ExperimentConfig
 from lightcone_spec.metrics import SAFETY_COUNTERS, per_user_generation_speed
 from lightcone_spec.preview import QWEN38_MODEL, QWEN38_VIDEO_METHODS, VIDEO_METHODS
+from lightcone_spec.preview_revision import preview_recipe
 from lightcone_spec.protocol import Job
 from lightcone_spec.recording import StreamRecording
 from lightcone_spec.runner import _cell_inputs, _runtime_job, _selection_for_job, _speed_metrics
@@ -40,30 +41,32 @@ def main():
         parser.error("GPU must belong to the configured instance")
     args.output.mkdir(parents=True, exist_ok=False)
     state = StateStore(config.run_dir)
-    acceptance = state.selection("formal_preview_video_acceptance_v2", {}).get(args.model, {})
+    acceptance = state.selection("formal_preview_video_acceptance_v3", {}).get(args.model, {})
     if acceptance.get("status") != "accepted" or acceptance.get("tp") != args.tp:
         raise RuntimeError("video needs full-workload six-method common-TP acceptance")
-    manifest = state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", {})
+    manifest = state.selection("formal_preview_manifest_v3", {})
+    if manifest.get("version") != 3 or acceptance.get("manifest") != manifest:
+        raise RuntimeError("video requires matching preview-v3 manifest acceptance")
     newer = args.model == QWEN38_MODEL
     backend, method, label = (QWEN38_VIDEO_METHODS if newer else VIDEO_METHODS)[args.method_index]
     prompts = manifest["qwen38"]["prompts"] if newer else manifest["prompts"]["LiveCodeBench"][:8]
     gpus = (args.gpu,) if args.tp == 1 else tuple(config.gpu_ids[:2])
     job = Job(
-        job_id=f"excluded-video-v2-{'qwen38' if newer else 'qwen3'}-{args.method_index}", node="excluded-video-v2", ordinal=0,
+        job_id=f"excluded-video-v3-{'qwen38' if newer else 'qwen3'}-{args.method_index}", node="excluded-video-v3", ordinal=0,
         method=method, model=args.model, backend=backend, task="LiveCodeBench", gpu_count=args.tp,
         context=17408, load="c8", width=(4 if backend == "NEXTN" else 8 if newer else 16) if backend != "NONE" else None,
         parameters={"excluded_from_analysis": True, "coverage_runtime": True,
-                    "panel": "preview_v1", "preview_panel": "excluded_video",
+                    "panel": "preview_v1", "preview_panel": "excluded_video", "preview_revision": 3,
                     "topology": f"tp{args.tp}_dp1", "sampling_seed": 0,
                     "preview_prompt_records": prompts, "regime": "preview_constructed_chat",
                     "input_tokens": 16384, "enable_thinking": False, "respect_eos": True,
-                    "execution_request_count": 8, "stride": 10, "generation_tokens": 1024,
-                    "memory_budget_policy": "method_peak_v1",
-                    "frozen_recipe": acceptance.get("recipes", {}).get(method)},
+                    "execution_request_count": 8, "stride": 1 if method == "lightcone" else 10, "generation_tokens": 1024,
+                    "memory_budget_policy": "method_peak_v1" if newer else "fixed_reserve_v1",
+                    "frozen_recipe": preview_recipe(method, backend, manifest)},
     )
     job = _runtime_job(config, state, job)
     selection = _selection_for_job(state, job)
-    if method in {"lightcone", "tts_lora_batched"} and not selection:
+    if method in {"lightcone", "onlinespec_ens"} and not selection:
         raise RuntimeError("video requires frozen adaptation recipe")
     (args.output / "server").mkdir()
     process = ServerProcess(config, job, gpus=gpus, port=config.server.base_port + 20,
@@ -102,6 +105,10 @@ def main():
                               committed_tokens=sum(row.completion_tokens for row in results),
                               event_count=sink.count,
                               aggregate_tok_s=sum(row.completion_tokens for row in results) / duration,
+                              accepted_drafts_per_target_call=(None if method == "target_only" else
+                                  (after["accepted_drafts"] - before["accepted_drafts"]) /
+                                  max(1, after["target_calls"] - before["target_calls"])),
+                              peak_hbm_bytes=after.get("peak_hbm_bytes"),
                               per_user_tok_s=per_user_generation_speed(row.to_dict() for row in results), safety=safety)
                 (args.output / "requests.json").write_text(json.dumps([row.to_dict() for row in results]))
             except Exception as error:

@@ -1,5 +1,9 @@
 # Preview v1: registered formal supplement
 
+Historical protocol: new preview execution is superseded by
+[preview v3](preview-v3.md). The definitions below remain for auditing old
+56/80-cell attempts, not for restarting the TTS preview schedule.
+
 Status: implementation in progress; all new GPU outcomes **UNMEASURED**.
 
 Scope: GitHub preview/release only. Per the 2026-09-08 instruction, this work

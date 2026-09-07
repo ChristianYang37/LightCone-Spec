@@ -127,11 +127,56 @@ def test_qwen38_preview_exact_24_native_mtp_and_common_tp():
     assert all(j.parameters["execution_request_count"] == 8 and j.parameters["memory_budget_policy"] == "method_peak_v1" for j in jobs)
     assert len({(j.backend, j.method) for j in jobs}) == 6
     assert ("NEXTN", "static", "Native MTP") in QWEN38_VIDEO_METHODS
-    assert any(m == "tts_lora_batched" for _, m, _ in QWEN38_VIDEO_METHODS)
+    assert any(m == "onlinespec_ens" for _, m, _ in QWEN38_VIDEO_METHODS)
     assert not any(m == "tts" for _, m, _ in QWEN38_VIDEO_METHODS)
     checkpoints["NEXTN"]["revision"] = "b" * 40
     with pytest.raises(ValueError, match="same target"):
         qwen38_jobs(manifest)
+
+
+def test_preview_v3_exact_96_isolates_recipes_and_all_baselines():
+    from collections import Counter
+    from copy import deepcopy
+
+    from lightcone_spec.preview import QWEN38_CHECKPOINTS, preview_jobs
+    from lightcone_spec.scheduling import logical_unit_key
+
+    records = [{"prompt": str(i), "problem_id": str(i)} for i in range(32)]
+    manifest = {
+        "version": 3, "lightcone_recipe": {"stride": 10, "optimizer": "chronobelief"},
+        "dspark_recipe": {"stride": 10, "confidence_temperatures": [1.] * 7},
+        "dflash_width": 16, "dspark_width": 16, "trace_request_count": 16,
+        "serving_output_tokens": 256, "trace_offset": 17,
+        "trace_anchor": {"source_job_ids": ["anchor"]},
+        "trace": {"arrivals": list(range(16)), "lengths": [[128, 64]] * 16},
+        "prompts": {task: records for task in ("MATH-500", "LiveCodeBench")},
+        "qwen38": {"tp": 2, "checkpoints": QWEN38_CHECKPOINTS, "prompts": records[:8]},
+    }
+    original = deepcopy(manifest)
+    jobs = preview_jobs(manifest)
+    assert manifest == original
+    assert len(jobs) == len({j.job_id for j in jobs}) == 96
+    assert Counter(j.parameters["preview_panel"] for j in jobs) == {
+        "long_generation": 40, "serving": 24, "burstgpt": 8, "qwen38_transfer": 24}
+    assert not any(j.method.startswith("tts") for j in jobs)
+    units = {}
+    for job in jobs:
+        units.setdefault(logical_unit_key(job), []).append(job)
+        payload = adaptation_payload(job, job.parameters["frozen_recipe"])
+        if job.method == "lightcone":
+            assert payload["stride"] == 1
+            assert payload["optimizer"]["learning_rate"] == .001
+            assert not uses_formal_adaptation_stride(job)
+        if job.method == "onlinespec_ens":
+            assert payload["stride"] == 10
+            assert payload["online_spec"]["ensemble_optimizer"] == "adam_preview_v3"
+            assert payload["online_spec"]["hedge_learning_rate"] == 10
+    assert all(len({j.gpu_count for j in unit}) == 1 for unit in units.values())
+    assert all(len({json.dumps(j.parameters["preview_prompt_records"]) for j in unit}) == 1 for unit in units.values())
+    assert jobs == preview_jobs(json.loads(json.dumps(manifest)))
+    legacy = replace(next(j for j in jobs if j.method == "lightcone"),
+                     parameters={"stride": 1})
+    assert adaptation_payload(legacy)["stride"] == 10
 
 
 def test_common_tp_requires_all_full_workload_cases_and_correctness():

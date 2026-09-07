@@ -20,7 +20,7 @@ function metrics(){
  const total=counts.reduce((a,b)=>a+b,0),finished=status.status==='completed';
  const elapsed=finished?status.duration_seconds:lastElapsed;
  const rate=finished?status.aggregate_tok_s:(elapsed>0?total/elapsed:null);
- document.querySelector('#metrics').textContent=`${status.status} | ${(elapsed||0).toFixed(2)} s | ${done.filter(Boolean).length}/8 completed | ${total} committed tokens | ${finished?'MEASURED end-to-end':'provisional received'} throughput: ${Number.isFinite(rate)?rate.toFixed(1):'—'} tok/s`+(status.per_user_tok_s!=null?` | native per-user ${status.per_user_tok_s.toFixed(1)} tok/s`:'');
+ document.querySelector('#metrics').textContent=`${status.status} | ${(elapsed||0).toFixed(2)} s | ${done.filter(Boolean).length}/8 completed | ${total} committed tokens | ${finished?'MEASURED end-to-end':'provisional received'} throughput: ${Number.isFinite(rate)?rate.toFixed(1):'—'} tok/s`+(status.per_user_tok_s!=null?` | native per-user ${status.per_user_tok_s.toFixed(1)} tok/s`:'')+(Number.isFinite(status.accepted_drafts_per_target_call)?` | AL ${status.accepted_drafts_per_target_call.toFixed(3)}`:' | draft AL N/A')+(Number.isFinite(status.peak_hbm_bytes)?` | peak ${(status.peak_hbm_bytes/2**30).toFixed(2)} GiB`:'');
 }
 function receive(event){
  const row=JSON.parse(event.data);

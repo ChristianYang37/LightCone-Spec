@@ -1863,7 +1863,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2601 @@
+@@ -0,0 +1,2639 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -2046,6 +2046,8 @@ index 00000000..7b2cb5db
 +class OnlineSpecMemberProposal:
 +    parameters: tuple[torch.Tensor, ...]
 +    gradient_norm: torch.Tensor
++    first_moments: tuple[torch.Tensor, ...] = ()
++    second_moments: tuple[torch.Tensor, ...] = ()
 +
 +
 +class ResidentOptimizer:
@@ -2494,6 +2496,11 @@ index 00000000..7b2cb5db
 +                ),
 +            )
 +        self._width = width
++        self.adam_ensemble = self.method == "onlinespec_ens" and getattr(
++            self.online_spec, "ensemble_optimizer", "ogd"
++        ) == "adam_preview_v3"
++        if self.adam_ensemble:
++            self.second += tuple(torch.zeros_like(p) for _ in range(2) for p in self.first)
 +        self._step = torch.zeros((), dtype=torch.int64, device=self.master[0].device)
 +
 +    @property
@@ -2649,6 +2656,25 @@ index 00000000..7b2cb5db
 +            or not 0 <= index < len(experts)
 +        ):
 +            raise ValueError("OnlineSPEC expert index is outside the learner")
++        if self.adam_ensemble:
++            clipped, norm = self._clip(gradients)
++            start = 1 + index * self._width
++            offset = len(self.first)
++            old_m = self.second[start:start + self._width]
++            old_v = self.second[start + offset:start + offset + self._width]
++            b1, b2 = self.config.beta1, self.config.beta2
++            first = tuple(b1 * m + (1 - b1) * g for m, g in zip(old_m, clipped, strict=True))
++            second = tuple(b2 * v + (1 - b2) * g.square() for v, g in zip(old_v, clipped, strict=True))
++            step = self._step + 1
++            parameters = tuple(
++                p - self.learning_rates[index] * (m / (1 - b1 ** step))
++                / ((v / (1 - b2 ** step)).sqrt() + self.config.epsilon)
++                for p, m, v in zip(experts[index], first, second, strict=True)
++            )
++            return OnlineSpecMemberProposal(
++                _project_online_parameters(parameters, self.initial, self.online_spec.projection_radius),
++                norm, first, second,
++            )
 +        return self._ogd(
 +            experts[index],
 +            gradients,
@@ -2700,10 +2726,17 @@ index 00000000..7b2cb5db
 +        gradient_norms = torch.stack(
 +            [member.gradient_norm.reshape(()) for member in members]
 +        )
++        moment_state = ()
++        if self.adam_ensemble:
++            if any(len(m.first_moments) != self._width or len(m.second_moments) != self._width for m in members):
++                raise ValueError("Adam ensemble proposal lacks expert moments")
++            moment_state = tuple(p for m in members for p in m.first_moments) + tuple(
++                p for m in members for p in m.second_moments
++            )
 +        return ParameterProposal(
 +            decision,
 +            flattened,
-+            (cumulative,),
++            (cumulative,) + moment_state,
 +            self._step + 1,
 +            gradient_norms,
 +            torch.as_tensor(
@@ -2765,6 +2798,8 @@ index 00000000..7b2cb5db
 +                    for destination, master in zip(expert, self.master, strict=True):
 +                        destination.copy_(master)
 +                self.second[0].zero_()
++                for moment in self.second[1:]:
++                    moment.zero_()
 +            self._step.zero_()
 +
 +    def diagnostics(self) -> dict:
@@ -2822,6 +2857,8 @@ index 00000000..7b2cb5db
 +        )
 +        if len(rates) != len(optimizer.learning_rates):
 +            raise ValueError("OnlineSPEC expert layout changed")
++        if getattr(config.online_spec, "ensemble_optimizer", "ogd") != getattr(optimizer.online_spec, "ensemble_optimizer", "ogd"):
++            raise ValueError("OnlineSPEC expert optimizer layout changed")
 +        optimizer.config = config.optimizer
 +        optimizer.method = config.method
 +        optimizer.online_spec = config.online_spec
@@ -2853,6 +2890,7 @@ index 00000000..7b2cb5db
 +        moment_layout,
 +        config.method if config.method.startswith("onlinespec_") else "adaptive",
 +        online_experts,
++        getattr(config.online_spec, "ensemble_optimizer", "ogd"),
 +    )
 +
 +

@@ -447,6 +447,7 @@ class SGLangClient:
         request_ids: Sequence[str] | None = None,
         timeout_seconds: float | None = None,
         ignore_eos: bool = True,
+        diagnostic_top_logprobs: int = 0,
     ) -> tuple[tuple[GenerationResult, ...], float]:
         prompt_rows = tuple(prompts)
         if not prompt_rows:
@@ -485,6 +486,10 @@ class SGLangClient:
         body["text" if are_text else "input_ids"] = [
             row if isinstance(row, str) else list(row) for row in prompt_rows
         ]
+        if diagnostic_top_logprobs:
+            if diagnostic_top_logprobs != 2 or self.stream_observer is None:
+                raise ValueError("top-2 diagnostic requires an excluded stream observer")
+            body.update(return_logprob=True, top_logprobs_num=2)
         headers = {"Content-Type": "application/json"}
         if routing_key is not None:
             headers["X-SMG-Routing-Key"] = routing_key
