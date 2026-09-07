@@ -3911,13 +3911,13 @@ def test_excluded_target_state_audit_detects_byte_alias_and_kv_mutation(tmp_path
     class MHATokenToKVPool:
         is_quantized_kv_cache = False
         layer_transfer_counter = None
-        start_layer, end_layer = 0, 1
+        start_layer, end_layer, layer_num = 3, 5, 2  # ModelRunner's end is exclusive
 
         def __init__(self):
             self.buffers = [(torch.ones(12, 1, 2), torch.ones(12, 1, 2)) for _ in range(2)]
 
         def get_kv_buffer(self, layer):
-            return self.buffers[layer]
+            return self.buffers[layer - self.start_layer]
 
     pool = MHATokenToKVPool()
     runner = SimpleNamespace(model=model, token_to_kv_pool=pool,
@@ -3936,6 +3936,7 @@ def test_excluded_target_state_audit_detects_byte_alias_and_kv_mutation(tmp_path
     assert evidence["target_parameters_unchanged"]
     assert evidence["committed_prefix_kv_unchanged_during_update"]
     assert len(evidence["prefix_kv_before"]["layers"]) == 2
+    assert set(evidence["prefix_kv_before"]["layers"]) == {"3", "4"}
     audit = TargetStateAudit(worker, tmp_path / "kv-fail.json")
     audit.before_update(values, 0)
     pool.buffers[1][1][2] += 1

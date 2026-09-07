@@ -71,7 +71,9 @@ def target_prefix_kv(values, row):
     index = int(batch.req_pool_indices[row].item())
     locations = worker.model_runner.req_to_token_pool.req_to_token[index, :length].clone().long()
     result = {"locations": locations.cpu().tolist(), "layers": {}}
-    for layer in range(pool.start_layer, pool.end_layer + 1):
+    # ModelRunner may pass an exclusive end_layer, while KVCache's default is
+    # inclusive. The actual allocated layer count is the unambiguous authority.
+    for layer in range(pool.start_layer, pool.start_layer + pool.layer_num):
         pair = pool.get_kv_buffer(layer)
         if any(buffer.ndim != 3 for buffer in pair):
             raise ValueError("excluded target KV audit requires token-major NHD")
