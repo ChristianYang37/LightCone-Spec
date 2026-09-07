@@ -1021,3 +1021,10 @@ def test_excluded_trajectory_logprobs_preserve_supported_paths():
     assert diagnostic["first_divergence"]([1, 2, 3], [1, 4, 3])["position"] == 1
     assert diagnostic["first_divergence"]([1, 2], [1, 2]) is None
     assert diagnostic["first_divergence"]([1], [1, 2])["target_token"] is None
+    params = {"stride": 10, "panel": "preview_v1", "frozen_recipe": {"stride": 10}}
+    frozen = diagnostic["frozen_control"](params, 4096)
+    assert params["stride"] == params["frozen_recipe"]["stride"] == 10
+    control = Job(job_id="excluded", node="excluded", ordinal=0, method="lightcone",
+                  model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500", parameters=frozen)
+    from lightcone_spec.server import adaptation_payload
+    assert adaptation_payload(control, frozen["frozen_recipe"])["stride"] == 32769

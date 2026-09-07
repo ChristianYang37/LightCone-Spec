@@ -27,6 +27,16 @@ def diagnostic_logprobs(variant):
     return 2 if variant == "target" else 0
 
 
+def frozen_control(parameters, max_tokens):
+    params = dict(parameters)
+    recipe = dict(params["frozen_recipe"])
+    recipe["stride"] = max_tokens * 8 + 1
+    # Job-level execution fields deliberately override selection fields.
+    params.update(stride=recipe["stride"], workload="systems_local_factorial",
+                  frozen_recipe=recipe)
+    return params
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -47,14 +57,16 @@ def main():
     recipe = dict(params["frozen_recipe"])
     # A bounded, excluded no-publication control, not a formal stride exception.
     if args.variant == "frozen":
-        recipe["stride"] = args.max_tokens * 8 + 1
-        params["workload"] = "systems_local_factorial"
+        params = frozen_control(params, args.max_tokens)
+        recipe = params["frozen_recipe"]
     params.update(excluded_from_analysis=True, frozen_recipe=recipe, generation_tokens=args.max_tokens)
     job = replace(original, job_id=f"excluded-first-divergence-{args.variant}",
                   node="excluded-preview-trajectory", method=method,
                   backend="NONE" if method == "target_only" else "DFLASH",
                   width=None if method == "target_only" else original.width, parameters=params)
     selection = recipe if method == "lightcone" else None
+    if args.variant == "frozen" and adaptation_payload(job, selection)["stride"] != args.max_tokens * 8 + 1:
+        raise RuntimeError("frozen control stride was overridden before launch")
     (args.output / "server").mkdir()
     (args.output / "config.json").write_text(json.dumps({"job": job.to_dict(),
         "adaptation": adaptation_payload(job, selection), "excluded": True,
