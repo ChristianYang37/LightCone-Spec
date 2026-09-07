@@ -170,6 +170,42 @@ def test_preview_startup_capacity_is_terminal_and_sibling_continues(monkeypatch,
     assert metrics["scientific_outcome"] == "infeasible" and not metrics["hard_feasible"]
 
 
+def test_native_tokenizer_initialization_is_serialized(monkeypatch, tmp_path):
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from lightcone_spec.runner import _native_tokenizer
+
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+    ready = threading.Barrier(2)
+
+    class Tokenizer:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            nonlocal active, peak
+            assert kwargs == {"local_files_only": True, "trust_remote_code": False}
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(.02)
+            with guard:
+                active -= 1
+            return path
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=Tokenizer))
+
+    def load(index):
+        ready.wait()
+        return _native_tokenizer(tmp_path / str(index))
+
+    with ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(load, range(2))) == [str(tmp_path / str(i)) for i in range(2)]
+    assert peak == 1
+
+
 def test_coverage_repair_is_method_specific_and_dense_transfer_preserves_workload():
     from lightcone_spec.coverage import (
         compatibility_replacements,

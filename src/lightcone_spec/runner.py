@@ -844,6 +844,21 @@ def _fit_prompt(tokens: tuple[int, ...], filler: tuple[int, ...], length: int) -
     return repeated[:needed] + tokens
 
 
+_NATIVE_TOKENIZER_LOCK = threading.Lock()
+
+
+def _native_tokenizer(model_path: Path):
+    # Transformers resolves AutoTokenizer through a lazy module. Its first
+    # concurrent resolution can expose a partially initialized export. Serialize
+    # import and construction, not generation or GPU workers.
+    with _NATIVE_TOKENIZER_LOCK:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            str(model_path), local_files_only=True, trust_remote_code=False,
+        )
+
+
 def _cell_inputs(
     config: ExperimentConfig,
     state: StateStore,
@@ -869,13 +884,7 @@ def _cell_inputs(
                 limit=count,
                 selection_seed=int(job.parameters["stimulus_selection_seed"]),
             )
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(config.model_path(job.model)),
-            local_files_only=True,
-            trust_remote_code=False,
-        )
+        tokenizer = _native_tokenizer(config.model_path(job.model))
         inputs = tuple(
             tuple(
                 tokenizer.apply_chat_template(
