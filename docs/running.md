@@ -172,3 +172,38 @@ the minimum full-context guard still applies. It must observe actual native KV
 retractions in the server log and zero logical-prefix/safety violations, not just
 complete a short request. It is separate from the 41 short QA identities, and its
 timings never price the formal ETA.
+
+## Automatic work units (v3)
+
+After the eight excluded TP1 interference cells pass request completion, GPU/CPU
+binding and numerical checks, ordinary TP1 units use one GPU each. The original
+goodput/p99-ITL BCa intervals remain recorded; exceeding ±1% is report-only, not a
+parallel-admission failure. Acceptance precedes coverage recovery. Every launch
+rediscovers BDF/NUMA and the available CPU set, reserves physical cores for the
+runner/OS and assigns disjoint server cores. `numactl` is optional; CPU binding is
+verified on the live server. A topology change requires a new excluded trial,
+and retains the earlier acceptance.
+
+Workers claim shared units atomically: independent eligible cells individually,
+paired blocks as a whole, and otherwise whole parent bundles. Logical block keys
+include source stage, model, comparison backend, topology, panel, budget policy
+and block (source/mechanism also retain their explicit pairing identity).
+Replacements resolve through source links, so a started unit keeps its binding
+and legacy isolation. No scientific job configuration or completed attempt is
+rewritten. A warm independent-cell session may transfer directly to the next
+compatible unit; a two-GPU task drains single-GPU leases after a bounded quantum.
+Hard-isolated units are last among ready units. Deferred coverage isolation is
+completed before E5, without declaring its pilot/final dependency complete early.
+
+New attempts record `execution_gpu_ids`, `reserved_gpu_ids`, `execution_policy`,
+CPU affinity (requested and observed), logical unit, co-running units and claim
+wait. `sessions/<node>/automatic-units-v3-*.json` records claims, warm handoffs and
+releases; SQLite remains the final per-cell claim gate. SIGINT stops new claims,
+finishes the active cell and leaves the rest pending. Runtime failures stop new
+claims; auditable scientific capacity outcomes do not stop sibling workers.
+
+Pair reducers and ETA stratify execution policy as well as memory policy; old
+missing fields mean `legacy_affinity_v1`. Full ETA stays `UNMEASURED` when matching
+new-policy samples are missing. Report effective cells/hour, busy/idle time and
+idle causes (loading, switching, unit tail, dependency or hard isolation).
+GPU utilization is not MFU: MFU remains `UNMEASURED` without reliable FLOP counts.

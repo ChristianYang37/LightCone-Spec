@@ -238,6 +238,7 @@ def four_block_panel_statistics(
             name: config.get(name) for name in ("node", "model", "backend", "task", "load", "width")
         }
         condition["metric"] = metric
+        condition["execution_policy"] = parameters.get("execution_policy", "legacy_affinity_v1")
         condition["memory_budget_policy"] = metrics.get("memory_budget_policy", "fixed_reserve_v1")
         condition.update(
             {
@@ -743,6 +744,7 @@ def paired_block_statistics(
             "comparison_backend", config.get("backend")
         )
         condition.update({name: parameters.get(name) for name in axes})
+        condition["execution_policy"] = parameters.get("execution_policy", "legacy_affinity_v1")
         condition["memory_budget_policy"] = metrics.get("memory_budget_policy", "fixed_reserve_v1")
         key = json.dumps(condition, sort_keys=True)
         descriptions[key] = condition

@@ -160,7 +160,10 @@ def discover_numa_affinity(gpu_ids: tuple[int, ...]) -> dict[str, Any]:
     for gpu, bdf in bdfs.items():
         path = Path("/sys/bus/pci/devices") / bdf / "numa_node"
         nodes[gpu] = int(path.read_text(encoding="utf-8").strip()) if path.is_file() else -1
-    plan = _plan_cpu_affinity(nodes, _parse_lscpu_rows(lscpu.stdout))
+    available = set(os.sched_getaffinity(0))
+    plan = _plan_cpu_affinity(nodes, tuple(
+        row for row in _parse_lscpu_rows(lscpu.stdout) if row[0] in available
+    ))
     plan.update(
         schema_version=1,
         enabled=True,
@@ -168,6 +171,7 @@ def discover_numa_affinity(gpu_ids: tuple[int, ...]) -> dict[str, Any]:
         nvidia_topology=topo.stdout if topo.returncode == 0 else "N/A",
         taskset_available=shutil.which("taskset") is not None,
         numactl_available=shutil.which("numactl") is not None,
+        launch_available_cpus=sorted(available),
     )
     return plan
 
@@ -741,7 +745,11 @@ class ServerProcess:
         else:
             bindings = []
         if bindings:
-            cpus = sorted({cpu for binding in bindings for cpu in binding["cpus"]})
+            cpus = self.job.parameters.get("execution_cpu_affinity") or sorted(
+                {cpu for binding in bindings for cpu in binding["cpus"]}
+            )
+            if not set(cpus).issubset(plan.get("launch_available_cpus", cpus)):
+                raise RuntimeError("started-unit CPU affinity is no longer available")
             nodes = {int(binding["numa_node"]) for binding in bindings}
             affinity = {
                 "gpu_ids": list(self.gpus),

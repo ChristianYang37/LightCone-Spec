@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .protocol import Job, materialize, mechanism_jobs, memory_budget_policy, source_coverage_jobs
+from .scheduling import logical_unit_key
 
 COMPATIBILITY_NODE = "coverage-compatibility-v1"
 DENSE_14B = "Qwen/Qwen3-14B"
@@ -25,7 +26,8 @@ def request_budget_eta(jobs, evidence, *, request_counts, resources, seed=0, rep
         p = job.parameters
         return (job.model, job.backend, job.method, p.get("topology", "tp1_dp1"),
                 job.load, p.get("generation_tokens"), p.get("panel"),
-                p.get("regime"), bool(p.get("respect_eos")), policy)
+                p.get("regime"), bool(p.get("respect_eos")), policy,
+                p.get("execution_policy", "legacy_affinity_v1"))
 
     pools = {}
     for item, metrics in evidence:
@@ -59,7 +61,8 @@ def request_budget_eta(jobs, evidence, *, request_counts, resources, seed=0, rep
         if resources[job.job_id] == 2:
             clocks[:] = clocks.max(axis=0) + cost
         else:
-            affinity = (job.node, job.block) if job.block is not None else None
+            identity = job.parameters.get("execution_unit")
+            affinity = (tuple(identity) if identity else logical_unit_key(job)) if job.block is not None else None
             gpu = affinities.get(affinity) if affinity is not None else None
             if gpu is None:
                 gpu = clocks.argmin(axis=0)

@@ -55,6 +55,18 @@ def test_coverage_eta_scales_request_budget_without_reusing_unknown_output_costs
     excluded = replace(job, parameters={**job.parameters, "excluded_from_analysis": True})
     assert request_budget_eta((job,), [(excluded, evidence[0][1])],
                               request_counts={job.job_id: 500}, **args)["priced_leaves"] == 0
+    new_execution = replace(job, parameters={**job.parameters, "execution_policy": "automatic_units_v3"})
+    assert request_budget_eta((new_execution,), evidence,
+                              request_counts={job.job_id: 500}, **args)["priced_leaves"] == 0
+
+
+def test_execution_modes_do_not_form_a_paired_effect():
+    base = {"block": 0, "model": "qwen", "backend": "DFLASH", "task": "math",
+            "context": 100, "load": "c1", "parameters": {}}
+    rows = [({**base, "method": "static"}, {"goodput": 100, "hard_feasible": True}),
+            ({**base, "method": "lightcone", "parameters": {
+                "execution_policy": "automatic_units_v3"}}, {"goodput": 110, "hard_feasible": True})]
+    assert paired_block_statistics(rows) == []
 
 
 def test_legacy_bonus_counters_are_recomputed_only_when_layout_is_identified(tmp_path):

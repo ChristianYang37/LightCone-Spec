@@ -13,6 +13,7 @@ from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import E0_ONLINESPEC_RECIPES, Job, materialize
 from lightcone_spec.runner import (
     ScientificFailure,
+    _automatic_work_units,
     _cleanup_interrupted_servers,
     _complete_blocked_profiler,
     _complete_infeasible_startup,
@@ -26,6 +27,7 @@ from lightcone_spec.runner import (
     _exclude_redundant_e2_dependency_jobs,
     _execution_allocations,
     _ncu_permission_block_reason,
+    _parallel_correctness_v3,
     _records_scientific_rejection,
     _reduce_node,
     _reopen_soft_gate_e3b,
@@ -1066,6 +1068,182 @@ def test_tp1_started_blocks_and_isolation_are_not_remapped(tmp_path):
         assert _execution_allocations(config, state, base.node, (special,))["base"] == (0, 1)
     special = replace(base, node="E6-final", block=None)
     assert _execution_allocations(config, state, special.node, (special,))["base"] == (0, 1)
+
+
+def test_automatic_unit_keys_keep_models_topologies_and_replacements_separate(tmp_path):
+    from lightcone_spec.scheduling import logical_unit_key
+
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    base = Job(job_id="original", node="E0-pilot", ordinal=0, method="static", block=0,
+               model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500", gpu_count=2)
+    other = replace(base, job_id="14b", model="Qwen/Qwen3-14B",
+                    parameters={"topology": "tp2_dp1"})
+    state.add_jobs(base.node, (base, other))
+    directory = tmp_path / "old-attempt"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps({"parameters": {
+        "execution_gpu_ids": [1], "reserved_gpu_ids": [1],
+        "execution_policy": "automatic_units_v3", "execution_cpu_affinity": [8, 9],
+    }}))
+    attempt = state.start(base, (1,), directory)
+    state.complete(base.job_id, attempt)
+    replacement = replace(base, job_id="replacement", node="coverage-E0-pilot-v1",
+        parameters={"source_node": base.node, "replaces_job_id": base.job_id,
+                    "panel": "coverage_restoration"})
+    units = _automatic_work_units(config, state, (replacement, other))
+    assert len(units) == 2
+    assert units[0].pin == (1,) and units[0].devices == 1
+    assert units[1].pin == () and units[1].devices == 2
+    source = replace(base, parameters={"pairing_key": "source|8b|dflash|math"})
+    assert logical_unit_key(source) != logical_unit_key(replace(source, block=1))
+    state.set_selection("tp1_resource_parallel_v2", {"enabled": True})
+    assert _execution_allocations(config, state, base.node, (base, other))[base.job_id] == (1,)
+
+
+def test_work_pool_refills_atomically_without_splitting_units_or_starving_tp2():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from lightcone_spec.scheduling import WorkPool, WorkUnit
+
+    base = Job(job_id="a", node="E0-tune", ordinal=0, method="static", gpu_count=1,
+               model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix")
+    units = tuple(WorkUnit((str(i),), (replace(base, job_id=f"{i}a", ordinal=i),
+                                    replace(base, job_id=f"{i}b", ordinal=i)),
+                          2 if i == 5 else 1, (("same",),), 100 - i)
+                  for i in range(8))
+    pool = WorkPool(units, (0, 1))
+    stop, failed = threading.Event(), threading.Event()
+    seen, lock = [], threading.Lock()
+
+    def worker(gpu):
+        while (claim := pool.claim(gpu, ("same",), stop, failed)) is not None:
+            unit, devices = claim
+            with lock:
+                seen.append((unit.key, devices))
+            time.sleep(.004 if gpu == 0 else .001)
+            pool.release(gpu)
+    with ThreadPoolExecutor(2) as executor:
+        list(executor.map(worker, (0, 1)))
+    assert len(seen) == len({key for key, _ in seen}) == 8
+    assert next(devices for key, devices in seen if key == ("5",)) == (0, 1)
+    assert [key for key, _ in seen].index(("5",)) <= 3
+    assert sum(devices == (1,) for _, devices in seen) > 3
+    assert not pool.pending and not pool.active
+    stopped = WorkPool(units, (0, 1))
+    stop.set()
+    assert stopped.claim(0, None, stop, failed) is None
+    assert len(stopped.pending) == 8
+
+
+def test_parallel_v3_correctness_does_not_gate_on_interference():
+    rows = []
+    for mode in ("isolated", "concurrent"):
+        for repetition in range(2):
+            for gpu in range(2):
+                rows.append(({"parameters": {"mode": mode, "repetition": repetition,
+                    "gpu_index": gpu, "execution_gpu_ids": [gpu],
+                    "execution_cpu_affinity": [gpu + 4]}}, {
+                    "hard_feasible": True, "observed_cpu_affinity": [gpu + 4],
+                    "observed_visible_gpu_ids": [gpu],
+                    "request_outcomes": {"offered": 16, "completed": 16},
+                    "goodput": 100 if mode == "isolated" else 50,
+                    "itl_p99_ms": 1 if mode == "isolated" else 3,
+                }))
+    assert _parallel_correctness_v3(rows)
+    rows[0][1]["fallbacks"] = 1
+    assert not _parallel_correctness_v3(rows)
+    rows[0][1]["fallbacks"] = 0
+    rows[0][1]["observed_cpu_affinity"] = [999]
+    assert not _parallel_correctness_v3(rows)
+
+
+def test_warm_handoff_retains_lease_and_yields_to_waiting_tp2():
+    from lightcone_spec.scheduling import WorkPool, WorkUnit
+
+    base = Job(job_id="a", node="E0-tune", ordinal=0, method="static", gpu_count=1,
+               model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix")
+    units = tuple(WorkUnit(("cell", str(i)), (replace(base, job_id=str(i), ordinal=i),),
+                          2 if i == 3 else 1, (("session",),), 10 - i)
+                  for i in range(4))
+    pool = WorkPool(units, (0, 1))
+    stop, failed = threading.Event(), threading.Event()
+    pool.claim(0, None, stop, failed)
+    assert pool.handoff(0, ("session",), stop, failed)[0].jobs[0].job_id == "1"
+    assert pool.handoff(0, ("session",), stop, failed) is None
+    pool.release(0)
+    unit, devices = pool.claim(1, None, stop, failed)
+    assert unit.jobs[0].job_id == "3" and devices == (0, 1)
+    pool.release(1)
+
+
+def test_numa_discovery_filters_current_affinity_and_does_not_require_numactl(monkeypatch):
+    from types import SimpleNamespace
+
+    from lightcone_spec.server import discover_numa_affinity
+
+    def command(argv, **kwargs):
+        if argv[0] == "lscpu":
+            text = "\n".join(f"{i},{i},0,0" for i in range(24))
+        elif "topo" in argv:
+            text = "current topology, not cached"
+        else:
+            text = "0, 00000000:49:00.0\n1, 00000000:b8:00.0"
+        return SimpleNamespace(returncode=0, stdout=text)
+    monkeypatch.setattr("lightcone_spec.server.subprocess.run", command)
+    monkeypatch.setattr("lightcone_spec.server.os.sched_getaffinity", lambda pid: set(range(8, 24)),
+                        raising=False)
+    monkeypatch.setattr("lightcone_spec.server.shutil.which",
+                        lambda name: "/usr/bin/taskset" if name == "taskset" else None)
+    plan = discover_numa_affinity((0, 1))
+    a, b = set(plan["gpus"]["0"]["cpus"]), set(plan["gpus"]["1"]["cpus"])
+    reserved = set(plan["runner_cpus"])
+    assert not a & b and not (a | b) & reserved
+    assert a | b | reserved == set(range(8, 24))
+    assert len(reserved) >= 4 and plan["enabled"] and not plan["numactl_available"]
+
+
+def test_automatic_runner_keeps_paired_children_and_records_real_resources(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    state.set_selection("tp1_resource_parallel_v3", {"enabled": True})
+    base = Job(job_id="a", node="E0-pilot", ordinal=0, method="static", gpu_count=2,
+               block=0, model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix")
+    jobs = tuple(replace(base, job_id=f"j{i}", ordinal=i, model=f"model-{i // 2}")
+                 for i in range(6))
+    state.add_jobs(base.node, jobs)
+    observed = []
+    barrier = threading.Barrier(2)
+
+    class Server:
+        def __init__(self, config, job, **kw):
+            self.output_dir = kw["output_dir"]
+            self.session_key = (job.model,)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def execute(config, state, job, *, gpus, **kwargs):
+        if job.ordinal in (0, 2):
+            barrier.wait(timeout=5)
+        path = config.run_dir / "evidence" / job.job_id
+        path.mkdir(parents=True)
+        attempt = state.start(job, gpus, path)
+        observed.append((job, gpus))
+        time.sleep(.003 if gpus == (0,) else .001)
+        state.complete(job.job_id, attempt)
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", Server)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    _run_pending_jobs(config, state, base.node, threading.Event(), jobs)
+    assert state.status_counts(base.node) == {"completed": 6}
+    assert len(observed) == len({j.job_id for j, _ in observed}) == 6
+    assignments = {j.model: {g for row, g in observed if row.model == j.model} for j, _ in observed}
+    assert all(len(devices) == 1 for devices in assignments.values())
+    assert {g for _, g in observed} == {(0,), (1,)}
+    assert all(j.parameters["reserved_gpu_ids"] == list(g) for j, g in observed)
+    assert all(j.parameters["execution_policy"] == "automatic_units_v3" for j, _ in observed)
 
 
 def test_tp1_v2_gate_uses_exact_excluded_interference_matrix(tmp_path):

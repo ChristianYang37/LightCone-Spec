@@ -17,6 +17,7 @@ import urllib.error
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,7 @@ from .protocol import (
     source_coverage_jobs,
     uses_formal_adaptation_stride,
 )
+from .scheduling import WorkPool, WorkUnit, logical_unit_key
 from .server import (
     ReplicaServerProcess,
     ServerProcess,
@@ -1543,6 +1545,11 @@ def _execute_cell(
         "execution_gpu_ids": list(gpus),
         "execution_gpu_count": len(gpus),
         "execution_request_count": execution_request_count,
+        **{name: job.parameters[name] for name in (
+            "reserved_gpu_ids", "execution_policy", "execution_unit",
+            "execution_cpu_affinity", "co_running_units", "unit_claimed_at",
+            "unit_wait_seconds",
+        ) if name in job.parameters},
     }
     while True:
         next_attempt = state.next_attempt(job.job_id)
@@ -1598,9 +1605,25 @@ def _execute_cell(
             _write_json(output_dir / "config.json", raw_config)
             bootstrap_job = _exactness_bootstrap(runtime_job)
             client = server.configure(bootstrap_job, selection)
+            requested_cpus = execution_resources.get("execution_cpu_affinity")
+            if requested_cpus:
+                if server.process is None:
+                    raise RuntimeError("CPU binding verification requires a live server")
+                observed_cpus = sorted(os.sched_getaffinity(server.process.pid))
+                if observed_cpus != sorted(requested_cpus):
+                    raise RuntimeError("server CPU binding differs from its execution lease")
+                execution_resources["observed_cpu_affinity"] = observed_cpus
+                entries = (Path("/proc") / str(server.process.pid) / "environ").read_bytes().split(b"\0")
+                visible = next((entry.split(b"=", 1)[1].decode() for entry in entries
+                                if entry.startswith(b"CUDA_VISIBLE_DEVICES=")), "")
+                if visible != ",".join(map(str, gpus)):
+                    raise RuntimeError("server GPU visibility differs from its execution lease")
+                execution_resources["observed_visible_gpu_ids"] = list(gpus)
             session_startup_seconds = (
-                0.0 if server.last_configure_reused else float(server.startup_seconds)
+                0.0 if server.last_configure_reused and getattr(server, "_startup_charged", False)
+                else float(server.startup_seconds)
             )
+            server._startup_charged = True
             session_reused = bool(server.last_configure_reused)
             prompts, max_new_tokens, workload = _cell_inputs(config, state, client, input_job)
             offered = len(prompts)
@@ -2564,7 +2587,7 @@ def _execution_allocations(
     e0_tune_exemption = node == "E0-tune"
     if not (parallel_v1 or parallel_v2 or e0_tune_exemption):
         return allocations
-    pins: dict[int, set[tuple[int, ...]]] = {}
+    pins: dict[tuple, set[tuple[int, ...]]] = {}
     with state.connect() as connection:
         rows = connection.execute(
             "SELECT j.config_json,j.assigned_gpus,a.output_dir FROM jobs j "
@@ -2582,22 +2605,117 @@ def _execution_allocations(
                 assigned = tuple(json.loads(saved.read_text()).get("parameters", {}).get(
                     "execution_gpu_ids", (),
                 ))
-        pins.setdefault(previous.block, set()).add(assigned or _job_gpus(config, previous))
+        pins.setdefault(logical_unit_key(previous), set()).add(
+            assigned or _job_gpus(config, previous)
+        )
     # A mixed-topology/isolation block cannot be split across resource classes.
-    protected = {job.block for job in jobs if job.block is not None
+    protected = {logical_unit_key(job) for job in jobs if job.block is not None
                  and not _tp1_resource_eligible(job)}
     for job in jobs:
-        if not _tp1_resource_eligible(job) or job.block in protected:
+        if not _tp1_resource_eligible(job) or logical_unit_key(job) in protected:
             continue
         if e0_tune_exemption and job.node != "E0-tune":
             continue
-        prior = pins.get(job.block, set())
+        prior = pins.get(logical_unit_key(job), set())
         if len(prior) > 1:
             continue
         assigned = next(iter(prior)) if prior else (_assigned_gpu(config, job),)
         if all(gpu in config.gpu_ids for gpu in assigned):
             allocations[job.job_id] = assigned
     return allocations
+
+
+def _automatic_work_units(
+    config: ExperimentConfig, state: StateStore, jobs: tuple[Job, ...],
+    *, resolve_sessions: bool = True,
+) -> tuple[WorkUnit, ...]:
+    """Resolve source/replacement identity and started-block leases together."""
+    with state.connect() as connection:
+        history = connection.execute(
+            "SELECT j.config_json,j.assigned_gpus,j.attempt_count,a.output_dir FROM jobs j "
+            "LEFT JOIN attempts a ON a.job_id=j.job_id AND a.attempt=j.attempt_count"
+        ).fetchall()
+    registered = {j.job_id: j for j in (Job(**json.loads(r["config_json"])) for r in history)}
+
+    def key(job: Job) -> tuple:
+        seen = set()
+        original = job
+        while original.job_id not in seen:
+            seen.add(original.job_id)
+            reference = original.parameters.get("replaces_job_id")
+            if reference not in registered:
+                reference = original.parameters.get("original_parent_job_id")
+            if reference not in registered:
+                break
+            original = registered[reference]
+        # A registered topology/budget change is a different scientific unit;
+        # operational restoration panel labels are not new pairing identities.
+        if original is not job and job.block is not None:
+            original = replace(original, parameters={
+                **original.parameters,
+                "logical_memory_budget_policy": memory_budget_policy(job),
+                **{name: job.parameters[name] for name in ("topology", "memory_budget_policy")
+                   if name in job.parameters},
+            })
+        independent = _session_pool_eligible(job) or (
+            job.block is None and str(job.parameters.get("source_node", job.node)) == "E0-tune"
+        )
+        return logical_unit_key(original, splittable=independent)
+
+    provenance: dict[tuple, list[dict]] = {}
+    for row in history:
+        previous = Job(**json.loads(row["config_json"]))
+        if not row["attempt_count"] or isinstance(previous.parameters.get("segments"), list):
+            continue
+        parameters = {}
+        if row["output_dir"]:
+            path = Path(row["output_dir"]) / "config.json"
+            if path.is_file():
+                parameters = json.loads(path.read_text()).get("parameters", {})
+        assigned = tuple(int(g) for g in (row["assigned_gpus"] or "").split(",") if g)
+        provenance.setdefault(key(previous), []).append({
+            "reserved": tuple(parameters.get("reserved_gpu_ids", assigned)),
+            "policy": parameters.get("execution_policy", "legacy_affinity_v1"),
+            "cpus": tuple(parameters.get("execution_cpu_affinity", ())),
+        })
+    groups: dict[tuple, list[Job]] = {}
+    for job in jobs:
+        groups.setdefault(key(job), []).append(job)
+    units = []
+    for identity, rows in groups.items():
+        prior = provenance.get(identity, [])
+        pins = {item["reserved"] for item in prior if item["reserved"]}
+        policies = {item["policy"] for item in prior}
+        cpus = {item["cpus"] for item in prior if item["cpus"]}
+        if len(pins) > 1 or len(policies) > 1 or len(cpus) > 1:
+            raise RuntimeError(f"conflicting started-unit execution provenance: {identity}")
+        pin = next(iter(pins), ())
+        if pin and not set(pin).issubset(config.gpu_ids):
+            raise RuntimeError(f"started-unit GPU allocation unavailable: {identity}: {pin}")
+        legacy = bool(prior) and policies != {"automatic_units_v3"}
+        isolation = legacy or any(any(job.parameters.get(name) for name in (
+            "profiler", "failure", "controlled_replay", "controlled_pair_baseline",
+            "requires_isolation",
+        )) for job in rows)
+        devices = max(1 if _tp1_resource_eligible(job) else job.gpu_count for job in rows)
+        if pin:
+            devices = len(pin)
+        if isolation:
+            devices = len(config.gpu_ids)
+        sessions = tuple(dict.fromkeys(server_session_key(
+            _exactness_bootstrap(_runtime_job(config, state, job)), _selection_for_job(state, job)
+        ) for job in rows)) if resolve_sessions else ()
+        units.append(WorkUnit(
+            identity, tuple(rows), devices, sessions,
+            sum(_session_pool_work(job) for job in rows),
+            pin=config.gpu_ids if isolation else pin, isolated=isolation,
+            execution_policy="legacy_affinity_v1" if legacy else "automatic_units_v3",
+            legacy_cpus=next(iter(cpus), tuple(state.selection(
+                "tp1_resource_parallel_v3", {}
+            ).get("legacy_launch_cpus", ()))) if legacy else (),
+            execution_pin=pin,
+        ))
+    return tuple(units)
 
 
 def _session_order(
@@ -3834,7 +3952,29 @@ def _run_pending_jobs(
     pooled_singles = tuple(job for job in singles if _session_pool_eligible(job))
     singles = tuple(job for job in singles if job not in pooled_singles)
 
-    def run_sessions(jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str) -> None:
+    @contextmanager
+    def process_context(process, cache):
+        if cache is None:
+            with process:
+                yield process
+            return
+        active = cache.get("process")
+        if active is not None and active.session_key != process.session_key:
+            active.stop()
+            active = None
+        if active is None:
+            active = process
+            cache["process"] = active
+            active.start()
+        try:
+            yield active
+        except BaseException:
+            active.stop()
+            cache.clear()
+            raise
+
+    def run_sessions(jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str,
+                     cache: dict | None = None) -> None:
         jobs = tuple(jobs)
         grouped: dict[tuple[object, ...], list[tuple[Job, Job, dict[str, Any] | None]]] = {}
         for job in jobs:
@@ -3903,7 +4043,7 @@ def _run_pending_jobs(
                     selection=first_selection,
                 )
                 try:
-                    with process:
+                    with process_context(process, cache) as process:
                         for job, _, selection in rows:
                             if stop_event.is_set() or node_failed.is_set():
                                 return
@@ -3915,7 +4055,7 @@ def _run_pending_jobs(
                                 selection=selection,
                                 server=process,
                             )
-                            if state.status_counts(node).get("failed"):
+                            if state.job_status(job.job_id) == "failed":
                                 node_failed.set()
                                 return
                     break
@@ -3967,6 +4107,91 @@ def _run_pending_jobs(
                     )
                     if not retry:
                         raise
+
+    automatic = state.selection("tp1_resource_parallel_v3", {}).get("enabled")
+    if automatic and node != "preflight" and not node.startswith("TP1-interference"):
+        # Freeze session ordering against the original declared placement, before
+        # any worker can claim a unit. Worker ID never becomes a new RNG seed.
+        remapped = True
+        legacy_keys.clear()
+        for job in pending:
+            runtime = _exactness_bootstrap(_runtime_job(config, state, job))
+            probe = job.job_id if job.parameters.get("adaptive_probe") else None
+            session = (job.block, probe, *server_session_key(runtime, _selection_for_job(state, job)))
+            legacy_keys.setdefault(_job_gpus(config, job), []).append(session)
+        legacy_keys.update({
+            devices: (list(dict.fromkeys(keys)) if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+                      else _session_order(config, node, devices, keys))
+            for devices, keys in legacy_keys.items()
+        })
+        units = _automatic_work_units(config, state, pending)
+        unit_pool = WorkPool(units, config.gpu_ids)
+        queue_started = time.time()
+        trace_path = config.run_dir / "sessions" / node / f"automatic-units-v3-{time.time_ns()}.json"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def unit_worker(gpu: int) -> None:
+            preferred = None
+            claimed = None
+            cache: dict = {}
+            while True:
+                if claimed is None:
+                    claimed = unit_pool.claim(gpu, preferred, stop_event, node_failed)
+                if claimed is None:
+                    return
+                unit, reserved = claimed
+                topology = unit.jobs[0].parameters.get("topology", "tp1_dp1")
+                tp1 = topology == "tp1_dp1" and not unit.jobs[0].node.startswith("E6")
+                execution = (unit.execution_pin or reserved)[:1] if tp1 else reserved
+                plan_path = config.run_dir / "numa-affinity.json"
+                plan = json.loads(plan_path.read_text()) if plan_path.is_file() else {}
+                cpus = list(unit.legacy_cpus) or sorted({
+                    cpu for device in execution
+                    for cpu in plan.get("gpus", {}).get(str(device), {}).get("cpus", [])
+                })
+                with unit_pool.condition:
+                    peers = [list(u.key) for w, (u, _) in unit_pool.active.items() if w != gpu]
+                    _write_json(trace_path, {"events": unit_pool.events,
+                        "pending_units": len(unit_pool.pending),
+                        "running_units": [list(u.key) for u, _ in unit_pool.active.values()],
+                        "mfu": "UNMEASURED"})
+                rows = tuple(replace(job, parameters={**job.parameters,
+                    "reserved_gpu_ids": list(reserved),
+                    "execution_policy": unit.execution_policy,
+                    "execution_unit": list(unit.key), "execution_cpu_affinity": cpus,
+                    "co_running_units": peers, "unit_claimed_at": time.time(),
+                    "unit_wait_seconds": time.time() - queue_started,
+                }) for job in unit.jobs)
+                reusable = (unit.key[0] == "cell" and not unit.isolated
+                            and not any(j.parameters.get("clean_server_per_cell") for j in rows))
+                next_claim = None
+                try:
+                    run_sessions(rows, gpus=execution, port=_resource_port(config, execution),
+                                 label=f"unit-gpu-{gpu}", cache=cache if reusable else None)
+                    preferred = unit.sessions[-1] if unit.sessions else None
+                    if reusable and cache.get("process") is not None:
+                        next_claim = unit_pool.handoff(
+                            gpu, cache["process"].session_key, stop_event, node_failed
+                        )
+                except BaseException:
+                    node_failed.set()
+                    raise
+                finally:
+                    if next_claim is None:
+                        if cache.get("process") is not None:
+                            cache.pop("process").stop()
+                        unit_pool.release(gpu)
+                    with unit_pool.condition:
+                        _write_json(trace_path, {"events": unit_pool.events,
+                            "pending_units": len(unit_pool.pending),
+                            "running_units": [list(u.key) for u, _ in unit_pool.active.values()],
+                            "mfu": "UNMEASURED"})
+                claimed = next_claim
+        with ThreadPoolExecutor(max_workers=len(config.gpu_ids),
+                                thread_name_prefix="lightcone-unit") as executor:
+            _join_workers_fail_fast([executor.submit(unit_worker, gpu) for gpu in config.gpu_ids],
+                                    node_failed)
+        return
 
     headline = node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
     calibration = state.selection("headline_parallel", {"enabled": False})
@@ -7370,6 +7595,89 @@ def _run_tp1_interference_v2(
     _write_json(path, result)
 
 
+def _parallel_correctness_v3(rows: list[tuple[dict, dict]]) -> bool:
+    if len(rows) != 8:
+        return False
+    seen = set()
+    for item, metrics in rows:
+        p = item.get("parameters", {})
+        identity = (p.get("mode"), p.get("repetition"), p.get("gpu_index"))
+        if identity in seen:
+            return False
+        seen.add(identity)
+        outcomes = metrics.get("request_outcomes", {})
+        if (metrics.get("hard_feasible") is not True
+                or outcomes.get("completed") != 16
+                or outcomes.get("offered") != 16
+                or p.get("execution_gpu_ids") != [p.get("gpu_index")]
+                or not p.get("execution_cpu_affinity")
+                or metrics.get("observed_cpu_affinity") != p.get("execution_cpu_affinity")
+                or metrics.get("observed_visible_gpu_ids") != p.get("execution_gpu_ids")
+                or any(metrics.get(name, 0) != 0 for name in SAFETY_COUNTERS)):
+            return False
+    return seen == {(mode, rep, gpu) for mode in ("isolated", "concurrent")
+                    for rep in range(2) for gpu in range(2)}
+
+
+def _run_tp1_interference_v3(
+    config: ExperimentConfig, state: StateStore, stop_event: threading.Event,
+) -> None:
+    topology_path = config.run_dir / "numa-affinity.json"
+    topology = json.loads(topology_path.read_text()) if topology_path.is_file() else {}
+    identity = {key: topology.get(key) for key in (
+        "gpu_bdfs", "gpus", "launch_available_cpus", "taskset_available", "numactl_available"
+    )}
+    previous = state.selection("tp1_resource_parallel_v3", {})
+    if previous.get("enabled") and previous.get("topology") == identity:
+        return
+    if not topology.get("enabled") or not topology.get("taskset_available"):
+        raise RuntimeError("automatic scheduling requires valid CPU affinity; numactl is optional")
+    # A changed host/cpuset gets a fresh excluded trial; old acceptance is retained.
+    if previous.get("topology") == identity and previous.get("trial"):
+        trial = previous["trial"]
+    else:
+        trial = int(previous.get("trial", 0)) + 1
+        if previous:
+            state.set_selection(f"tp1_resource_parallel_v3_history_{trial - 1}", previous)
+    node = f"TP1-interference-v3-{trial}"
+    state.set_selection("tp1_resource_parallel_v3", {
+        "enabled": False, "trial": trial, "topology": identity,
+        "legacy_launch_cpus": previous.get("legacy_launch_cpus", topology["launch_available_cpus"]),
+    })
+    jobs = tuple(replace(job, node=node, job_id=job.job_id.replace("v2", f"v3-{trial}"),
+        parameters={**job.parameters, "execution_policy": "automatic_units_v3_qa",
+            "execution_cpu_affinity": topology["gpus"][str(job.parameters["gpu_index"])]["cpus"],
+        }) for job in _tp1_interference_v2_jobs())
+    state.add_internal_jobs(jobs, storage_node=node)
+    for job in state.pending_jobs(node):
+        if job.parameters["mode"] == "isolated":
+            _run_pending_jobs(config, state, node, stop_event, (job,))
+            if stop_event.is_set():
+                return
+    for repetition in range(2):
+        pending = tuple(job for job in state.pending_jobs(node)
+                        if job.parameters["mode"] == "concurrent"
+                        and job.parameters["repetition"] == repetition)
+        _run_pending_jobs(config, state, node, stop_event, pending)
+        if stop_event.is_set():
+            return
+    _require_internal_jobs(state, node)
+    rows = list(_metric_rows(state, node))
+    if not _parallel_correctness_v3(rows):
+        raise RuntimeError(f"{node}: request, binding or numerical correctness acceptance failed")
+    result = _select_pair_parallelism(state, node)
+    result.update(
+        interference_within_one_percent=result["enabled"], enabled=True,
+        criterion="correctness_required_interference_report_only_v3",
+        trial=trial, topology=identity,
+        legacy_launch_cpus=state.selection("tp1_resource_parallel_v3")["legacy_launch_cpus"],
+    )
+    result_path = config.run_dir / "stages" / node / "result.json"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(result_path, result)
+    state.set_selection("tp1_resource_parallel_v3", result)
+
+
 def _remaining_leaf_cells(state: StateStore) -> int:
     with state.connect() as connection:
         stored = connection.execute(
@@ -7556,14 +7864,29 @@ def _write_coverage_eta(config, state):
              SOURCE_COVERAGE_NODE, MECHANISM_NODE, "E5-pilot", "E5-final"]
     remaining = tuple(sorted(remaining, key=lambda j: (
         order.index(j.node) if j.node in order else len(order), j.ordinal)))
-    evidence = [(_job_from_metric_config(item), metrics)
-                for node in (*PAPER_NODES, SOURCE_COVERAGE_NODE, MECHANISM_NODE)
-                for item, metrics in _metric_rows(state, node)]
+    with state.connect() as connection:
+        internal_nodes = tuple(row[0] for row in connection.execute(
+            "SELECT DISTINCT node FROM jobs WHERE node LIKE 'coverage-%'"
+        ))
+    evidence_by_source = {}
+    for node in (*PAPER_NODES, SOURCE_COVERAGE_NODE, MECHANISM_NODE, *internal_nodes):
+        for item, metrics in _metric_rows(state, node):
+            identity = (item["job_id"], metrics.get("source_attempt_dir"))
+            evidence_by_source[identity] = (_job_from_metric_config(item), metrics)
+    evidence = list(evidence_by_source.values())
+    resource_map = None
+    if state.selection("tp1_resource_parallel_v3", {}).get("enabled"):
+        units = _automatic_work_units(config, state, remaining, resolve_sessions=False)
+        resolved = {job.job_id: replace(job, parameters={**job.parameters,
+                    "execution_policy": unit.execution_policy, "execution_unit": list(unit.key)})
+                    for unit in units for job in unit.jobs}
+        remaining = tuple(resolved[j.job_id] for j in remaining)
+        resource_map = {job.job_id: unit.devices for unit in units for job in unit.jobs}
     isolated = not state.selection("tp1_resource_parallel_v2", {}).get("enabled")
     audit = request_budget_eta(
         remaining, evidence,
         request_counts={j.job_id: _request_count(config, state, j) for j in remaining},
-        resources={j.job_id: (2 if isolated and j.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+        resources=resource_map or {j.job_id: (2 if isolated and j.node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
                               else _eta_resource_count(state, j)) for j in remaining},
         seed=config.protocol.seed,
     )
@@ -7584,6 +7907,8 @@ def _eta_stratum(config: dict[str, Any] | Job) -> tuple[str, ...]:
             config.method,
             str(parameters.get("workload", "unspecified")),
             str(parameters.get("topology", "tp1_dp1")),
+            str(parameters.get("execution_policy", "legacy_affinity_v1")),
+            memory_budget_policy(config),
         )
     parameters = config.get("parameters", {})
     return (
@@ -7592,6 +7917,8 @@ def _eta_stratum(config: dict[str, Any] | Job) -> tuple[str, ...]:
         str(config.get("method")),
         str(parameters.get("workload", "unspecified")),
         str(parameters.get("topology", "tp1_dp1")),
+        str(parameters.get("execution_policy", "legacy_affinity_v1")),
+        str(config.get("memory_budget_policy", parameters.get("memory_budget_policy", "fixed_reserve_v1"))),
     )
 
 
@@ -7602,6 +7929,8 @@ def _eta_resource_count(state: StateStore, job: Job) -> int:
     if job.node == "E0-tune":
         return 1
     parallel = bool(
+        state.selection("tp1_resource_parallel_v3", {}).get("enabled")
+        or
         state.selection("tp1_resource_parallel_v2", {}).get("enabled")
         or state.selection("tp1_resource_parallel_v1", {}).get("enabled")
     )
@@ -7609,6 +7938,9 @@ def _eta_resource_count(state: StateStore, job: Job) -> int:
 
 
 def _write_priority_eta_v2(config: ExperimentConfig, state: StateStore) -> None:
+    if state.selection("tp1_resource_parallel_v3", {}).get("enabled"):
+        _write_coverage_eta(config, state)
+        return
     if state.selection("formal_priority_eta_v2", None) is not None:
         return
     # The legacy cell-runtime bootstrap cannot price 500-request source cells
@@ -7926,7 +8258,8 @@ def _run_coverage_e1a_repair(config, state, stop_event):
 
 
 def _run_coverage_recovery(
-    config: ExperimentConfig, state: StateStore, stop_event: threading.Event
+    config: ExperimentConfig, state: StateStore, stop_event: threading.Event,
+    *, include_isolated: bool = False,
 ) -> None:
     if state.selection("formal_coverage_runtime_v1", {}).get("status") != "accepted":
         return
@@ -7955,6 +8288,7 @@ def _run_coverage_recovery(
         if "original_parent_job_id" in job.parameters
     )
     state.set_selection("formal_evidence_exclusions", sorted(excluded))
+    deferred = []
     for node in (COMPATIBILITY_NODE, "coverage-E0-pilot-v1", "coverage-E0-final-v1"):
         planned = tuple(job for job in jobs if job.node == node)
         if not planned:
@@ -7981,10 +8315,28 @@ def _run_coverage_recovery(
         )
         if stop_event.is_set():
             return
-        _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
+        pending = state.pending_jobs(node)
+        if state.selection("tp1_resource_parallel_v3", {}).get("enabled") and not include_isolated:
+            # Do not let a legacy clean-isolation tail hold independent E3b/E6
+            # work behind coverage recovery. Its actual evidence stays pending.
+            units = _automatic_work_units(config, state, pending)
+            if deferred and node == "coverage-E0-final-v1":
+                deferred.extend(job.job_id for job in pending)
+                continue  # Final never bypasses its unfinished pilot dependency.
+            deferred.extend(job.job_id for unit in units if unit.isolated for job in unit.jobs)
+            pending = tuple(job for unit in units if not unit.isolated for job in unit.jobs)
+        _run_pending_jobs(config, state, node, stop_event, pending)
         if stop_event.is_set():
             return
+        if state.status_counts(node).get("pending") and deferred:
+            continue
         _require_internal_jobs(state, node)
+    if deferred:
+        state.set_selection("automatic_units_v3_deferred_coverage", {
+            "job_ids": deferred, "reason": "legacy_isolation_or_pilot_dependency",
+            "resume_before": "E5-pilot",
+        })
+        return
     rows = [
         (_job_from_metric_config(item), metrics) for item, metrics in _metric_rows(state, "E0-tune")
     ]
@@ -8103,6 +8455,9 @@ class PaperRunner:
         _cleanup_interrupted_servers(self.config.run_dir)
         self.state.recover_interrupted()
         self.config.run_dir.mkdir(parents=True, exist_ok=True)
+        # Explicit on every formal launch, not an optional shell export which
+        # silently disappears after a restart. Discovery never trusts an old file.
+        os.environ["LIGHTCONE_NUMA_ISOLATION"] = "1"
         apply_runner_affinity(
             self.config.gpu_ids,
             self.config.run_dir / "numa-affinity.json",
@@ -8112,6 +8467,10 @@ class PaperRunner:
         old_term = signal.signal(signal.SIGTERM, self._signal)
         old_int = signal.signal(signal.SIGINT, self._signal)
         try:
+            if self.state.selection("formal_coverage_runtime_v1", {}).get("status") == "accepted":
+                _run_tp1_interference_v3(self.config, self.state, self.stop_event)
+                if self.stop_event.is_set():
+                    return
             nodes = list(PAPER_NODES)
             if self.config.protocol.start_stage:
                 nodes = nodes[nodes.index(self.config.protocol.start_stage) :]
@@ -8126,6 +8485,11 @@ class PaperRunner:
             for node in nodes:
                 if self.stop_event.is_set():
                     break
+                if node == "E5-pilot":
+                    _run_coverage_recovery(self.config, self.state, self.stop_event,
+                                           include_isolated=True)
+                    if self.stop_event.is_set():
+                        break
                 if (
                     node == "E5-pilot"
                     and self.state.selection("formal_four_block_coverage_v1", {}).get("status")
@@ -8170,11 +8534,8 @@ class PaperRunner:
                     self.state.selection("formal_priority_window_v2", {}).get("status")
                     == "completed"
                 ):
-                    _run_tp1_interference_v2(
-                        self.config,
-                        self.state,
-                        self.stop_event,
-                    )
+                    if not self.state.selection("tp1_resource_parallel_v3", {}).get("enabled"):
+                        _run_tp1_interference_v2(self.config, self.state, self.stop_event)
                     if not self.stop_event.is_set():
                         _write_priority_eta_v2(self.config, self.state)
                 if self.stop_event.is_set():
