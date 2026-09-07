@@ -1246,6 +1246,33 @@ def test_automatic_runner_keeps_paired_children_and_records_real_resources(monke
     assert all(j.parameters["execution_policy"] == "automatic_units_v3" for j, _ in observed)
 
 
+def test_interference_singleton_preserves_explicit_gpu_one(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(config.run_dir)
+    job = next(j for j in _tp1_interference_v2_jobs()
+               if j.parameters["mode"] == "isolated" and j.parameters["gpu_index"] == 1)
+    job = replace(job, node="TP1-interference-v3-test")
+    state.add_jobs(job.node, (job,))
+
+    class Server:
+        def __init__(self, *args, **kw):
+            assert kw["gpus"] == (1,)
+            self.output_dir = kw["output_dir"]
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    def execute(config, state, job, *, gpus, **kw):
+        assert gpus == (1,)
+        directory = tmp_path / "evidence"
+        directory.mkdir()
+        state.complete(job.job_id, state.start(job, gpus, directory))
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", Server)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    _run_pending_jobs(config, state, job.node, threading.Event(), (job,))
+    assert state.job_status(job.job_id) == "completed"
+
+
 def test_tp1_v2_gate_uses_exact_excluded_interference_matrix(tmp_path):
     config = _config(tmp_path)
     state = StateStore(config.run_dir)

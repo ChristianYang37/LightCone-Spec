@@ -1533,6 +1533,9 @@ def _execute_cell(
     # Freeze the ORIGINAL input job, not its resolved load. In particular,
     # common_slo_load and BurstGPT retain their historical prompt-pool size.
     execution_request_count = _request_count(config, state, job)
+    if (job.node.startswith("TP1-interference")
+            and gpus != (job.parameters.get("gpu_index"),)):
+        raise RuntimeError("excluded interference cell was assigned to the wrong GPU")
     input_job = replace(
         job,
         parameters={
@@ -4261,7 +4264,7 @@ def _run_pending_jobs(
         )
         if stop_event.is_set() or node_failed.is_set():
             return
-    if remapped:
+    if remapped or node.startswith("TP1-interference"):
         queues = {
             gpu: tuple(job for job in singles if allocations[job.job_id] == (gpu,))
             for gpu in config.gpu_ids
@@ -7633,7 +7636,8 @@ def _run_tp1_interference_v3(
     if not topology.get("enabled") or not topology.get("taskset_available"):
         raise RuntimeError("automatic scheduling requires valid CPU affinity; numactl is optional")
     # A changed host/cpuset gets a fresh excluded trial; old acceptance is retained.
-    if previous.get("topology") == identity and previous.get("trial"):
+    if (previous.get("topology") == identity and previous.get("trial")
+            and not previous.get("invalidated_reason")):
         trial = previous["trial"]
     else:
         trial = int(previous.get("trial", 0)) + 1
