@@ -93,6 +93,45 @@ def test_preview_frozen_selection_and_atomic_resume(tmp_path):
         _e5_reference(state, trace)
     assert _records_scientific_rejection(trace)
 
+def test_preview_remapped_units_keep_each_registered_order(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    state = StateStore(tmp_path / "preview-state")
+    state.set_selection("tp1_resource_parallel_v3", {"enabled": True})
+    orders = (("static", "lightcone", "tts"), ("tts", "lightcone", "static"))
+    jobs = tuple(Job(job_id=f"preview-order-{unit}-{i}", node="E3b-preview-v1",
+                     ordinal=unit*3+i, method=method, model="Qwen/Qwen3-8B",
+                     backend="DFLASH", task="MATH-500", context=4096, load="c1",
+                     width=16, block=0, gpu_count=1,
+                     parameters={"panel": "preview_v1", "pairing_key": f"pair-{unit}"})
+                 for unit, order in enumerate(orders) for i, method in enumerate(order))
+    state.add_internal_jobs(jobs, storage_node="E3b-preview-v1")
+    seen = {"pair-0": [], "pair-1": []}
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def execute(config, state, job, *, gpus, **kwargs):
+        attempt = state.start(job, gpus, tmp_path / job.job_id)
+        state.complete(job.job_id, attempt)
+        seen[job.parameters["pairing_key"]].append(job.method)
+
+    monkeypatch.setattr("lightcone_spec.runner.ServerProcess", FakeServer)
+    monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda config, state, job: job)
+    monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda *_: None)
+    monkeypatch.setattr("lightcone_spec.runner._execute_cell", execute)
+    monkeypatch.setattr("lightcone_spec.runner._write_preview_status", lambda *_: None)
+    _run_pending_jobs(config, state, "E3b-preview-v1", threading.Event(), jobs)
+    assert seen == {f"pair-{i}": list(order) for i, order in enumerate(orders)}
+    assert state.status_counts("E3b-preview-v1") == {"completed": 6}
+
+
 def test_coverage_repair_is_method_specific_and_dense_transfer_preserves_workload():
     from lightcone_spec.coverage import (
         compatibility_replacements,

@@ -48,8 +48,9 @@ def main():
         all_rows = [row for row in evidence["rows"] if row["panel"] == panel]
         conditions = sorted({row["task"] if panel == "long_generation" else row["load"] for row in all_rows},
                             key=lambda x: int(x.removeprefix("closed_loop_c")) if x.startswith("closed_loop_c") else 0)
-        fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 2.8), squeeze=False)
-        for ax, metric in zip(axes[0], metrics, strict=True):
+        ncols = len(metrics) + int(panel == "serving")
+        fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 2.8), squeeze=False)
+        for ax, metric in zip(axes[0][:len(metrics)], metrics, strict=True):
             for method in sorted({row["method"] for row in all_rows}):
                 centers, lows, highs = [], [], []
                 for index, condition in enumerate(conditions):
@@ -76,6 +77,31 @@ def main():
                            "itl_p99_ms": "p99 ITL (ms)"}[metric])
             ax.margins(y=.35)
             ax.legend(loc="upper right")
+        if panel == "serving":
+            ax = axes[0][-1]
+            for method in ("static", "lightcone"):
+                centers = []
+                for condition in conditions:
+                    pairs = [(row["metrics"].get("goodput"), row["metrics"].get("per_user_generation_speed"))
+                             for row in all_rows if row["method"] == method
+                             and row["load"] == condition and row["status"] == "measured"]
+                    pairs = [p for p in pairs if all(isinstance(v, (int, float)) and np.isfinite(v) for v in p)]
+                    if pairs:
+                        a = np.asarray(pairs)
+                        ax.scatter(a[:, 0], a[:, 1], color=colors[method], alpha=.7, s=13)
+                    if len(pairs) == 4:
+                        center = a.mean(axis=0)
+                        radius = t.ppf(.975, 3) * a.std(axis=0, ddof=1) / 2
+                        ax.errorbar(*center, xerr=radius[0], yerr=radius[1], color=colors[method], capsize=2)
+                        ax.annotate(condition.removeprefix("closed_loop_"), center, fontsize=8,
+                                    xytext=(4, 4), textcoords="offset points")
+                        centers.append(center)
+                if centers:
+                    centers = np.asarray(centers)
+                    ax.plot(centers[:, 0], centers[:, 1], color=colors[method], label=labels[method])
+            ax.set_xlabel("Aggregate committed tokens/s")
+            ax.set_ylabel("Native per-user tokens/s")
+            ax.legend()
         fig.tight_layout()
         fig.savefig(args.output / f"{panel}.pdf", bbox_inches="tight")
         fig.savefig(args.output / f"{panel}.png", dpi=180, bbox_inches="tight")

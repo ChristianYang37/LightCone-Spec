@@ -4021,7 +4021,11 @@ def _run_pending_jobs(
             process_job = _exactness_bootstrap(runtime_job)
             key = (job.block, probe, *server_session_key(process_job, selection))
             grouped.setdefault(key, []).append((job, runtime_job, selection))
-        if remapped:
+        if node in PREVIEW_NODES:
+            # Each preview pairing unit has its own frozen method order; global
+            # session reuse order must not borrow it from another same-seed unit.
+            keys = sorted(grouped, key=lambda key: min(row[0].ordinal for row in grouped[key]))
+        elif remapped:
             declared = tuple(dict.fromkeys(_job_gpus(config, job) for job in jobs))
             keys = list(
                 dict.fromkeys(
