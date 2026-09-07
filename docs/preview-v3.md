@@ -46,8 +46,11 @@ LightCone. Current throughput formulas reproduce raw counters, but this does not
 resolve trajectory correctness. Old raw requests lack output IDs, so they cannot
 locate the first divergent token. `scripts/diagnose_preview_trajectory.py` captures
 the first three original requests (same order/seeds) with target, Static, frozen
-and active adapters, native output IDs and top-2 log probabilities in an excluded
-bounded run. Generated text stays private. No captured run is an automatic pass.
+and active adapters with native output IDs in an excluded bounded run.
+DFlash rejects `return_logprob`; only target-only captures top-2 probabilities.
+The first common prefix is scored through target-only; verification-side logits
+need separate instrumentation if that does not explain the difference.
+Generated text stays private. No captured run is an automatic pass.
 Review verification/bonus/stop indices, target state, KV/version/reset, and
 numeric margins before declaring a root cause or accepting speedup claims.
 The diagnostic output cap is not a change to any formal request budget.

@@ -20,6 +20,13 @@ def first_divergence(left, right):
     return None
 
 
+def diagnostic_logprobs(variant):
+    # Native DFlash explicitly rejects return_logprob. Do not change its path
+    # to obtain diagnostics: compare committed IDs first, then score their
+    # common prefix with target-only (whose top-2 capture is supported).
+    return 2 if variant == "target" else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -51,7 +58,8 @@ def main():
     (args.output / "server").mkdir()
     (args.output / "config.json").write_text(json.dumps({"job": job.to_dict(),
         "adaptation": adaptation_payload(job, selection), "excluded": True,
-        "capture_scope": "first three original requests, original seed/order, bounded output; not performance evidence"}, indent=2))
+        "capture_scope": "first three original requests, original seed/order, bounded output; not performance evidence",
+        "diagnostic_top_logprobs": diagnostic_logprobs(args.variant)}, indent=2))
     process = ServerProcess(config, job, gpus=(args.gpu,), port=config.server.base_port + 30 + args.gpu,
                             output_dir=args.output / "server", selection=selection)
     with process as client:
@@ -65,7 +73,7 @@ def main():
                 result, _ = client.run_batch((prompt,), max_new_tokens=args.max_tokens,
                                             seed=index, temperature=0., ignore_eos=False,
                                             request_id_prefix=f"diag-{args.variant}-{index}",
-                                            diagnostic_top_logprobs=2)
+                                            diagnostic_top_logprobs=diagnostic_logprobs(args.variant))
             client.stream_observer = None
             records.extend(r.to_dict() for r in result)
             (args.output / "requests.json").write_text(json.dumps(records))

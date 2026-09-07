@@ -1011,3 +1011,13 @@ def test_cosine_schedule_endpoint_and_registered_overrun():
     assert _schedule_exhausted_updates({"updates_published": 100}, adaptation) == 0
     assert _schedule_exhausted_updates({"updates_published": 101}, adaptation) == 1
     assert _schedule_exhausted_updates({"updates_published": 101}, None) is None
+def test_excluded_trajectory_logprobs_preserve_supported_paths():
+    import runpy
+    from pathlib import Path
+    diagnostic = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/diagnose_preview_trajectory.py"))
+    assert diagnostic["diagnostic_logprobs"]("target") == 2
+    for variant in ("static", "frozen", "active"):
+        assert diagnostic["diagnostic_logprobs"](variant) == 0
+    assert diagnostic["first_divergence"]([1, 2, 3], [1, 4, 3])["position"] == 1
+    assert diagnostic["first_divergence"]([1, 2], [1, 2]) is None
+    assert diagnostic["first_divergence"]([1], [1, 2])["target_token"] is None
