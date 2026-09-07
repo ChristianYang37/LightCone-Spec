@@ -1,7 +1,11 @@
 LightCone-Spec
 Copyright 2026 LightCone contributors
 
-Licensed under the Apache License, Version 2.0. See LICENSE.
+Historical code through f93b8e831ddcaddc7826c083c7a5aaf3cd78810c retains
+Apache-2.0 permissions; see LICENSES/Apache-2.0.txt. Authorized new original
+contributions after that boundary use the source-available terms in LICENSE.
+Modified files retain their earlier notices and historical grants. This is
+not a retroactive restriction on earlier versions or third-party code.
 
 This distribution contains original LightCone-Spec code and plain unified
 diffs for SGLang. SGLang is licensed under Apache-2.0 and is not distributed

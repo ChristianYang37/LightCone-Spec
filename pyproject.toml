@@ -8,8 +8,8 @@ version = "1.0.0"
 description = "Direct research runner for LightCone-Spec experiments."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license = "LicenseRef-LightCone-Source-Available-1.0 AND Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "LICENSES/Apache-2.0.txt"]
 authors = [{ name = "LightCone contributors" }]
 dependencies = [
     "numpy>=1.24",
