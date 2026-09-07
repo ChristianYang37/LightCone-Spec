@@ -76,6 +76,20 @@ def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
         "long_generation": 24, "serving": 24, "burstgpt": 8,
     }
     assert jobs == preview_jobs(json.loads(json.dumps(manifest)))
+    from lightcone_spec.preview import QWEN38_CHECKPOINTS
+    extended = {**manifest, "qwen38": {"tp": 2, "checkpoints": QWEN38_CHECKPOINTS,
+                                       "prompts": manifest["prompts"]["LiveCodeBench"][:8]}}
+    assert len(preview_jobs(extended)) == 80
+    assert preview_jobs(extended)[:56] == jobs
+    tp2 = {**manifest, "comparison_topologies": {"dspark_serving": 2}}
+    with pytest.raises(ValueError, match="anchor"):
+        preview_jobs(tp2)
+    tp2["tp2_trace_anchor"] = {"source_job_ids": ["tp2-anchor"], "topology": "tp2_dp1"}
+    migrated = preview_jobs(tp2)
+    assert len(migrated) == 56
+    assert all(j == jobs[i] for i, j in enumerate(migrated) if j.backend == "DFLASH")
+    assert all(j.gpu_count == 2 and j.parameters["replaces_job_id"] == jobs[i].job_id
+               for i, j in enumerate(migrated) if j.backend == "DSPARK")
     units = {}
     for job in jobs:
         units.setdefault(logical_unit_key(job), []).append(job)
@@ -91,6 +105,48 @@ def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     assert all(j.parameters["execution_request_count"] == 32 for j in serving)
     assert len({json.dumps(j.parameters["preview_prompt_records"]) for j in serving}) == 1
     assert len(VIDEO_METHODS) == 6 and all(method != "tts" for _, method, _ in VIDEO_METHODS)
+
+
+def test_qwen38_preview_exact_24_native_mtp_and_common_tp():
+    from lightcone_spec.preview import QWEN38_MODEL, QWEN38_VIDEO_METHODS, qwen38_jobs
+    from lightcone_spec.scheduling import logical_unit_key
+
+    checkpoints = {key: {"repo": repo, "revision": "a" * 40} for key, repo in {
+        "target": QWEN38_MODEL, "NEXTN": QWEN38_MODEL,
+        "DSPARK": "RadixArk/Qwen3.8-27B-DSpark", "DFLASH": "incoai/Qwen3.8-27B-DFlash2",
+    }.items()}
+    manifest = {"tts_recipe": {"lr": 1e-4, "stride": 10}, "lightcone_recipe": {"lr": .001, "stride": 10},
+                "qwen38": {"tp": 2, "checkpoints": checkpoints,
+                           "prompts": [{"prompt": str(i)} for i in range(8)]}}
+    jobs = qwen38_jobs(manifest)
+    assert len(jobs) == len({j.job_id for j in jobs}) == 24
+    assert len({logical_unit_key(j) for j in jobs}) == 4
+    assert {j.block for j in jobs} == {0, 1, 2, 3}
+    assert all(j.gpu_count == 2 and j.parameters["topology"] == "tp2_dp1" for j in jobs)
+    assert all(j.load == "c1" and j.context == 17408 and j.parameters["generation_tokens"] == 1024 for j in jobs)
+    assert all(j.parameters["execution_request_count"] == 8 and j.parameters["memory_budget_policy"] == "method_peak_v1" for j in jobs)
+    assert len({(j.backend, j.method) for j in jobs}) == 6
+    assert ("NEXTN", "static", "Native MTP") in QWEN38_VIDEO_METHODS
+    assert any(m == "tts_lora_batched" for _, m, _ in QWEN38_VIDEO_METHODS)
+    assert not any(m == "tts" for _, m, _ in QWEN38_VIDEO_METHODS)
+    checkpoints["NEXTN"]["revision"] = "b" * 40
+    with pytest.raises(ValueError, match="same target"):
+        qwen38_jobs(manifest)
+
+
+def test_common_tp_requires_all_full_workload_cases_and_correctness():
+    from lightcone_spec.preview import select_common_tp
+
+    cases = {"static-c1", "lightcone-c1", "static-c32", "lightcone-c32"}
+    rows = [{"case": c, "tp": tp, "correct": True, "full_workload": True,
+             "reset_verified": True, "gpu_binding_verified": True}
+            for tp in (1, 2) for c in sorted(cases)]
+    assert select_common_tp(rows, cases) == 1
+    rows[0]["correct"] = False
+    assert select_common_tp(rows, cases) == 2
+    rows[-1]["full_workload"] = False
+    with pytest.raises(ValueError, match="no fully validated"):
+        select_common_tp(rows, cases)
 
 
 def test_preview_heldout_deterministic_and_no_duplicates():

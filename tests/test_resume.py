@@ -1831,6 +1831,22 @@ def test_resume_keeps_main_draft_identity_when_adding_source_b7(tmp_path):
             _save_or_validate_run_config(replace(changed, drafts=bad))
 
 
+def test_resume_adds_only_registered_qwen38_paths_without_changing_existing(tmp_path):
+    from lightcone_spec.preview import QWEN38_MODEL
+
+    config = _config(tmp_path)
+    config.run_dir.mkdir()
+    _save_or_validate_run_config(config)
+    expanded = replace(config, models={**config.models, QWEN38_MODEL: tmp_path / "qwen38"},
+                       drafts={**config.drafts, f"{QWEN38_MODEL}|DFLASH": tmp_path / "dflash2"})
+    _save_or_validate_run_config(expanded)
+    _save_or_validate_run_config(expanded)
+    for bad in (config, replace(expanded, models={**expanded.models, QWEN38_MODEL: tmp_path / "changed"}),
+                replace(expanded, models={**expanded.models, "unregistered": tmp_path / "other"})):
+        with pytest.raises(RuntimeError, match="different experiment config"):
+            _save_or_validate_run_config(bad)
+
+
 def test_sqlite_records_actual_gpu_pair(tmp_path: Path):
     state = StateStore(tmp_path)
     job = materialize("E6-final")[0]

@@ -1,6 +1,72 @@
 # Preview v1: registered formal supplement
 
 Status: implementation in progress; all new GPU outcomes **UNMEASURED**.
+
+Scope: GitHub preview/release only. Per the 2026-09-08 instruction, this work
+does not update the manuscript, Evaluation, or paper-status documents. Its
+registered evidence remains auditable in the shared run without being pooled
+into the paper's existing primary statistics.
+
+## Matched-TP extension (2026-09-08)
+
+The original 56 logical leaves are unchanged by default. A separately enabled
+Qwen3.8-27B supplement adds 24 leaves: Target-only, native MTP, community DSpark,
+community DFlash2, Full TTS-DFlash2 and LightCone-DFlash2, each in four clean-server
+paired blocks. Combined preview: **80 logical leaves**, excluding acceptance,
+anchors, replacement attempts and twelve video takes across the two models.
+The new panel uses eight frozen held-out LiveCodeBench prompts, 16,384 input
+tokens inside the native non-thinking chat envelope, c1, temperature 1,
+normal EOS and maximum 1,024 output tokens. Seeds are 0/1/2/3. This is a separate
+small-budget transfer panel, not a replacement for the original long-generation
+panel or a claim of improved target task quality.
+
+The new panel uses `method_peak_v1`, S10, TTS lr=1e-4 and the frozen LightCone
+transfer recipe. Its checkpoints are frozen in `QWEN38_CHECKPOINTS`; native MTP
+shares the target revision. Community draft licenses remain separate from the
+LightCone source-available license. DSpark's card declares `other`; complete
+license review remains required before redistribution. No checkpoint is included
+in this code distribution.
+
+Each comparison chooses a common validated TP1 or TP2. DFlash long generation,
+DSpark serving plus BurstGPT, Qwen3.8 six-method results, and each six-method
+video suite are separate common-TP groups. TP2 replaces every relevant TP1 row
+using a new physical job identity and `replaces_job_id`; raw attempts remain.
+TP2 BurstGPT needs a measured topology-matched anchor and retains the original
+trace/request budget. Never mix TP, budget or execution policies in paired effects.
+`formal_preview_manifest_v2` is append-only relative to the v1 audit. Qwen3.8
+execution requires an exactly matching `formal_preview_qwen38_acceptance_v1`.
+The old runtime has not passed Qwen3.8/DFlash2 online-update acceptance.
+
+Video recording uses SSE `/stream`, monotonic event IDs and replay via
+`Last-Event-ID`. Actual token IDs are checked against cumulative trajectories;
+committed bursts appear together, with UTF-8 suffix repair and no artificial
+typing timer. Browser elapsed time never supplies the final benchmark field:
+the header freezes backend `aggregate_tok_s` and native per-user speed. Videos
+remain excluded individual-run measurements, not four-block benchmark estimates.
+Opening the HTML with `file://` explicitly reports that no live service is connected.
+The recorder requires `formal_preview_video_acceptance_v2` for all six methods
+at a common TP; the 27B video uses TTS-LoRA-Batched, not Full TTS.
+
+`capture_preview.cjs` retains native CDP frame timestamps, original PNG frames,
+an unchanged-speed VFR original, raw stream events and backend counts.
+Capture and Chromium must run on the SSH/GPU server itself against its local
+loopback service. The recorder checks the service hostname against the capture
+host and rejects tunneled remote capture. Download originals only after the
+take finishes; WAN latency is excluded from the recorded rendering path.
+Clock round trips before/after recording bound the service-to-browser epoch offset;
+clock uncertainty above 100 ms invalidates the take. Composition requires six
+valid `capture.json` sidecars with the same model/TP/c8/16K/1024 configuration.
+Only pre-submission lead-in is removed, starting at the earliest plausible
+submission so that all prefill remains. Alignment uncertainty and frame
+resolution are disclosed; neither a recording-start timestamp nor a fake
+typing timer can serve as submission alignment. Technical failures retain
+their frames and logs; they are not candidates for fastest-take selection.
+
+Deployment checkpoint: remote tokenizer-failure evidence has been backed up and
+the instance shut down without release. Legacy cumulative patches compile;
+the documented Qwen3.8 upstream `1cf2b8c` conflicts with the current allocation
+and memory patches. Porting, GPU acceptance, final videos and measured figures
+are unfinished; do not mark coverage accepted from CPU tests.
 The preview is not a selection search, an original-system replication, or a
 replacement for the full-budget and twelve-block primary results.
 

@@ -20,6 +20,7 @@ class StreamRecording:
         self.error = None
         self.events = []
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
         self.closed = False
         self.count = 0
         self.path = path
@@ -47,11 +48,21 @@ class StreamRecording:
                     stream.flush()
                     with self.lock:
                         self.events.append(event)
+                        self.changed.notify_all()
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"
 
     def snapshot(self, since: int = 0) -> list[dict]:
         with self.lock:
+            return self.events[since:]
+
+    def wait_since(self, since: int, timeout: float = 1.0) -> list[dict]:
+        """Replay from a cursor; waiting browsers never block generation."""
+        with self.changed:
+            if since < 0 or since > len(self.events):
+                raise ValueError("invalid stream cursor")
+            if since == len(self.events) and not self.closed and not self.error:
+                self.changed.wait(timeout)
             return self.events[since:]
 
     def close(self):

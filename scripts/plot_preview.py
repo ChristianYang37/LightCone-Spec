@@ -23,8 +23,10 @@ def main():
                         help="Optional local ai-paper-figures-tables figstyle.py; not redistributed")
     args = parser.parse_args()
     evidence = json.loads(args.evidence.read_text())
-    if evidence.get("expected_cells") != 56 or evidence["counts"].get("UNMEASURED", 0):
-        raise RuntimeError("all 56 terminal outcomes are required before rendering release figures")
+    if evidence.get("expected_cells") not in {56, 80} or evidence["counts"].get("UNMEASURED", 0):
+        raise RuntimeError("all registered 56/80 terminal outcomes are required before release figures")
+    if len({row["job_id"] for row in evidence["rows"]}) != evidence["expected_cells"]:
+        raise RuntimeError("preview evidence has missing or duplicate logical cells")
     if args.style_helper:
         import sys
         spec = importlib.util.spec_from_file_location("preview_figstyle", args.style_helper)
@@ -109,9 +111,51 @@ def main():
         missing = [row["job_id"] for row in all_rows if row["status"] != "measured"]
         captions.append(f"{panel}: independent block points and mean t95% intervals (n=4, df=3). "
                         f"Unavailable cells: {missing or 'none'}. No interval for incomplete groups.")
+    transfer = [row for row in evidence["rows"] if row["panel"] == "qwen38_transfer"]
+    if transfer:
+        # Categorical methods, not an interpolated performance curve. Backend is
+        # part of the identity: three Static variants must never be pooled.
+        keys = [("target_only", "NONE"), ("static", "NEXTN"), ("static", "DSPARK"),
+                ("static", "DFLASH"), ("tts", "DFLASH"), ("lightcone", "DFLASH")]
+        names = ["Target-only", "Native MTP", "Community DSpark", "Community DFlash2",
+                 "Full TTS–DFlash2", "LightCone–DFlash2"]
+        palette = ["#666666", "#CC79A7", "#E69F00", "#D55E00", "#009E73", "#0072B2"]
+        metrics = [("accepted_drafts_per_target_call", "AL (bonus excluded)"),
+                   ("goodput", "Committed tokens/s"),
+                   ("per_user_generation_speed", "Native per-user tokens/s")]
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4.2))
+        for ax, (metric, label) in zip(axes, metrics, strict=True):
+            for index, ((method, backend), color) in enumerate(zip(keys, palette, strict=True)):
+                group = [row for row in transfer if (row["method"], row["backend"]) == (method, backend)]
+                if len(group) != 4 or {row["block"] for row in group} != {0, 1, 2, 3}:
+                    raise RuntimeError("27B figure requires exactly four independent blocks per method")
+                values = [row["metrics"].get(metric) for row in sorted(group, key=lambda row: row["block"])
+                          if row["status"] == "measured"]
+                values = [v for v in values if isinstance(v, (int, float)) and np.isfinite(v)]
+                ax.scatter(values, [index] * len(values), color=color, s=16, alpha=.7)
+                if len(values) == 4:
+                    center = np.mean(values)
+                    radius = t.ppf(.975, 3) * np.std(values, ddof=1) / 2
+                    ax.errorbar(center, index, xerr=radius, color=color, marker="o", capsize=3)
+                else:
+                    note = "N/A" if method == "target_only" and metric.startswith("accepted_") else f"{len(values)}/4 measured"
+                    ax.text(.98, index, note, transform=ax.get_yaxis_transform(), ha="right", va="center", fontsize=9)
+            ax.set_yticks(range(6), names)
+            ax.invert_yaxis()
+            ax.set_xlabel(label)
+            ax.margins(x=.25, y=.15)
+        fig.tight_layout()
+        fig.savefig(args.output / "qwen38_transfer.pdf", bbox_inches="tight")
+        fig.savefig(args.output / "qwen38_transfer.png", dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        captions.append("qwen38_transfer: four independent block points and mean t95% intervals "
+                        "(df=3, approximately normal run-level measurements); Target-only AL is N/A. "
+                        "No intervals for incomplete groups. Paired multiplicative gains and their "
+                        "log-ratio t intervals are in preview.json, not these absolute-value intervals. "
+                        "27B is not pooled with the original 56-cell panel.")
     # Lossless allowlisted table, including all unavailable rows.
     with (args.output / "cells.csv").open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=("job_id", "panel", "task", "method", "load", "block", "status", "metrics"))
+        writer = csv.DictWriter(stream, fieldnames=("job_id", "panel", "task", "model", "backend", "method", "topology", "load", "block", "status", "metrics"))
         writer.writeheader()
         for row in evidence["rows"]:
             writer.writerow({key: json.dumps(row[key]) if key == "metrics" else row[key] for key in writer.fieldnames})

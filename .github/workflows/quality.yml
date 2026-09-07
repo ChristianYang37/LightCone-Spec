@@ -59,4 +59,9 @@ jobs:
           persist-credentials: false
       - run: npm install --no-save --ignore-scripts playwright@1.55.0
       - run: npx --no-install playwright install --with-deps chromium
-      - run: node scripts/test_preview_ui.cjs
+      - run: python -m pip install imageio-ffmpeg==0.6.0
+      - name: Synthetic UI and actual local frame capture
+        run: |
+          FFMPEG="$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" \
+          PREVIEW_CAPTURE_TEST_DIRECTORY="$RUNNER_TEMP/preview-SYNTHETIC-capture" \
+          node scripts/test_preview_ui.cjs

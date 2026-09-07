@@ -62,7 +62,14 @@ from .metrics import (
     summarize_metric_rows,
     validate_scientific_metrics,
 )
-from .preview import PREVIEW_NODES, held_out_pool, preview_eta, preview_jobs, preview_summary
+from .preview import (
+    PREVIEW_NODES,
+    QWEN38_MODEL,
+    held_out_pool,
+    preview_eta,
+    preview_jobs,
+    preview_summary,
+)
 from .protocol import (
     DSPARK_CONFIDENCE_LOSS_WEIGHT,
     DSPARK_CONFIDENCE_POSITIONS,
@@ -868,6 +875,37 @@ def _cell_inputs(
     count = _request_count(config, state, job)
     dataset_key = _task_for_data(config, job)
     metadata: dict[str, object] = {"dataset": dataset_key}
+    if job.parameters.get("regime") == "preview_constructed_chat":
+        records = tuple(job.parameters["preview_prompt_records"])
+        if len(records) != count:
+            raise ScientificFailure("preview frozen prompt budget is incomplete")
+        tokenizer = _native_tokenizer(config.model_path(job.model))
+        # Fit content inside the official chat envelope, preserving non-thinking
+        # control tokens instead of padding after the assistant prefix.
+        tokenized = [client.tokenize(str(row["prompt"])) for row in records]
+        filler = tuple(token for tokens in tokenized for token in tokens)
+        length = int(job.parameters["input_tokens"])
+        inputs = []
+        for tokens in tokenized:
+            def wrap(content):
+                return tuple(tokenizer.apply_chat_template(
+                    [{"role": "user", "content": tokenizer.decode(list(content))}],
+                    tokenize=True, return_dict=True, add_generation_prompt=True,
+                    enable_thinking=False,
+                )["input_ids"])
+            content_length = length - len(wrap(()))
+            for _ in range(8):
+                encoded = wrap(_fit_prompt(tokens, filler, content_length))
+                if len(encoded) == length:
+                    break
+                content_length += length - len(encoded)
+            else:
+                raise ScientificFailure("cannot construct exact native-chat input token budget")
+            inputs.append(encoded)
+        metadata.update(examples=records, enable_thinking=False, respect_eos=True,
+                        context_construction="frozen_repeated_content_native_chat",
+                        execution_request_count=count, prompt_tokens=[len(x) for x in inputs])
+        return tuple(inputs), int(job.parameters["generation_tokens"]), metadata
     if job.parameters.get("regime") in {"source_native_prompt", "mechanism_native_prompt"}:
         seed = int(job.parameters["sampling_seed"])
         if job.parameters.get("panel") == "preview_v1":
@@ -1153,7 +1191,7 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
 
 
 def _runtime_job(config: ExperimentConfig, state: StateStore, job: Job) -> Job:
-    if job.parameters.get("coverage_runtime") and job.backend != "NONE":
+    if job.parameters.get("coverage_runtime") and job.backend not in {"NONE", "NEXTN"}:
         # Inspect only the explicitly configured local checkpoint. Existing
         # job/config rows remain immutable; this is a recorded runtime route.
         draft = config.draft_path(job.model, job.backend)
@@ -2482,7 +2520,7 @@ def _execute_cell(
 def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
     if job.parameters.get("panel") == "preview_v1":
         recipe = job.parameters.get("frozen_recipe")
-        if job.method != "static" and not isinstance(recipe, dict):
+        if job.method not in {"static", "target_only"} and not isinstance(recipe, dict):
             raise ScientificFailure("preview adaptive job lacks frozen recipe")
         return dict(recipe) if recipe is not None else None
     if job.method in {"tts", "l0_naive"}:
@@ -6196,6 +6234,8 @@ def _save_or_validate_run_config(config: ExperimentConfig) -> None:
         new_datasets = dict(new_paths.pop("datasets"))
         old_drafts = dict(old_paths.pop("drafts"))
         new_drafts = dict(new_paths.pop("drafts"))
+        old_models = dict(old_paths.pop("models"))
+        new_models = dict(new_paths.pop("models"))
         old_paths.pop("sglang_root")
         new_paths.pop("sglang_root")
         same_existing_datasets = all(
@@ -6204,11 +6244,16 @@ def _save_or_validate_run_config(config: ExperimentConfig) -> None:
         same_existing_drafts = all(
             new_drafts.get(name) == value for name, value in old_drafts.items()
         ) and all(
-            name.startswith("DeepSpec-source|") for name in new_drafts.keys() - old_drafts.keys()
+            name.startswith("DeepSpec-source|") or name in {
+                f"{QWEN38_MODEL}|DFLASH", f"{QWEN38_MODEL}|DSPARK", f"{QWEN38_MODEL}|NEXTN",
+            } for name in new_drafts.keys() - old_drafts.keys()
+        )
+        same_existing_models = all(new_models.get(name) == value for name, value in old_models.items()) and (
+            new_models.keys() - old_models.keys() <= {QWEN38_MODEL}
         )
         previous = {**previous, "paths": old_paths}
         current = {**normalized, "paths": new_paths}
-        if previous != current or not same_existing_datasets or not same_existing_drafts:
+        if previous != current or not same_existing_datasets or not same_existing_drafts or not same_existing_models:
             raise RuntimeError("run directory belongs to a different experiment config")
         saved.write_text(yaml.safe_dump(normalized, sort_keys=True), encoding="utf-8")
         return
@@ -7500,7 +7545,7 @@ def _run_priority_paper_node(
 
 
 def _write_preview_status(config: ExperimentConfig, state: StateStore) -> None:
-    manifest = state.selection("formal_preview_manifest_v1", None)
+    manifest = state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
     if manifest is None:
         return
     jobs = preview_jobs(manifest)
@@ -7517,7 +7562,7 @@ def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: thr
     enabled = state.selection("formal_preview_v1", {})
     if not enabled.get("enabled") or enabled.get("status") == "completed":
         return
-    manifest = state.selection("formal_preview_manifest_v1", None)
+    manifest = state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
     if manifest is None:
         recipes = {name: state.selection(name, None) for name in (
             "tts_recipe", "lightcone_recipe", "dspark_recipe",
@@ -7567,12 +7612,27 @@ def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: thr
         }
         state.set_selection("formal_preview_manifest_v1", manifest)
     jobs = preview_jobs(manifest)
+    if manifest.get("qwen38"):
+        accepted = state.selection("formal_preview_qwen38_acceptance_v1", {})
+        if accepted.get("status") != "accepted" or accepted.get("manifest") != manifest["qwen38"]:
+            raise RuntimeError("Qwen3.8 preview requires matching full-workload GPU acceptance")
+    # New topology identities replace only the old members of that comparison.
+    # Keep their raw artifacts and preserve every unaffected completed identity.
+    replaced = tuple(j.parameters["replaces_job_id"] for j in jobs if j.parameters.get("replaces_job_id"))
+    if replaced:
+        state.supersede_jobs(replaced, "matched preview topology replacement; raw evidence retained")
+        excluded = set(state.selection("formal_evidence_exclusions", []))
+        state.set_selection("formal_evidence_exclusions", sorted(excluded.union(replaced)))
     for node in PREVIEW_NODES:
         rows = tuple(job for job in jobs if job.node == node)
+        if not rows:
+            continue
         state.add_internal_jobs(rows, storage_node=node)
         state.set_stage_status(node, "pending", row_count=len(rows))
     for node in PREVIEW_NODES:
         rows = tuple(job for job in jobs if job.node == node)
+        if not rows:
+            continue
         state.add_internal_jobs(rows, storage_node=node)
         state.set_stage_status(node, "running", row_count=len(rows))
         _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
@@ -7585,7 +7645,7 @@ def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: thr
         if any(counts.get(status) for status in ("failed", "running", "pending")):
             raise RuntimeError(f"preview runtime failures remain: {node}: {counts}")
         state.set_stage_status(node, "completed", row_count=len(rows))
-    state.set_selection("formal_preview_v1", {**enabled, "status": "completed", "leaf_cells": 56})
+    state.set_selection("formal_preview_v1", {**enabled, "status": "completed", "leaf_cells": len(jobs)})
 
 
 def _run_priority_window_v1(

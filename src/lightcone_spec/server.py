@@ -399,7 +399,8 @@ def server_command(
         "--dp-size",
         str(dp),
         "--context-length",
-        str(max(40960, job.context or 0)),
+        str(job.context if job.parameters.get("regime") == "preview_constructed_chat"
+            else max(40960, job.context or 0)),
         "--max-running-requests",
         str(max_running),
         "--mem-fraction-static",

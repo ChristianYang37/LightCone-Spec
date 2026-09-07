@@ -95,6 +95,11 @@ def test_live_stream_observer_uses_real_chunks_and_detects_disk_failure(tmp_path
     recording(observed[0])
     recording.close()
     assert recording.snapshot() == observed
+    assert observed[0]["sequence"] == 1 and observed[0]["token_ids"] == [1, 2]
+    assert recording.wait_since(0, timeout=0) == observed
+    assert recording.wait_since(1, timeout=0) == []
+    with pytest.raises(ValueError, match="cursor"):
+        recording.wait_since(2)
     assert len((tmp_path / "events.jsonl").read_text().splitlines()) == 1
     broken = StreamRecording(tmp_path / "missing" / "events.jsonl")
     broken.thread.join(2)
@@ -3717,6 +3722,11 @@ def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
 
     config = SimpleNamespace(gpu_ids=(0, 1), run_dir=tmp_path / "state",
                              server=SimpleNamespace(base_port=30000))
+    state = StateStore(config.run_dir)
+    state.set_selection("formal_preview_video_acceptance_v2", {
+        "Qwen/Qwen3-8B": {"status": "accepted", "tp": 1}})
+    state.set_selection("formal_preview_manifest_v1", {
+        "prompts": {"LiveCodeBench": [{"prompt": str(i)} for i in range(8)]}})
     monkeypatch.setattr(ExperimentConfig, "load", lambda _: config)
     monkeypatch.setattr("lightcone_spec.runner._runtime_job", lambda c, s, j: j)
     monkeypatch.setattr("lightcone_spec.runner._selection_for_job", lambda s, j: None)

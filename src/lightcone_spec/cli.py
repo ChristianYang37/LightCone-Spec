@@ -62,6 +62,7 @@ def _plan(config: ExperimentConfig) -> None:
     for row in paper_plan():
         print(f"{row.name}\t{row.rows}\t{row.gpu_count}\t{row.description}")
     print("\npreview_v1 supplemental leaves\t56\tdeployment-enabled; 24 long + 24 serving + 8 trace; video excluded")
+    print("qwen38 preview supplemental leaves\t24\tacceptance-enabled; six methods x four blocks; combined preview 80")
     pairs = tuple(zip(config.gpu_ids[::2], config.gpu_ids[1::2], strict=True))
     print(f"\ngpu_pairs\t{len(pairs)}\t{pairs}")
     print(f"max_parallel_blocks\t{len(pairs)}\tone clean block per TP2 pair")
@@ -171,7 +172,7 @@ def _summarize(run_dir: Path) -> None:
         node = str(row["node"])
         frame = summarize_metric_rows(_metric_rows(state, node), run_dir / "stages" / node)
         written[node] = len(frame)
-    manifest = state.selection("formal_preview_manifest_v1", None)
+    manifest = state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
     if manifest is not None:
         preview_summary([row for node in PREVIEW_NODES for row in _metric_rows(state, node)],
                         preview_jobs(manifest), run_dir / "stages" / "preview-v1")

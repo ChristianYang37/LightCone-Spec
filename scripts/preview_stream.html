@@ -5,24 +5,60 @@
 body{font:18px system-ui;margin:24px;background:#101923;color:#e9f1f7}h1{font-size:28px}
 .notice{color:#b9c9d6}#metrics{font:20px monospace;padding:12px 0}#grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 article{background:#1c2936;border:1px solid #425466;border-radius:8px;padding:12px;min-width:0}pre{font:13px/1.45 monospace;white-space:pre-wrap;overflow:auto;height:280px}
-button{padding:12px;font-size:18px}header{color:#77d9c2}
+button{padding:12px;font-size:18px}header,.new{color:#77d9c2}.new{background:#204c46}
 </style>
 <h1 id="label">Loading real stream endpoint…</h1>
-<p class="notice">Qwen3-8B · actual batch 8 · 16K input each · ≤1,024 output each · normal EOS</p>
+<p class="notice" id="configuration">Waiting for verified run configuration</p>
 <p class="notice">Independent real run · 1× playback · received chunks, no simulated token animation<br>UI transport/render lag is not native token latency. Recording metrics are excluded from benchmarks.</p>
-<button id="start">Start this real batch</button><div id="metrics">Ready</div><div id="grid"></div>
+<button id="start" disabled>Start this real batch</button><div id="metrics">Connecting</div><div id="grid"></div>
 <script>
-let cursor=0, origin=null, state='ready'; const counts=Array(8).fill(0), done=Array(8).fill(false);
-const boxes=Array.from({length:8},(_,i)=>{const a=document.createElement('article'),h=document.createElement('header'),p=document.createElement('pre');h.textContent=`Request ${i+1} · 0 tokens`;a.append(h,p);document.querySelector('#grid').append(a);return{h,p};});
-document.querySelector('#start').onclick=async()=>{origin=performance.now();document.querySelector('#start').disabled=true;const r=await fetch('/start',{method:'POST'});if(!r.ok)throw Error('Start rejected');};
-async function poll(){
- try{const response=await fetch(`/events?since=${cursor}`);if(!response.ok)throw Error('Endpoint unavailable');const data=await response.json();state=data.status;document.body.dataset.status=state;document.querySelector('#label').textContent=data.label;
- for(const event of data.events){const i=event.index,c=event.chunk,m=c.meta_info;counts[i]=m.completion_tokens||0;done[i]=m.finish_reason!=null;boxes[i].h.textContent=`Request ${i+1} · ${counts[i]} tokens · ${done[i]?'done':'streaming'}`;boxes[i].p.textContent=c.text||'';boxes[i].p.scrollTop=boxes[i].p.scrollHeight;cursor++;}
- const elapsed=origin===null?0:(performance.now()-origin)/1000,total=counts.reduce((a,b)=>a+b,0);
- document.querySelector('#metrics').textContent=`${state} | ${elapsed.toFixed(1)} s | ${done.filter(Boolean).length}/8 completed | ${total} committed tokens | received ${(total/Math.max(elapsed,.001)).toFixed(1)} tok/s`+(data.per_user_tok_s!=null?` | native/user ${data.per_user_tok_s.toFixed(1)} tok/s`:'')+(data.error?` | ERROR: ${data.error}`:'');
- if(state==='failed')document.querySelector('#metrics').style.color='#ff9b9b';
- }catch(e){document.body.dataset.status='failed';document.querySelector('#metrics').textContent=`Recording connection failed: ${e.message}`;return;}
- if(state!=='completed'&&state!=='failed')setTimeout(poll,100);
+let cursor=0, stream=null, status={}, lastElapsed=0;
+const counts=Array(8).fill(0), done=Array(8).fill(false), ids=Array.from({length:8},()=>[]);
+const boxes=Array.from({length:8},(_,i)=>{const a=document.createElement('article'),h=document.createElement('header'),p=document.createElement('pre');h.textContent=`Request ${i+1} · 0 tokens`;a.append(h,p);document.querySelector('#grid').append(a);return{h,p,text:''};});
+function fail(message){if(stream)stream.close();document.body.dataset.status='failed';document.querySelector('#metrics').textContent=message;document.querySelector('#metrics').style.color='#ff9b9b';document.querySelector('#start').disabled=true;}
+function metrics(){
+ const total=counts.reduce((a,b)=>a+b,0),finished=status.status==='completed';
+ const elapsed=finished?status.duration_seconds:lastElapsed;
+ const rate=finished?status.aggregate_tok_s:(elapsed>0?total/elapsed:null);
+ document.querySelector('#metrics').textContent=`${status.status} | ${(elapsed||0).toFixed(2)} s | ${done.filter(Boolean).length}/8 completed | ${total} committed tokens | ${finished?'MEASURED end-to-end':'provisional received'} throughput: ${Number.isFinite(rate)?rate.toFixed(1):'—'} tok/s`+(status.per_user_tok_s!=null?` | native per-user ${status.per_user_tok_s.toFixed(1)} tok/s`:'');
 }
-poll();
+function receive(event){
+ const row=JSON.parse(event.data);
+ if(row.sequence!==cursor+1||Number(event.lastEventId)!==row.sequence)throw Error('Lost or duplicate stream event');
+ const i=row.index;if(!Number.isInteger(i)||i<0||i>=8)throw Error('Invalid request index');
+ const c=row.chunk,m=c.meta_info,all=c.output_ids;
+ if(!Array.isArray(all)||all.length<ids[i].length||all.length!==m.completion_tokens||all.some((v,k)=>!Number.isInteger(v)||(k<ids[i].length&&v!==ids[i][k])))throw Error('Token trajectory mismatch');
+ if(JSON.stringify(row.token_ids)!==JSON.stringify(all.slice(ids[i].length)))throw Error('Token delta mismatch');
+ const text=c.text||'',box=boxes[i];let keep=box.text.length;
+ // Repair only an unstable UTF-8 suffix; never invent per-token arrival times.
+ while(keep>0&&box.text.slice(0,keep)!==text.slice(0,keep))keep--;
+ if(keep>0&&/[\uD800-\uDBFF]/.test(box.text[keep-1]))keep--;
+ if(keep<box.text.length)box.p.textContent=box.text.slice(0,keep);
+ box.p.querySelectorAll('.new').forEach(el=>el.classList.remove('new'));
+ const tail=text.slice(keep);if(tail){const span=document.createElement('span');span.className='new';span.textContent=tail;span.dataset.tokenIds=JSON.stringify(row.token_ids);box.p.append(span);}
+ box.text=text;ids[i]=all.slice();counts[i]=all.length;done[i]=m.finish_reason!=null;
+ box.h.textContent=`Request ${i+1} · ${counts[i]} tokens · ${done[i]?'done':'streaming'}`;box.p.scrollTop=box.p.scrollHeight;
+ cursor=row.sequence;lastElapsed=row.elapsed_seconds;metrics();
+}
+function state(event){
+ status=JSON.parse(event.data);document.querySelector('#label').textContent=status.label;
+ document.querySelector('#configuration').textContent=`${status.model} · TP${status.tp} · actual concurrency ${status.dispatcher_concurrency} · ${status.input_tokens_per_request} input / ≤${status.max_output_tokens} output · normal EOS`;
+ if(status.status==='completed'){
+  if(status.event_count!==cursor||status.committed_tokens!==counts.reduce((a,b)=>a+b,0)||!done.every(Boolean)||!Number.isFinite(status.aggregate_tok_s))throw Error('Final recording count/metric mismatch');
+  if(!Number.isFinite(status.duration_seconds)||status.duration_seconds<=0||
+     Math.abs(status.aggregate_tok_s-status.committed_tokens/status.duration_seconds)>1e-8*Math.max(1,status.aggregate_tok_s))throw Error('Backend throughput denominator mismatch');
+  stream.close();
+ }
+ if(status.status==='failed'){fail(`Recording failed: ${status.error}`);return;}
+ document.body.dataset.status=status.status;document.querySelector('#start').disabled=status.status!=='ready';metrics();
+}
+const guard=fn=>event=>{try{fn(event);}catch(error){fail(error.message);}};
+if(location.protocol==='file:'){
+ document.querySelector('#label').textContent='Not connected to a live recording';
+ fail('This is a local HTML file. Open the recording service HTTP URL through its loopback SSH tunnel; no experiment is running in this page.');
+}else{
+ stream=new EventSource('/stream');stream.addEventListener('token',guard(receive));stream.addEventListener('state',guard(state));
+ stream.onerror=()=>{document.querySelector('#metrics').textContent='Transport interrupted — reconnecting from the last event ID; no synthetic output.';};
+ document.querySelector('#start').onclick=async()=>{document.querySelector('#start').disabled=true;try{const r=await fetch('/start',{method:'POST'});if(!r.ok)throw Error('Start rejected');}catch(e){fail(e.message);}};
+}
 </script></html>

@@ -262,6 +262,8 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float, obse
     intervals: list[list[float]] = [[] for _ in request_ids]
     finals: list[dict | None] = [None] * count
     finished: list[float | None] = [None] * count
+    observed_ids: list[list[int]] = [[] for _ in request_ids]
+    sequence = 0
     for raw_line in response:
         line = raw_line.decode("utf-8").strip()
         if not line.startswith("data:"):
@@ -281,7 +283,7 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float, obse
         index = chunk.get("index", 0)
         if not isinstance(index, int) or not 0 <= index < count:
             raise RuntimeError("stream response has an invalid batch index")
-        if count > 1 and meta.get("id") != request_ids[index]:
+        if (count > 1 or observer is not None) and meta.get("id") != request_ids[index]:
             raise RuntimeError("stream response request identity changed")
         arrived = time.perf_counter()
         completion = int(meta.get("completion_tokens", token_counts[index]))
@@ -289,8 +291,16 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float, obse
         if new_tokens < 0:
             raise RuntimeError("stream completion count regressed")
         if observer is not None:
+            ids = chunk.get("output_ids")
+            if (not isinstance(ids, list) or len(ids) != completion
+                    or ids[:len(observed_ids[index])] != observed_ids[index]
+                    or any(type(token) is not int for token in ids)):
+                raise RuntimeError("recording lacks a consistent committed-token trajectory")
+            sequence += 1
             observer({"request_id": request_ids[index], "index": index,
-                      "elapsed_seconds": arrived - started, "chunk": chunk})
+                      "elapsed_seconds": arrived - started, "chunk": chunk,
+                      "sequence": sequence, "token_ids": ids[len(observed_ids[index]):]})
+            observed_ids[index] = list(ids)
         if new_tokens:
             if prior_arrival[index] is None:
                 first_token[index] = (arrived - started) * 1000

@@ -10,6 +10,7 @@ import json
 import math
 import random
 from collections import Counter, defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,26 @@ from scipy.stats import t
 from .protocol import Job
 from .scheduling import logical_unit_key
 
-PREVIEW_NODES = ("E3b-preview-v1", "E5-preview-v1")
+PREVIEW_NODES = ("E3b-preview-v1", "E5-preview-v1", "Qwen38-preview-v1")
+QWEN38_MODEL = "Qwen/Qwen3.8-27B"
+QWEN38_CHECKPOINTS = {
+    "target": {"repo": QWEN38_MODEL, "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"},
+    "NEXTN": {"repo": QWEN38_MODEL, "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"},
+    "DSPARK": {"repo": "RadixArk/Qwen3.8-27B-DSpark", "revision": "b9a5dbdf03bc999c6c73c426b19c2d9041cea393"},
+    "DFLASH": {"repo": "incoai/Qwen3.8-27B-DFlash2", "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4"},
+}
+QWEN38_METHODS = (
+    ("NONE", "target_only", "Target-only"),
+    ("NEXTN", "static", "Native MTP"),
+    ("DSPARK", "static", "Community DSpark"),
+    ("DFLASH", "static", "Community DFlash2"),
+    ("DFLASH", "tts", "Full TTS (DFlash2 transfer)"),
+    ("DFLASH", "lightcone", "LightCone (DFlash2 transfer)"),
+)
+QWEN38_VIDEO_METHODS = tuple(
+    (backend, "tts_lora_batched", "TTS-LoRA-Batched (DFlash2)") if method == "tts"
+    else (backend, method, label) for backend, method, label in QWEN38_METHODS
+)
 VIDEO_METHODS = (
     ("NONE", "target_only", "Target-only"),
     ("EAGLE3", "static", "Static EAGLE3"),
@@ -83,6 +103,92 @@ def preview_jobs(manifest: dict) -> tuple[Job, ...]:
                     parameters=params,
                 ))
     assert len(jobs) == 56 and len({job.job_id for job in jobs}) == 56
+    topologies = manifest.get("comparison_topologies", {})
+    for i, job in enumerate(jobs):
+        group = "dflash_long" if job.backend == "DFLASH" else "dspark_serving"
+        tp = topologies.get(group, 1)
+        if type(tp) is not int or tp not in (1, 2):
+            raise ValueError("preview comparison TP must be 1 or 2")
+        if tp == 2:
+            params = {**job.parameters, "topology": "tp2_dp1", "replaces_job_id": job.job_id,
+                      "replacement_reason": "matched comparison topology TP2"}
+            if job.load == "burstgpt_shape":
+                anchor = manifest.get("tp2_trace_anchor")
+                if not anchor or anchor.get("topology") != "tp2_dp1" or not anchor.get("source_job_ids"):
+                    raise ValueError("TP2 BurstGPT requires a measured topology-matched anchor")
+                params["preview_anchor"] = anchor
+            jobs[i] = replace(job, job_id=job.job_id + "__tp2", gpu_count=2, parameters=params)
+    if manifest.get("qwen38") is not None:
+        jobs.extend(qwen38_jobs(manifest))
+    return tuple(jobs)
+
+
+def select_common_tp(rows: list[dict], expected_cases: set[str]) -> int:
+    """Only a complete, correct matched acceptance panel can freeze a TP."""
+    if not expected_cases:
+        raise ValueError("empty topology acceptance panel")
+    for tp in (1, 2):
+        selected = [r for r in rows if r.get("tp") == tp]
+        by_case = {r["case"]: r for r in selected}
+        if len(by_case) != len(selected):
+            raise ValueError("duplicate topology acceptance case")
+        if set(by_case) != expected_cases:
+            continue
+        if all(r.get("correct") is True and r.get("full_workload") is True
+               and r.get("reset_verified") is True
+               and r.get("gpu_binding_verified") is True for r in selected):
+            return tp
+    raise ValueError("no fully validated common TP; preserve capacity/error evidence")
+
+
+def qwen38_jobs(manifest: dict) -> tuple[Job, ...]:
+    spec = manifest["qwen38"]
+    for name in ("tts_recipe", "lightcone_recipe"):
+        recipe = manifest[name]
+        if recipe.get("stride") != 10 or (name == "tts_recipe" and recipe.get("lr") != 1e-4):
+            raise ValueError("27B transfer must retain frozen S10 and TTS lr=1e-4")
+    tp = spec["tp"]
+    if type(tp) is not int or tp not in (1, 2):
+        raise ValueError("Qwen3.8 requires common TP1 or TP2")
+    checkpoints = spec["checkpoints"]
+    expected = {"target": QWEN38_MODEL, "NEXTN": QWEN38_MODEL,
+                "DFLASH": "incoai/Qwen3.8-27B-DFlash2",
+                "DSPARK": "RadixArk/Qwen3.8-27B-DSpark"}
+    for key, repo in expected.items():
+        record = checkpoints[key]
+        revision = record.get("revision", "")
+        if record.get("repo") != repo or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+            raise ValueError("Qwen3.8 checkpoint needs an exact repository and revision")
+    if checkpoints["target"] != checkpoints["NEXTN"]:
+        raise ValueError("native MTP must use the same target checkpoint revision")
+    records = spec["prompts"]
+    if len(records) != 8 or len({r["prompt"] for r in records}) != 8:
+        raise ValueError("Qwen3.8 needs eight distinct frozen held-out prompts")
+    jobs = []
+    for block in range(4):
+        methods = list(QWEN38_METHODS)
+        random.Random(f"qwen38-preview-v1:{block}").shuffle(methods)
+        for backend, method, label in methods:
+            recipe = manifest["tts_recipe" if method == "tts" else "lightcone_recipe"] if method in {"tts", "lightcone"} else None
+            jobs.append(Job(
+                job_id=f"qwen38-preview-v1__{backend}__{method}__b{block}__tp{tp}",
+                node=PREVIEW_NODES[2], ordinal=56 + len(jobs), model=QWEN38_MODEL,
+                backend=backend, method=method, task="LiveCodeBench", context=17408,
+                load="c1", block=block, gpu_count=tp,
+                width=None if backend == "NONE" else (4 if backend == "NEXTN" else 8),
+                parameters={
+                    "panel": "preview_v1", "preview_panel": "qwen38_transfer", "method_label": label,
+                    "pairing_key": f"qwen38-preview-v1:{block}", "comparison_backend": "Qwen38-matched",
+                    "topology": f"tp{tp}_dp1", "memory_budget_policy": "method_peak_v1",
+                    "coverage_runtime": True, "checkpoint_provenance": checkpoints,
+                    "sampling_seed": block, "stride": 10, "frozen_recipe": recipe,
+                    "execution_request_count": 8, "preview_prompt_records": records,
+                    "regime": "preview_constructed_chat", "generation_tokens": 1024,
+                    "input_tokens": 16384, "respect_eos": True, "enable_thinking": False,
+                    "temperature": 1.0, "verification": "native_scheduler",
+                    "workload": "preview_formal_supplement",
+                },
+            ))
     return tuple(jobs)
 
 
@@ -135,31 +241,43 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
         )
         measured[identity]["execution_policy"] = config.get("parameters", {}).get("execution_policy")
         measured[identity]["effective_load"] = metrics.get("effective_load")
+        measured[identity]["topology"] = config.get("parameters", {}).get("topology", "tp1_dp1")
+        measured[identity]["memory_budget_policy"] = config.get("parameters", {}).get("memory_budget_policy", "fixed_reserve_v1")
     rows, groups = [], defaultdict(dict)
     for identity, job in expected.items():
         m = measured.get(identity)
         row = {
             "job_id": identity, "panel": job.parameters["preview_panel"], "task": job.task,
             "method": job.method, "backend": job.backend, "load": job.load, "block": job.block,
+            "model": job.model, "topology": job.parameters.get("topology", "tp1_dp1"),
+            "method_label": job.parameters.get("method_label", job.method),
             "status": "UNMEASURED" if m is None else (
                 "measured" if m.get("hard_feasible") is True else "unavailable"
             ), "metrics": m,
         }
         rows.append(row)
         if row["status"] == "measured":
-            groups[(row["panel"], job.task, job.load)][(job.method, job.block)] = m
+            if m["topology"] != row["topology"]:
+                raise ValueError("preview evidence topology differs from frozen comparison")
+            groups[(row["panel"], job.task, job.load, job.model)][(job.method, job.backend, job.block)] = m
     effects = []
     for condition, data in sorted(groups.items()):
-        for baseline, metric in itertools.product(
-            ("static", "tts") if condition[0] == "long_generation" else ("static",),
+        backend = "DFLASH" if condition[0] in {"long_generation", "qwen38_transfer"} else "DSPARK"
+        baselines = (("static", backend), ("tts", backend)) if condition[0] == "long_generation" else (("static", backend),)
+        if condition[0] == "qwen38_transfer":
+            baselines = tuple((method, b) for b, method, _ in QWEN38_METHODS if method != "lightcone")
+        for (baseline, baseline_backend), metric in itertools.product(
+            baselines,
             ("goodput", "accepted_drafts_per_target_call", "per_user_generation_speed"),
         ):
             ratios = []
             for block in range(4):
-                a, b = data.get(("lightcone", block), {}), data.get((baseline, block), {})
+                a, b = data.get(("lightcone", backend, block), {}), data.get((baseline, baseline_backend, block), {})
                 x, y = a.get(metric), b.get(metric)
                 if (a.get("execution_policy") != b.get("execution_policy")
-                        or a.get("effective_load") != b.get("effective_load")):
+                        or a.get("effective_load") != b.get("effective_load")
+                        or a.get("topology") != b.get("topology")
+                        or a.get("memory_budget_policy") != b.get("memory_budget_policy")):
                     continue
                 if all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in (x, y)):
                     ratios.append(math.log(x / y))
@@ -168,6 +286,7 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
             radius = float(t.ppf(.975, 3) * np.std(ratios, ddof=1) / 2) if complete else None
             effects.append({
                 "condition": list(condition), "baseline": baseline, "metric": metric,
+                "baseline_backend": baseline_backend,
                 "n_blocks": len(ratios), "status": "measured" if complete else "UNMEASURED",
                 "paired_log_ratios": ratios,
                 "ratio": math.exp(mean) if complete else None,
@@ -189,7 +308,9 @@ def preview_summary(evidence, expected_jobs, output: Path) -> dict:
 def preview_eta(evidence, remaining_jobs, *, repetitions=10000) -> dict:
     """Cell-time resampling, frozen whole-pair units; never extrapolate missing panels."""
     def key(job, policy):
-        return (job.backend, job.method, job.task, job.load, job.parameters["preview_panel"],
+        return (job.model, job.backend, job.method, job.task, job.load, job.context,
+                job.parameters.get("generation_tokens"), job.parameters.get("topology", "tp1_dp1"),
+                job.parameters["preview_panel"],
                 job.parameters.get("memory_budget_policy"), policy)
 
     pools = defaultdict(list)
@@ -217,8 +338,11 @@ def preview_eta(evidence, remaining_jobs, *, repetitions=10000) -> dict:
                 continue
             cost += rng.choice(pool, repetitions)
             priced += 1
-        gpu = clocks.argmin(axis=0)
-        clocks[gpu, samples] += cost
+        if any(j.parameters.get("topology") == "tp2_dp1" for j in jobs):
+            clocks[:] = clocks.max(axis=0) + cost
+        else:
+            gpu = clocks.argmin(axis=0)
+            clocks[gpu, samples] += cost
     totals = clocks.max(axis=0)
     return {
         "remaining_leaves": len(remaining_jobs), "priced_leaves": priced,
@@ -227,5 +351,5 @@ def preview_eta(evidence, remaining_jobs, *, repetitions=10000) -> dict:
         "p50_seconds": None if missing else float(np.quantile(totals, .5)),
         "p90_seconds": None if missing else float(np.quantile(totals, .9)),
         "priced_subset_p50_seconds": float(np.quantile(totals, .5)),
-        "assumptions": "remaining cells cost a complete matched cell; clean starts; paired-unit TP1 scheduling; no video/QA",
+        "assumptions": "matched model/topology/budget/execution strata; whole paired units; TP2 reserves both GPUs; no video/QA",
     }

@@ -72,6 +72,63 @@ def test_preview_four_block_effects_keep_missing_and_exclude_private_data(tmp_pa
     assert missing["status"] == "UNMEASURED" and missing["p50_seconds"] is None
 
 
+def test_preview_topology_mismatch_is_not_paired(tmp_path):
+    from lightcone_spec.preview import preview_summary
+
+    job = Job(job_id="wrong-tp", node="E5-preview-v1", ordinal=0, method="static",
+              model="Qwen/Qwen3-8B", backend="DSPARK", task="LiveCodeBench", load="c1", block=0,
+              parameters={"panel": "preview_v1", "preview_panel": "serving", "topology": "tp2_dp1"})
+    wrong = replace(job, parameters={**job.parameters, "topology": "tp1_dp1"})
+    with pytest.raises(ValueError, match="topology"):
+        preview_summary([(wrong.to_dict(), {"hard_feasible": True})], [job], tmp_path)
+
+
+def test_preview_eta_tp2_reserves_both_devices():
+    from lightcone_spec.preview import preview_eta
+
+    jobs = tuple(Job(job_id=f"tp2-{i}", node="Qwen38-preview-v1", ordinal=i,
+                     method="static", model="Qwen/Qwen3.8-27B", backend="DFLASH",
+                     task="LiveCodeBench", load="c1", block=i, gpu_count=2,
+                     parameters={"panel": "preview_v1", "preview_panel": "qwen38_transfer",
+                                 "topology": "tp2_dp1", "execution_policy": "automatic_units_v3"})
+                 for i in range(4))
+    evidence = [(j.to_dict(), {"hard_feasible": True, "duration_seconds": 60., "session_startup_seconds": 10.}) for j in jobs]
+    assert preview_eta(evidence, jobs, repetitions=10)["p50_seconds"] == 280.
+
+
+def test_video_composition_requires_submission_clock_and_matched_topology(tmp_path):
+    import hashlib
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("compose_preview", Path(__file__).parents[1] / "scripts/compose_preview.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    paths = []
+    record = {"status": "completed", "errors": [], "video_sha256": hashlib.sha256(b"EXCLUDED SYNTHETIC TEST").hexdigest(), "alignment": {
+        "status": "verified_clock_bounded", "submission_offset_seconds": 2., "clock_uncertainty_seconds": .02,
+    }, "measurement": {"model": "Qwen/Qwen3.8-27B", "tp": 2, "dispatcher_concurrency": 8,
+                       "input_tokens_per_request": 16384, "max_output_tokens": 1024}}
+    for i in range(6):
+        directory = tmp_path / str(i)
+        directory.mkdir()
+        record["measurement"]["label"] = str(i)
+        (directory / "capture.json").write_text(json.dumps(record))
+        paths.append(directory / "original.mp4")
+        paths[-1].write_bytes(b"EXCLUDED SYNTHETIC TEST")
+    offsets, bounds = module.submission_alignment(paths)
+    assert offsets == [1.98] * 6 and bounds == [.02] * 6
+    record["measurement"]["tp"] = 1
+    paths[-1].with_name("capture.json").write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="share model, TP"):
+        module.submission_alignment(paths)
+    record["alignment"]["status"] = "UNMEASURED"
+    paths[-1].with_name("capture.json").write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="submission-clock"):
+        module.submission_alignment(paths)
+
+
 def test_coverage_eta_scales_request_budget_without_reusing_unknown_output_costs():
     from lightcone_spec.coverage import request_budget_eta
     from lightcone_spec.protocol import source_coverage_jobs
