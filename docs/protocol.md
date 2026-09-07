@@ -30,6 +30,13 @@ global `N` or `final_blocks` setting.
 
 ## Four-block coverage extension (registered; GPU results UNMEASURED)
 
+The additional [preview v1](preview-v1.md) contributes 56 separately identified
+formal supplemental leaves (24 long-generation, 24 DSpark serving, 8 BurstGPT).
+It does not replace the following 1,344-leaf coverage extension or existing
+main-effect evidence. Including preview, the base-plus-new-panel budget is
+8,766 leaves before compatibility replacements and bounded work. The public
+21-node protocol is unchanged; excluded video/QA are counted separately.
+
 Two internal panels add exactly **1,344 leaf cells**, without changing the 21
 public nodes or deleting existing six-/twelve-block evidence. Compatibility
 replacements and reopened old cells are counted separately, not included in

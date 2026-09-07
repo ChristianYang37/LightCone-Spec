@@ -254,7 +254,7 @@ def _native_events(meta: dict, output_ids: list[int]) -> tuple[int, ...]:
     return tuple(timestamps)
 
 
-def _consume_stream(response, request_ids: tuple[str, ...], started: float) -> tuple[GenerationResult, ...]:
+def _consume_stream(response, request_ids: tuple[str, ...], started: float, observer=None) -> tuple[GenerationResult, ...]:
     count = len(request_ids)
     prior_arrival: list[float | None] = [None] * count
     token_counts = [0] * count
@@ -288,6 +288,9 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float) -> t
         new_tokens = completion - token_counts[index]
         if new_tokens < 0:
             raise RuntimeError("stream completion count regressed")
+        if observer is not None:
+            observer({"request_id": request_ids[index], "index": index,
+                      "elapsed_seconds": arrived - started, "chunk": chunk})
         if new_tokens:
             if prior_arrival[index] is None:
                 first_token[index] = (arrived - started) * 1000
@@ -343,6 +346,8 @@ class SGLangClient:
     def __init__(self, base_url: str, timeout_seconds: int):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        # Excluded live recordings only. Normal benchmark execution has no sink.
+        self.stream_observer = None
 
     def health(self) -> bool:
         try:
@@ -483,7 +488,7 @@ class SGLangClient:
         with urllib.request.urlopen(
             request, timeout=timeout_seconds or self.timeout_seconds
         ) as response:
-            results = _consume_stream(response, request_ids, started)
+            results = _consume_stream(response, request_ids, started, self.stream_observer)
         return results, time.perf_counter() - started
 
     def abort(self, request_id: str) -> None:

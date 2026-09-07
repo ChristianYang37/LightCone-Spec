@@ -61,6 +61,38 @@ from lightcone_spec.runner import (
 from lightcone_spec.state import StateStore
 
 
+def test_preview_frozen_selection_and_atomic_resume(tmp_path):
+    from lightcone_spec.runner import _arrival_offsets, _dispatcher_concurrency, _runtime_job
+
+    state = StateStore(tmp_path)
+    config = ExperimentConfig(source=tmp_path / "paper.yaml", run_name="test", results_root=tmp_path,
+                              sglang_root=tmp_path, gpu_ids=(0, 1), server=ServerConfig(python=Path("/usr/bin/python3")),
+                              protocol=ProtocolConfig(), models={}, drafts={}, datasets={})
+    job = Job(job_id="preview-test", node="E3b-preview-v1", ordinal=0, method="tts",
+              model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500", load="c2",
+              parameters={"panel": "preview_v1", "frozen_recipe": {"lr": 1e-4, "stride": 10},
+                          "execution_request_count": 8})
+    state.add_internal_jobs((job,), storage_node=job.node)
+    attempt = state.start(job, (0,), tmp_path / "attempt-01")
+    state.complete(job.job_id, attempt)
+    state.add_internal_jobs((job,), storage_node=job.node)
+    assert state.pending_jobs(job.node) == ()
+    state.set_selection("tts_recipe", {"lr": 1e-3})
+    assert _selection_for_job(state, job)["lr"] == 1e-4
+    assert _dispatcher_concurrency(_runtime_job(config, state, job)) == 1
+    with pytest.raises(RuntimeError, match="changed"):
+        state.add_internal_jobs((replace(job, load="c1"),), storage_node=job.node)
+    trace = replace(job, node="E5-preview-v1", method="static", load="burstgpt_shape", parameters={
+        "panel": "preview_v1", "registered_load": "burstgpt_shape",
+        "preview_trace": {"arrivals": [0., 2.]},
+    })
+    assert _arrival_offsets(config, state, trace, trace, 2) == (0., 2.)
+    with pytest.raises(ScientificFailure, match="arrival budget"):
+        _arrival_offsets(config, state, trace, trace, 3)
+    with pytest.raises(ScientificFailure, match="anchor"):
+        _e5_reference(state, trace)
+    assert _records_scientific_rejection(trace)
+
 def test_coverage_repair_is_method_specific_and_dense_transfer_preserves_workload():
     from lightcone_spec.coverage import (
         compatibility_replacements,

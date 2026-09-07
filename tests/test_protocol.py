@@ -54,6 +54,57 @@ from lightcone_spec.server import (
 from lightcone_spec.state import StateStore
 
 
+def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
+    from collections import Counter
+
+    from lightcone_spec.preview import VIDEO_METHODS, preview_jobs
+    from lightcone_spec.scheduling import logical_unit_key
+
+    manifest = {
+        "tts_recipe": {"lr": 1e-4, "stride": 10}, "lightcone_recipe": {"stride": 10},
+        "dspark_recipe": {"stride": 10, "confidence_temperatures": [1.] * 7},
+        "dflash_width": 8, "dspark_width": 16, "trace_request_count": 16,
+        "serving_output_tokens": 256, "trace_offset": 17,
+        "trace_anchor": {"source_job_ids": ["anchor"]},
+        "trace": {"arrivals": list(range(16)), "lengths": [[128, 64]] * 16},
+        "prompts": {task: [{"problem_id": str(i), "prompt": str(i)} for i in range(32)]
+                    for task in ("MATH-500", "LiveCodeBench")},
+    }
+    jobs = preview_jobs(manifest)
+    assert len(jobs) == 56 and len(PAPER_NODES) == 21
+    assert Counter(j.parameters["preview_panel"] for j in jobs) == {
+        "long_generation": 24, "serving": 24, "burstgpt": 8,
+    }
+    assert jobs == preview_jobs(json.loads(json.dumps(manifest)))
+    units = {}
+    for job in jobs:
+        units.setdefault(logical_unit_key(job), []).append(job)
+        assert job.parameters["sampling_seed"] == job.block
+        assert job.parameters["stride"] == 10
+        if job.method == "tts":
+            assert job.load == "c1" and job.parameters["execution_request_count"] == 8
+    assert len(units) == 24
+    assert sorted(len(rows) for rows in units.values()) == [2] * 16 + [3] * 8
+    for rows in units.values():
+        assert len({json.dumps(j.parameters["preview_prompt_records"]) for j in rows}) == 1
+    serving = [j for j in jobs if j.parameters["preview_panel"] == "serving"]
+    assert all(j.parameters["execution_request_count"] == 32 for j in serving)
+    assert len({json.dumps(j.parameters["preview_prompt_records"]) for j in serving}) == 1
+    assert len(VIDEO_METHODS) == 6 and all(method != "tts" for _, method, _ in VIDEO_METHODS)
+
+
+def test_preview_heldout_deterministic_and_no_duplicates():
+    from lightcone_spec.preview import held_out_pool
+
+    records = [{"problem_id": str(i), "prompt": f"prompt-{i}"} for i in range(12)]
+    calibration = [records[0], {"problem_id": "other", "prompt": "prompt-1"}]
+    chosen = held_out_pool(records, calibration, 8)
+    assert chosen == held_out_pool(list(reversed(records)), calibration, 8)
+    assert len({r["prompt"] for r in chosen}) == 8
+    assert not {"prompt-0", "prompt-1"}.intersection(r["prompt"] for r in chosen)
+    with pytest.raises(ValueError, match="distinct held-out"):
+        held_out_pool(records, calibration, 11)
+
 def test_official_jsonl_keeps_unicode_line_separators_inside_prompts(tmp_path):
     from lightcone_spec.data import load_source_prompt_records
 

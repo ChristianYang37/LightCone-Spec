@@ -1,5 +1,17 @@
 # LightCone-Spec
 
+## First preview (registered; results UNMEASURED)
+
+The [56-cell formal supplement](docs/preview-v1.md) prioritizes paired AL and
+throughput evidence against Full TTS and native DSpark without replacing the
+full experiment. Four independent blocks, all outcomes, and honest uncertainty
+are required before publishing effect claims. The separate real c8 streaming
+video uses **TTS-LoRA-Batched**, not original Full TTS.
+
+New authorized contributions use the source-available terms in [LICENSE](LICENSE);
+historical Apache-2.0 and third-party rights remain intact. This is not a
+uniformly open-source release. See [CONTRIBUTING](CONTRIBUTING.md).
+
 LightCone-Spec is the experiment implementation for online drafter adaptation
 in speculative decoding. It compares six distinct roles: Target-only, Static,
 TTS, L0-naive, LightCone, and an independently tuned OnlineSPEC baseline.

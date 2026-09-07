@@ -68,6 +68,53 @@ from lightcone_spec.server import (
 from lightcone_spec.state import StateStore
 
 
+def test_live_stream_observer_uses_real_chunks_and_detects_disk_failure(tmp_path):
+    from lightcone_spec.client import _consume_stream
+    from lightcone_spec.recording import StreamRecording
+
+    chunks = [{"text": "ab", "output_ids": [1, 2], "meta_info": {
+        "id": "r", "completion_tokens": 2, "prompt_tokens": 4,
+        "finish_reason": {"type": "length"},
+    }}]
+    lines = [("data: " + json.dumps(chunk)).encode() for chunk in chunks]
+    observed = []
+    # Even if native metadata is absent, the observer must not invent or animate events.
+    with pytest.raises(RuntimeError):
+        _consume_stream(lines, ("r",), time.perf_counter(), observed.append)
+    assert len(observed) == 1 and observed[0]["chunk"]["text"] == "ab"
+    chunks[0]["meta_info"]["native_token_timestamp_events"] = [
+        {"token_index": i, "token_id": token, "committed_ns": (i + 1) * 1000000000}
+        for i, token in enumerate((1, 2))
+    ]
+    lines = [("data: " + json.dumps(chunk)).encode() for chunk in chunks]
+    plain = _consume_stream(lines, ("r",), time.perf_counter())
+    with_sink = _consume_stream(lines, ("r",), time.perf_counter(), lambda event: None)
+    assert plain[0].output_ids == with_sink[0].output_ids == (1, 2)
+    assert plain[0].native_token_timestamps_ns == with_sink[0].native_token_timestamps_ns
+    recording = StreamRecording(tmp_path / "events.jsonl")
+    recording(observed[0])
+    recording.close()
+    assert recording.snapshot() == observed
+    assert len((tmp_path / "events.jsonl").read_text().splitlines()) == 1
+    broken = StreamRecording(tmp_path / "missing" / "events.jsonl")
+    broken.thread.join(2)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        broken.close()
+
+
+def test_live_recording_overflow_is_not_silent(tmp_path, monkeypatch):
+    from lightcone_spec.recording import StreamRecording
+
+    release = threading.Event()
+    monkeypatch.setattr(StreamRecording, "_write", lambda self: release.wait(2))
+    sink = StreamRecording(tmp_path / "overflow.jsonl", capacity=1)
+    sink({"index": 0})
+    with pytest.raises(RuntimeError, match="overflow"):
+        sink({"index": 1})
+    release.set()
+    with pytest.raises(RuntimeError, match="incomplete"):
+        sink.close()
+
 def test_coverage_memory_policy_does_not_leak_into_legacy_sessions():
     from lightcone_spec.protocol import memory_budget_policy, source_coverage_jobs
     job = materialize("E0-tune")[0]

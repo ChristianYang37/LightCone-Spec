@@ -1,0 +1,10 @@
+# Python 3.12 CPU validation; exact direct scientific/test dependencies.
+numpy==2.5.2
+pandas==3.0.5
+pyarrow==25.0.1
+PyYAML==6.0.3
+scipy==1.18.1
+pytest==9.1.1
+ruff==0.16.2
+setuptools==81.0.0
+torch==2.11.0

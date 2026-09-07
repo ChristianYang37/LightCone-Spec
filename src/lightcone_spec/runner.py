@@ -62,6 +62,7 @@ from .metrics import (
     summarize_metric_rows,
     validate_scientific_metrics,
 )
+from .preview import PREVIEW_NODES, held_out_pool, preview_eta, preview_jobs, preview_summary
 from .protocol import (
     DSPARK_CONFIDENCE_LOSS_WEIGHT,
     DSPARK_CONFIDENCE_POSITIONS,
@@ -206,7 +207,8 @@ def _records_scientific_rejection(job: Job) -> bool:
     sibling replacement queue or leave the other GPU idle.
     """
     return (
-        job.node == "S10-reconciliation"
+        job.node in PREVIEW_NODES
+        or job.node == "S10-reconciliation"
         or job.node == "bugfix-reconciliation-v1"
         or job.node in {"soft-gate-width-v1", "profile-proxy-v1"}
         or job.node
@@ -752,6 +754,8 @@ def _task_for_data(config: ExperimentConfig, job: Job) -> str:
 
 
 def _prompt_offset(job: Job, limit: int) -> int:
+    if job.parameters.get("panel") == "preview_v1":
+        return int(job.parameters["preview_prompt_offset"])
     condition = "|".join(
         str(value)
         for value in (job.model, job.task, job.context, job.load, job.block)
@@ -851,7 +855,9 @@ def _cell_inputs(
     metadata: dict[str, object] = {"dataset": dataset_key}
     if job.parameters.get("regime") in {"source_native_prompt", "mechanism_native_prompt"}:
         seed = int(job.parameters["sampling_seed"])
-        if job.parameters["regime"] == "source_native_prompt":
+        if job.parameters.get("panel") == "preview_v1":
+            records = tuple(job.parameters["preview_prompt_records"][:count])
+        elif job.parameters["regime"] == "source_native_prompt":
             records = load_source_prompt_records(
                 config.dataset_path(dataset_key),
                 max_samples=count,
@@ -901,7 +907,13 @@ def _cell_inputs(
     )
     domain = job.parameters.get("domain")
     calibration_split = job.parameters.get("calibration_split")
-    if domain in {"math", "code", "chat"} and calibration_split in {"fit", "validation"}:
+    if job.parameters.get("panel") == "preview_v1":
+        records = tuple(job.parameters["preview_prompt_records"][:count])
+        if len(records) != count:
+            raise ScientificFailure("preview frozen prompt budget is incomplete")
+        prompts = tuple(str(row["prompt"]) for row in records)
+        metadata["examples"] = records
+    elif domain in {"math", "code", "chat"} and calibration_split in {"fit", "validation"}:
         source = {"math": "OpenR1-Math", "code": "APPS", "chat": "UltraChat"}[str(domain)]
         domain_records = [
             dict(row)
@@ -975,11 +987,14 @@ def _cell_inputs(
         trace_path = config.datasets.get("BurstGPT")
         if trace_path is None:
             raise ScientificFailure("BurstGPT row lacks its explicit trace")
-        _, lengths = load_arrival_trace(
-            trace_path,
-            limit=count,
-            offset=_prompt_offset(job, count),
-        )
+        if job.parameters.get("panel") == "preview_v1":
+            lengths = tuple(tuple(row) for row in job.parameters["preview_trace"]["lengths"])
+            if len(lengths) != count:
+                raise ScientificFailure("preview frozen trace length budget changed")
+        else:
+            _, lengths = load_arrival_trace(
+                trace_path, limit=count, offset=_prompt_offset(job, count),
+            )
         inputs = tuple(
             _fit_prompt(tokens, filler, min(input_length, job.context - 1))
             for tokens, (input_length, _) in zip(tokenized, lengths, strict=True)
@@ -1088,6 +1103,11 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
+    if job.parameters.get("panel") == "preview_v1":
+        anchor = job.parameters.get("preview_anchor")
+        if not isinstance(anchor, dict) or not anchor.get("source_job_ids"):
+            raise ScientificFailure("preview trace lacks frozen formal anchor provenance")
+        return float(anchor["request_rate"]), int(anchor["concurrency"])
     by_method: dict[str, list[tuple[float, int]]] = {}
     comparison_backend = job.parameters.get("comparison_backend", job.backend)
     rows = _metric_rows(state, job.node)
@@ -1255,6 +1275,11 @@ def _arrival_offsets(
     if not original_job.node.startswith("E5") or not isinstance(registered, str):
         return None
     if registered == "burstgpt_shape":
+        if original_job.parameters.get("panel") == "preview_v1":
+            arrivals = tuple(original_job.parameters["preview_trace"]["arrivals"])
+            if len(arrivals) != count:
+                raise ScientificFailure("preview frozen trace arrival budget changed")
+            return arrivals
         trace = config.datasets.get("BurstGPT")
         if trace is None:
             raise ScientificFailure("BurstGPT workload-shape row lacks its local trace")
@@ -2446,6 +2471,11 @@ def _execute_cell(
 
 
 def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
+    if job.parameters.get("panel") == "preview_v1":
+        recipe = job.parameters.get("frozen_recipe")
+        if job.method != "static" and not isinstance(recipe, dict):
+            raise ScientificFailure("preview adaptive job lacks frozen recipe")
+        return dict(recipe) if recipe is not None else None
     if job.method in {"tts", "l0_naive"}:
         return _formalize_recipe(dict(state.selection("tts_recipe", {})))
     if job.method == "tts_lora_batched":
@@ -3999,7 +4029,7 @@ def _run_pending_jobs(
                 )
             )
         else:
-            if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}:
+            if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE, *PREVIEW_NODES}:
                 # Protocol ordinals already encode the frozen within-block method
                 # randomization. A second session shuffle would change that order.
                 keys = sorted(grouped, key=lambda key: min(row[0].ordinal for row in grouped[key]))
@@ -4127,7 +4157,7 @@ def _run_pending_jobs(
             session = (job.block, probe, *server_session_key(runtime, _selection_for_job(state, job)))
             legacy_keys.setdefault(_job_gpus(config, job), []).append(session)
         legacy_keys.update({
-            devices: (list(dict.fromkeys(keys)) if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE}
+            devices: (list(dict.fromkeys(keys)) if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE, *PREVIEW_NODES}
                       else _session_order(config, node, devices, keys))
             for devices, keys in legacy_keys.items()
         })
@@ -4188,6 +4218,8 @@ def _run_pending_jobs(
                         if cache.get("process") is not None:
                             cache.pop("process").stop()
                         unit_pool.release(gpu)
+                    if node in PREVIEW_NODES:
+                        _write_preview_status(config, state)
                     with unit_pool.condition:
                         _write_json(trace_path, {"events": unit_pool.events,
                             "pending_units": len(unit_pool.pending),
@@ -7454,6 +7486,95 @@ def _run_priority_paper_node(
     _reduce_node(config, state, node)
 
 
+def _write_preview_status(config: ExperimentConfig, state: StateStore) -> None:
+    manifest = state.selection("formal_preview_manifest_v1", None)
+    if manifest is None:
+        return
+    jobs = preview_jobs(manifest)
+    evidence = [row for node in PREVIEW_NODES for row in _metric_rows(state, node)]
+    remaining = tuple(job for job in jobs if state.job_status(job.job_id) != "completed")
+    # Worker-local reports avoid concurrent writes of the same JSON file.
+    output = config.run_dir / "stages" / "preview-v1" / f"worker-{threading.get_ident()}"
+    preview_summary(evidence, jobs, output)
+    state.set_selection("formal_preview_eta_v1", preview_eta(evidence, remaining))
+
+
+def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> None:
+    """Deployment enables this once after excluded QA; no public DAG migration."""
+    enabled = state.selection("formal_preview_v1", {})
+    if not enabled.get("enabled") or enabled.get("status") == "completed":
+        return
+    manifest = state.selection("formal_preview_manifest_v1", None)
+    if manifest is None:
+        recipes = {name: state.selection(name, None) for name in (
+            "tts_recipe", "lightcone_recipe", "dspark_recipe",
+        )}
+        if not all(isinstance(value, dict) and value for value in recipes.values()):
+            raise RuntimeError("preview prerequisites missing: frozen TTS/LightCone/DSpark recipe")
+        temperatures = recipes["dspark_recipe"].get("confidence_temperatures")
+        if (not isinstance(temperatures, list) or len(temperatures) != 7
+                or not all(isinstance(t, (int, float)) and math.isfinite(t) and t > 0
+                           for t in temperatures)):
+            raise RuntimeError("preview requires seven validated DSpark STS temperatures")
+        recipes = {name: _formalize_recipe(dict(value)) for name, value in recipes.items()}
+        if float(recipes["tts_recipe"].get("learning_rate", recipes["tts_recipe"].get("lr", 0))) != 1e-4:
+            raise RuntimeError("preview requires the frozen S10 TTS lr=1e-4 recipe")
+        widths = state.selection("deployment_widths", {})
+        dflash_widths = {widths.get(method) for method in ("static", "tts", "lightcone")}
+        if len(dflash_widths) != 1 or None in dflash_widths:
+            raise RuntimeError("preview requires the already frozen common DFlash width")
+        source = next((job for job in state.jobs("E5-pilot")
+                       if job.backend == "DSPARK" and job.method == "static"
+                       and job.block == 0 and job.parameters.get("topology", "tp1_dp1") == "tp1_dp1"), None)
+        if source is None:
+            raise RuntimeError("preview dependency missing: existing E5 DSpark TP1 pilot anchor")
+        rate, concurrency = _e5_reference(state, source)
+        anchor_rows = [item[0]["job_id"] for item in _metric_rows(state, "E5-pilot")
+                       if item[0].get("block") == 0
+                       and item[0].get("method") in {"static", "target_only"}
+                       and _capacity_feasible_row(item[1])]
+        trace_job = replace(source, load="burstgpt_shape", parameters={
+            **source.parameters, "registered_load": "burstgpt_shape",
+        })
+        count = _request_count(config, state, trace_job)
+        offset = _prompt_offset(trace_job, count)
+        trace_path = config.dataset_path("BurstGPT")
+        arrivals, lengths = load_arrival_trace(trace_path, limit=count, offset=offset)
+        calibration = load_prompt_pool(config.dataset_path("CalibrationMix"))
+        manifest = {
+            "version": 1, **recipes, "dflash_width": next(iter(dflash_widths)),
+            "dspark_width": source.width or 16, "trace_request_count": count,
+            "serving_output_tokens": min(256, config.server.max_new_tokens),
+            "trace_offset": offset, "trace": {"arrivals": list(arrivals), "lengths": list(lengths)},
+            "trace_anchor": {"request_rate": rate, "concurrency": concurrency,
+                             "source_job_ids": anchor_rows, "source_node": "E5-pilot"},
+            "prompts": {task: held_out_pool(load_prompt_pool(config.dataset_path(task)), calibration,
+                                           max(32, count) if task == "LiveCodeBench" else 8)
+                        for task in ("LiveCodeBench", "MATH-500")},
+        }
+        state.set_selection("formal_preview_manifest_v1", manifest)
+    jobs = preview_jobs(manifest)
+    for node in PREVIEW_NODES:
+        rows = tuple(job for job in jobs if job.node == node)
+        state.add_internal_jobs(rows, storage_node=node)
+        state.set_stage_status(node, "pending", row_count=len(rows))
+    for node in PREVIEW_NODES:
+        rows = tuple(job for job in jobs if job.node == node)
+        state.add_internal_jobs(rows, storage_node=node)
+        state.set_stage_status(node, "running", row_count=len(rows))
+        _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
+        evidence = [row for name in PREVIEW_NODES for row in _metric_rows(state, name)]
+        report = preview_summary(evidence, jobs, config.run_dir / "stages" / "preview-v1")
+        state.set_selection("formal_preview_progress_v1", report["counts"])
+        if stop_event.is_set():
+            return
+        counts = state.status_counts(node)
+        if any(counts.get(status) for status in ("failed", "running", "pending")):
+            raise RuntimeError(f"preview runtime failures remain: {node}: {counts}")
+        state.set_stage_status(node, "completed", row_count=len(rows))
+    state.set_selection("formal_preview_v1", {**enabled, "status": "completed", "leaf_cells": 56})
+
+
 def _run_priority_window_v1(
     config: ExperimentConfig,
     state: StateStore,
@@ -8475,6 +8596,9 @@ class PaperRunner:
         old_term = signal.signal(signal.SIGTERM, self._signal)
         old_int = signal.signal(signal.SIGINT, self._signal)
         try:
+            _run_preview_v1(self.config, self.state, self.stop_event)
+            if self.stop_event.is_set():
+                return
             if self.state.selection("formal_coverage_runtime_v1", {}).get("status") == "accepted":
                 _run_tp1_interference_v3(self.config, self.state, self.stop_event)
                 if self.stop_event.is_set():

@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- New contributions: LicenseRef-LightCone-Source-Available-1.0. See LICENSE. -->
+<html lang="en"><meta charset="utf-8"><title>LightCone live stream</title>
+<style>
+body{font:18px system-ui;margin:24px;background:#101923;color:#e9f1f7}h1{font-size:28px}
+.notice{color:#b9c9d6}#metrics{font:20px monospace;padding:12px 0}#grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+article{background:#1c2936;border:1px solid #425466;border-radius:8px;padding:12px;min-width:0}pre{font:13px/1.45 monospace;white-space:pre-wrap;overflow:auto;height:280px}
+button{padding:12px;font-size:18px}header{color:#77d9c2}
+</style>
+<h1 id="label">Loading real stream endpoint…</h1>
+<p class="notice">Qwen3-8B · actual batch 8 · 16K input each · ≤1,024 output each · normal EOS</p>
+<p class="notice">Independent real run · 1× playback · received chunks, no simulated token animation<br>UI transport/render lag is not native token latency. Recording metrics are excluded from benchmarks.</p>
+<button id="start">Start this real batch</button><div id="metrics">Ready</div><div id="grid"></div>
+<script>
+let cursor=0, origin=null, state='ready'; const counts=Array(8).fill(0), done=Array(8).fill(false);
+const boxes=Array.from({length:8},(_,i)=>{const a=document.createElement('article'),h=document.createElement('header'),p=document.createElement('pre');h.textContent=`Request ${i+1} · 0 tokens`;a.append(h,p);document.querySelector('#grid').append(a);return{h,p};});
+document.querySelector('#start').onclick=async()=>{origin=performance.now();document.querySelector('#start').disabled=true;const r=await fetch('/start',{method:'POST'});if(!r.ok)throw Error('Start rejected');};
+async function poll(){
+ try{const response=await fetch(`/events?since=${cursor}`);if(!response.ok)throw Error('Endpoint unavailable');const data=await response.json();state=data.status;document.body.dataset.status=state;document.querySelector('#label').textContent=data.label;
+ for(const event of data.events){const i=event.index,c=event.chunk,m=c.meta_info;counts[i]=m.completion_tokens||0;done[i]=m.finish_reason!=null;boxes[i].h.textContent=`Request ${i+1} · ${counts[i]} tokens · ${done[i]?'done':'streaming'}`;boxes[i].p.textContent=c.text||'';boxes[i].p.scrollTop=boxes[i].p.scrollHeight;cursor++;}
+ const elapsed=origin===null?0:(performance.now()-origin)/1000,total=counts.reduce((a,b)=>a+b,0);
+ document.querySelector('#metrics').textContent=`${state} | ${elapsed.toFixed(1)} s | ${done.filter(Boolean).length}/8 completed | ${total} committed tokens | received ${(total/Math.max(elapsed,.001)).toFixed(1)} tok/s`+(data.per_user_tok_s!=null?` | native/user ${data.per_user_tok_s.toFixed(1)} tok/s`:'')+(data.error?` | ERROR: ${data.error}`:'');
+ if(state==='failed')document.querySelector('#metrics').style.color='#ff9b9b';
+ }catch(e){document.body.dataset.status='failed';document.querySelector('#metrics').textContent=`Recording connection failed: ${e.message}`;return;}
+ if(state!=='completed'&&state!=='failed')setTimeout(poll,100);
+}
+poll();
+</script></html>

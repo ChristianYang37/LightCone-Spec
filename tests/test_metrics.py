@@ -33,6 +33,45 @@ from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
 
 
+def test_preview_four_block_effects_keep_missing_and_exclude_private_data(tmp_path):
+    from lightcone_spec.preview import preview_summary
+    from lightcone_spec.protocol import Job
+
+    jobs, evidence = [], []
+    for block in range(4):
+        for method in ("static", "lightcone"):
+            job = Job(job_id=f"preview-{block}-{method}", node="E5-preview-v1", ordinal=len(jobs),
+                      model="Qwen/Qwen3-8B", backend="DSPARK", task="LiveCodeBench", method=method,
+                      load="closed_loop_c8", block=block,
+                      parameters={"panel": "preview_v1", "preview_panel": "serving",
+                                  "execution_policy": "automatic_units_v3", "prompt": "PRIVATE"})
+            jobs.append(job)
+            evidence.append((job.to_dict(), {"hard_feasible": True, "goodput": 100 if method == "static" else 120,
+                                             "target_calls": 10, "accepted_drafts": 30,
+                                             "effective_load": "c8", "source_attempt_dir": "/PRIVATE"}))
+    result = preview_summary(evidence, jobs, tmp_path)
+    effect = next(e for e in result["effects"] if e["metric"] == "goodput")
+    assert effect["ratio"] == pytest.approx(1.2)
+    assert effect["ratio_ci95"] == pytest.approx([1.2, 1.2])
+    assert all(row["metrics"]["accepted_drafts_per_target_call"] == 3 for row in result["rows"])
+    assert "PRIVATE" not in (tmp_path / "preview.json").read_text()
+    partial = preview_summary(evidence[:-1], jobs, tmp_path)
+    assert partial["counts"]["UNMEASURED"] == 1
+    assert all(e["status"] == "UNMEASURED" for e in partial["effects"])
+    with pytest.raises(ValueError, match="duplicate"):
+        preview_summary(evidence + evidence[:1], jobs, tmp_path)
+    from lightcone_spec.preview import preview_eta
+
+    for _, metrics in evidence:
+        metrics.update(duration_seconds=60., session_startup_seconds=10.)
+    eta = preview_eta(evidence, jobs, repetitions=20)
+    assert eta["status"] == "estimated" and eta["remaining_leaves"] == 8
+    # Both methods of each block consume the same device, never divided individually.
+    assert eta["p50_seconds"] == 280.
+    missing = preview_eta(evidence[:1], jobs, repetitions=20)
+    assert missing["status"] == "UNMEASURED" and missing["p50_seconds"] is None
+
+
 def test_coverage_eta_scales_request_budget_without_reusing_unknown_output_costs():
     from lightcone_spec.coverage import request_budget_eta
     from lightcone_spec.protocol import source_coverage_jobs
