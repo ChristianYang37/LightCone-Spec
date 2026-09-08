@@ -3808,6 +3808,43 @@ def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
         runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/record_preview.py"), run_name="__main__")
 
 
+def test_excluded_tp_rank_metrics_do_not_assume_dp_reply_count(tmp_path, monkeypatch):
+    import runpy
+    import sys
+    import time
+    from types import SimpleNamespace as NS
+
+    from lightcone_spec.verification_diagnostic import install
+
+    script = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/validate_preview_updates.py"))
+    read = script["captured_rank_info"]
+    source = "def get_internal_state(self, response):\n    return response\n"
+    path = tmp_path / "managers/scheduler.py"
+    path.parent.mkdir()
+    path.write_text(source)
+    namespace = {}
+    exec(compile(source, str(path), "exec"), namespace)
+    monkeypatch.setenv("LIGHTCONE_EXCLUDED_VERIFY_TRACE", json.dumps({
+        "output_directory": str(tmp_path), "rank_metrics": True, "trace_verify": False}))
+    timestamp = time.time_ns()
+    previous = sys.gettrace()
+    try:
+        install()
+        for rank in range(2):
+            reply = NS(internal_state={"speed_study_metrics": {"rank_value": rank},
+                                      "api_key": "never include this field"})
+            assert namespace["get_internal_state"](NS(ps=NS(tp_rank=rank, tp_size=2)), reply) is reply
+    finally:
+        sys.settrace(previous)
+    records = read(tmp_path, 2, timestamp, timeout=0)
+    assert [r["speed_study_metrics"]["rank_value"] for r in records["internal_states"]] == [0, 1]
+    assert all("api_key" not in p.read_text() for p in tmp_path.glob("rank-*-metrics.jsonl"))
+    with pytest.raises(RuntimeError, match="fresh"):
+        read(tmp_path, 2, time.time_ns(), timeout=0)
+    with pytest.raises(RuntimeError, match="topology"):
+        read(tmp_path, 1, timestamp, timeout=0)
+
+
 def test_excluded_reset_fingerprints_detect_state_not_output(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace as NS

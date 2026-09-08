@@ -84,6 +84,11 @@ QA result or formal acceptance. It records whether instrumentation preserves eac
 original trajectory; synchronized traces that change an async publication schedule
 cannot establish the cause of an uninstrumented divergence. Epoch/generation IDs
 are recorded separately from byte-equality checks because they intentionally advance.
+For excluded TP2 QA, `/get_server_info` reports a DP leader, not one entry per
+TP rank. An opt-in local trace records each scheduler's existing metrics before
+its IPC response is filtered; QA requires fresh rank0/rank1 records and checks
+both ranks' update/reset counters. This does not change production telemetry or
+claim unobserved rank-local numbers from the DP-leader API response.
 
 ## Metrics, memory and release
 

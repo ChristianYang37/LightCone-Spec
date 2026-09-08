@@ -4,6 +4,7 @@ import json
 import linecache
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -76,6 +77,23 @@ def install():
     def dispatch(frame, event, arg):
         nonlocal state_audit, reset_count, reset_reference
         code = frame.f_code
+        if (event == "call" and settings.get("rank_metrics") and code.co_name == "get_internal_state"
+                and code.co_filename.endswith("/managers/scheduler.py")):
+            scheduler = frame.f_locals["self"]
+
+            def finish_metrics(frame, event, arg):
+                if event == "return" and arg is not None:
+                    state = arg.internal_state
+                    rank = int(scheduler.ps.tp_rank)
+                    record = {"tp_rank": rank, "tp_size": int(scheduler.ps.tp_size),
+                              "captured_ns": time.time_ns(),
+                              "state": {k: state[k] for k in
+                                  ("speed_study_metrics", "speculative_adaptation_info_record") if k in state}}
+                    with (output / f"rank-{rank}-metrics.jsonl").open("a") as stream:
+                        stream.write(json.dumps(record) + "\n")
+                return finish_metrics
+
+            return finish_metrics
         if (event == "call" and settings.get("reset_audit") and code.co_name == "reset"
                 and code.co_filename.endswith("/speculative/dflash_online_adaptation.py")):
             adapter = frame.f_locals["self"]
@@ -116,7 +134,8 @@ def install():
                             return finish_update
 
                         return finish_update
-        if (event != "call" or code.co_name != "forward_batch_generation"
+        if (not settings.get("trace_verify", True)
+                or event != "call" or code.co_name != "forward_batch_generation"
                 or not code.co_filename.endswith("/speculative/dflash_worker_v2.py")):
             return None
         if settings.get("target_state_audit") and state_audit is None:

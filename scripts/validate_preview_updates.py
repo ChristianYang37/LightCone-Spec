@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +14,30 @@ from lightcone_spec.preview_revision import preview_recipe
 from lightcone_spec.runner import _cell_inputs, _speed_metrics
 from lightcone_spec.server import ServerProcess, adaptation_payload, apply_runner_affinity
 from lightcone_spec.state import StateStore
+
+
+def captured_rank_info(directory, tp, not_before_ns, timeout=5.):
+    """TP API returns one DP leader; excluded sidecars retain every TP rank."""
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = []
+        for rank in range(tp):
+            path = directory / f"rank-{rank}-metrics.jsonl"
+            try:
+                lines = path.read_text().splitlines()
+                row = json.loads(lines[-1])
+            except (FileNotFoundError, IndexError, json.JSONDecodeError):
+                break
+            if row["tp_rank"] != rank or row["tp_size"] != tp:
+                raise RuntimeError("excluded rank telemetry topology mismatch")
+            if row["captured_ns"] < not_before_ns:
+                break
+            rows.append(row["state"])
+        if len(rows) == tp:
+            return {"internal_states": rows}
+        if time.monotonic() >= deadline:
+            raise RuntimeError("missing fresh excluded TP-rank telemetry")
+        time.sleep(.01)
 
 
 def update_qa_job(source, case, tp=1):
@@ -136,6 +161,11 @@ def main():
                 "start": 150, "end": 190, "reset_audit": True})
             os.environ["PYTHONPATH"] = os.pathsep.join((
                 str(Path(__file__).resolve().parent / "preview_verify_trace"), os.environ.get("PYTHONPATH", "")))
+        elif args.tp == 2:
+            os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
+                "output_directory": str(server.resolve()), "rank_metrics": True, "trace_verify": False})
+            os.environ["PYTHONPATH"] = os.pathsep.join((
+                str(Path(__file__).resolve().parent / "preview_verify_trace"), os.environ.get("PYTHONPATH", "")))
         process = ServerProcess(config, job, gpus=gpus, port=config.server.base_port + 50 + args.gpu,
                                 output_dir=server, selection=recipe)
         with process as client:
@@ -152,9 +182,16 @@ def main():
             if args.reset_diagnostic:
                 plan = plan[:2]
             reference = None
+            def metrics():
+                timestamp = time.time_ns()
+                info = client.server_info()
+                if args.tp == 2:
+                    info = captured_rank_info(server, args.tp, timestamp)
+                return _speed_metrics(info, topology)
+
             for name, tokens, temperature in plan:
                 client.reset()
-                before = _speed_metrics(client.server_info(), topology)
+                before = metrics()
                 assert len(before["rank_local"]) == args.tp
                 assert before["updates_published"] == 0
                 if args.case == "ensemble":
@@ -176,7 +213,7 @@ def main():
                 client.stream_observer = None
                 raw = [r.to_dict() for r in results]
                 (args.output / f"{name}-requests.json").write_text(json.dumps(raw))
-                after = _speed_metrics(client.server_info(), topology)
+                after = metrics()
                 (args.output / f"{name}-metrics.json").write_text(json.dumps({"before": before, "after": after}))
                 assert len(raw) == 1 and raw[0]["completion_tokens"] == tokens and ids == raw[0]["output_ids"]
                 for key in ("fallbacks", "nonfinite_updates", "exactness_violations", "budget_violations",
