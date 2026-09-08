@@ -136,6 +136,12 @@ It does not write that candidate back to the formal database, authorize legacy
 TTS jobs, or freeze the tested TP. An existing malformed v3 manifest still fails
 closed instead of falling back. The 27B manifest remains a separate prerequisite.
 
+For preview-v3 native EAGLE3, use Triton for draft attention only: the pinned
+FlashInfer multi-step draft backend cannot initialize the registered sliding
+window with its single-wrapper buffer. Target attention, draft window, TP,
+sampling and request budgets stay unchanged; historical E0 commands are not
+rewritten. Preserve the failed initialization take and require GPU revalidation.
+
 Freeze `formal_preview_manifest_v3` with version=3 and original stimuli. Enable
 `formal_preview_v3` only after CI and matched GPU QA. Acceptance stores the exact
 manifest, `trajectory_diagnosis=reviewed` and per-node accepted status. Old v1/v2

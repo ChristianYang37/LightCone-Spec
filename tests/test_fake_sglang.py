@@ -2655,6 +2655,19 @@ def test_eagle3_rejection_sampling_uses_single_branch(tmp_path: Path):
     assert command[steps + 1] == "15"
     assert command[draft_tokens + 1] == "16"
 
+    assert "--speculative-draft-attention-backend" not in command
+    for tp in (1, 2):
+        baseline = replace(job, gpu_count=tp, parameters={**job.parameters, "topology": f"tp{tp}_dp1"})
+        original = server_command(config, baseline, port=30000, output_dir=tmp_path, adaptation=None)
+        preview = replace(baseline, parameters={**baseline.parameters, "preview_revision": 3})
+        fixed = server_command(config, preview, port=30000, output_dir=tmp_path, adaptation=None)
+        at = fixed.index("--speculative-draft-attention-backend")
+        assert fixed[at + 1] == "triton"
+        assert fixed[:at] + fixed[at + 2:] == original
+        assert "--attention-backend" not in fixed  # target engine is unchanged
+        assert fixed[fixed.index("--speculative-draft-window-size") + 1] == "16"
+        assert server_session_key(preview) != server_session_key(baseline)
+
     adaptive = next(
         item
         for item in materialize("E0-tune")

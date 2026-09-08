@@ -476,6 +476,11 @@ def server_command(
     # registered canvas for both native EAGLE3 and the NEXTN alias.
     if job.backend in {"EAGLE3", "NEXTN"}:
         argv.extend(["--speculative-eagle-topk", "1"])
+    if job.parameters.get("preview_revision") == 3 and execution_backend == "EAGLE3":
+        # FlashInfer's multi-step draft backend accepts one kv_indptr wrapper,
+        # but the registered draft sliding window needs two. Triton's draft
+        # backend supports that window; retain target attention and all budgets.
+        argv.extend(["--speculative-draft-attention-backend", "triton"])
     if execution_backend == "DSPARK":
         argv.extend(["--attention-backend", "triton"])
     draft_key = job.parameters.get("draft_key")
