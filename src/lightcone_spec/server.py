@@ -38,6 +38,12 @@ def _qa_retraction_environment(job: Job, environment: dict[str, str]) -> None:
         environment["SGLANG_TEST_RETRACT_INTERVAL"] = str(interval)
 
 
+def _qa_reconstruction_environment(job: Job, environment: dict[str, str]) -> None:
+    if job.parameters.get("excluded_from_analysis") is not True:
+        environment.pop("LIGHTCONE_DFLASH_RECONSTRUCTION_DIR", None)
+        environment.pop("LIGHTCONE_DFLASH_CAPTURE_FROM_ROUND", None)
+
+
 ADAPTIVE_METHODS = {
     "tts",
     "tts_lora_batched",
@@ -789,6 +795,7 @@ class ServerProcess:
         )
         environment = dict(os.environ)
         _qa_retraction_environment(self.job, environment)
+        _qa_reconstruction_environment(self.job, environment)
         # Always override inherited values: old experiments must retain their
         # fixed reservation even when resumed by a coverage-enabled runner.
         environment["LIGHTCONE_MEMORY_BUDGET_POLICY"] = memory_budget_policy(self.job)

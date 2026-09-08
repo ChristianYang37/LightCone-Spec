@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1433 @@
+@@ -0,0 +1,1445 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -517,6 +517,9 @@ index 00000000..20e93274
 +            max_trace_updates=math.ceil(trace_rounds / config.stride) + 2,
 +            max_trace_batch=max_batch,
 +        )
++        from lightcone_spec.dflash_reconstruction_diagnostic import install_reconstruction_capture
++
++        self._reconstruction_capture = install_reconstruction_capture(self)
 +        self.factor_names: tuple[str, ...] = ()
 +        self.factor_shapes: dict[str, tuple[int, int]] = {}
 +        if config.weight_update_mode == "full":
@@ -1344,6 +1347,15 @@ index 00000000..20e93274
 +                        active_logits,
 +                        valid_mask=training_mask,
 +                    )
++                    if self._reconstruction_capture is not None:
++                        self._reconstruction_capture.stage(
++                            source_round=source_round,
++                            source_version=source_version,
++                            draft_hidden=owned_draft,
++                            inference_logits=inference_logits,
++                            replay_logits=active_logits,
++                            valid_mask=training_mask,
++                        )
 +                    loss = self._distillation_loss(
 +                        inference_logits,
 +                        target,

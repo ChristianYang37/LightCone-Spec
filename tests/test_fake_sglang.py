@@ -941,6 +941,7 @@ def test_dflash_microbatch_supervision_matches_loss_gate_and_publication(selecte
     runtime.submit = submit
     adapter = SimpleNamespace(
         request_slots=None, runtime=runtime, optimizer=optimizer, names=("weight",),
+        _reconstruction_capture=None,
         config=SimpleNamespace(adaptation_microbatch_size=1, optimizer=SimpleNamespace(name="sgd")),
         worker=SimpleNamespace(block_size=3), _captured_input=torch.zeros(2, 3, 2),
         _captured_positions=torch.zeros(6), _captured_prefix_lens=torch.tensor([527, 379]),
@@ -3734,6 +3735,68 @@ def test_tp_publication_preserves_rejection_category(tmp_path, failed_gate, fail
     ))
     assert outcomes == [expected, expected]
     assert len(decisions) == 2
+
+
+def test_failed_dflash_capture_is_opt_in_and_retains_rejected_candidate(tmp_path, monkeypatch):
+    from lightcone_spec.dflash_reconstruction_diagnostic import install_reconstruction_capture
+    from lightcone_spec.server import _qa_reconstruction_environment
+
+    inherited = {"LIGHTCONE_DFLASH_RECONSTRUCTION_DIR": str(tmp_path),
+                 "LIGHTCONE_DFLASH_CAPTURE_FROM_ROUND": "10", "UNCHANGED": "1"}
+    _qa_reconstruction_environment(SimpleNamespace(parameters={"excluded_from_analysis": True}),
+                                   inherited)
+    assert len(inherited) == 3
+    _qa_reconstruction_environment(SimpleNamespace(parameters={}), inherited)
+    assert inherited == {"UNCHANGED": "1"}
+
+    monkeypatch.delenv("LIGHTCONE_DFLASH_RECONSTRUCTION_DIR", raising=False)
+    assert install_reconstruction_capture(None) is None
+    monkeypatch.setenv("LIGHTCONE_DFLASH_RECONSTRUCTION_DIR", str(tmp_path))
+    monkeypatch.setenv("LIGHTCONE_DFLASH_CAPTURE_FROM_ROUND", "10")
+    tensor = torch.ones((1, 2))
+    history = tensor.clone()
+    rejected = []
+
+    def reject(trace, **flags):
+        trace.diagnosed = True
+        rejected.append(flags)
+
+    adapter = SimpleNamespace(
+        runtime=SimpleNamespace(active_version=7, _record_invalid_candidate=reject),
+        model=SimpleNamespace(layers=[SimpleNamespace(
+            self_attn=SimpleNamespace(attn=SimpleNamespace(layer_id=0)))]),
+        _captured_history=SimpleNamespace(locations=tensor.long(), valid_mask=tensor.bool()),
+        _captured_request_ids=("request-8",), _captured_input=tensor,
+        _captured_positions=tensor.long(), _captured_prefix_lens=torch.tensor([490]),
+        _gather_history=lambda **_: (history, history),
+        names=("selected.weight",), inference=SimpleNamespace(active=(tensor,)),
+        optimizer=SimpleNamespace(master=(tensor.float(),)), named={"selected.weight": tensor},
+        tp_group=SimpleNamespace(world_size=2),
+    )
+    capture = install_reconstruction_capture(adapter)
+    values = dict(source_version=7, draft_hidden=tensor, inference_logits=tensor,
+                  replay_logits=tensor * 1.1, valid_mask=tensor.bool())
+    capture.stage(source_round=9, **values)
+    assert capture.payload is None
+    capture.stage(source_round=10, **values)
+    assert list(tmp_path.iterdir()) == []  # No I/O or host validity read at stage.
+    history.add_(1)
+    trace = SimpleNamespace(source_round=10, diagnosed=False)
+    flags = dict(finite_ok=True, reconstruction_ok=False, supervision_ok=True)
+    adapter.runtime._record_invalid_candidate(trace, **flags)
+    assert rejected == [flags] and trace.diagnosed
+    paths = list(tmp_path.glob("*.pt"))
+    assert len(paths) == 1
+    evidence = torch.load(paths[0], weights_only=True)
+    assert evidence["flags"] == flags
+    assert evidence["source_version"] == 7
+    torch.testing.assert_close(evidence["history_at_proposal"][0][0], tensor)
+    torch.testing.assert_close(evidence["history_at_boundary"][0][0], tensor * 2)
+    assert evidence["request_ids"] == ["request-8"]
+    assert evidence["measurement_scope"] == "excluded_failed_reconstruction"
+    adapter.runtime._record_invalid_candidate(trace, **flags)
+    assert list(tmp_path.glob("*.pt")) == paths
+    assert capture.payload is None
 
 
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
