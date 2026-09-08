@@ -1721,7 +1721,22 @@ diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglan
  
              attn_logits = torch.empty(
                  (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
-@@ -1761,9 +1788,11 @@
+@@ -1029,7 +1056,13 @@
+                     device=self.device,
+                 )
+             else:
+-                self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
++                # Each speculative query reads at most one registered window,
++                # not the full-context capacity of its parent step buffer.
++                self.cuda_graph_window_kv_indices = torch.zeros(
++                    (max_num_tokens * self.sliding_window_size),
++                    dtype=torch.int64,
++                    device=self.device,
++                )
+ 
+             self.cuda_graph_window_num_kv_splits = torch.full(
+                 (max_num_tokens,),
+@@ -1761,9 +1794,11 @@
          if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
              kv_indptr = self.forward_metadata.window_kv_indptr
              kv_indices = self.forward_metadata.window_kv_indices
@@ -1733,7 +1748,7 @@ diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglan
  
          if layer.k_scale is not None and layer.v_scale is not None:
              k_descale = layer.k_scale_float
-@@ -1808,7 +1837,7 @@
+@@ -1808,7 +1843,7 @@
                  kv_indices,
                  attn_logits,
                  self.forward_metadata.attn_lse,
@@ -1742,7 +1757,7 @@ diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglan
                  self.max_kv_splits,
                  layer.scaling,
                  k_descale,
-@@ -1835,7 +1864,7 @@
+@@ -1835,7 +1870,7 @@
              kv_indices,
              attn_logits,
              self.forward_metadata.attn_lse,
@@ -1751,7 +1766,7 @@ diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglan
              self.max_kv_splits,
              layer.scaling,
              k_descale,
-@@ -1952,12 +1981,18 @@
+@@ -1952,12 +1987,18 @@
              device=self.device,
          )
  
@@ -1770,7 +1785,7 @@ diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglan
              )
              self.attn_backends[i].init_forward_metadata(forward_batch)
  
-@@ -2009,7 +2044,13 @@
+@@ -2009,7 +2050,13 @@
              self.common_template(forward_batch, None, call_fn)
          else:
              bs = forward_batch.batch_size
@@ -1785,7 +1800,7 @@ diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglan
  
              # NOTE: Multi-step's attention backends use the slice of
              # - kv_indptr buffer (cuda graph and non-cuda graph)
-@@ -2026,6 +2067,41 @@
+@@ -2026,6 +2073,41 @@
      def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
          for attn_backend in self.attn_backends:
              attn_backend.init_forward_metadata_in_graph(forward_batch)

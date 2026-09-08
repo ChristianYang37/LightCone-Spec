@@ -4150,6 +4150,8 @@ def test_speculative_window_capture_replay_and_eager_bind_same_metadata():
     assert "step_batch.spec_info, use_cuda_graph=True" in section
     assert "+            self.common_template(forward_batch, None, call_fn)" in section
     assert "+            num_kv_splits = self.forward_metadata.window_num_kv_splits" in section
+    assert "-                self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)" in section
+    assert "+                    (max_num_tokens * self.sliding_window_size)," in section
 
 
 def test_speculative_window_swa_translation_is_once_per_fresh_gather():
