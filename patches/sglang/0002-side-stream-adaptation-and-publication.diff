@@ -1863,7 +1863,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2639 @@
+@@ -0,0 +1,2641 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -3757,13 +3757,15 @@ index 00000000..7b2cb5db
 +        if self.config.topology.tensor_parallel_size * self.config.topology.data_parallel_size > 1:
 +            if not dist.is_available() or not dist.is_initialized():
 +                raise RuntimeError("multi-GPU publication needs an initialized process group")
++            # Reduce each gate independently: a reconstruction-only failure
++            # on any rank must not be mislabeled as a non-finite update.
 +            decision = torch.tensor(
-+                int(finite_ok and reconstruction_ok and supervision_ok),
++                [finite_ok, reconstruction_ok, supervision_ok],
 +                device=self.device,
 +                dtype=torch.int32,
 +            )
 +            dist.all_reduce(decision, op=dist.ReduceOp.MIN)
-+            finite_ok = finite_ok and bool(decision.item())
++            finite_ok, reconstruction_ok, supervision_ok = map(bool, decision.tolist())
 +        if not (finite_ok and reconstruction_ok and supervision_ok):
 +            self._record_invalid_candidate(
 +                self.update_traces[candidate.trace_index],

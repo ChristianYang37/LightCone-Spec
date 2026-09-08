@@ -3674,6 +3674,68 @@ def test_adam_budget_covers_live_functional_working_tensors(tmp_path, monkeypatc
     assert estimate(optimizer, merge_bytes=4096) == estimate(optimizer, merge_bytes=0) + 4096
 
 
+@pytest.mark.parametrize("failed_gate", [0, 1, 2])
+@pytest.mark.parametrize("failing_rank", [0, 1])
+def test_tp_publication_preserves_rejection_category(tmp_path, failed_gate, failing_rank):
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(
+            ["git", "apply", f"--include={relative}", str(patch.resolve())],
+            cwd=tmp_path, check=True, capture_output=True,
+        )
+    source = ast.parse((tmp_path / relative).read_text())
+    boundary = next(
+        method for cls in source.body if isinstance(cls, ast.ClassDef)
+        for method in cls.body
+        if isinstance(method, ast.FunctionDef) and method.name == "boundary"
+        and "host_validity" in ast.unparse(method)
+    )
+    flags = torch.ones((2, 3), dtype=torch.int32)
+    flags[failing_rank, failed_gate] = 0
+    decisions = []
+
+    def reduce_flags(value, op):
+        assert value.shape == (3,)
+        decisions.append(value.clone())
+        value.copy_(flags.min(dim=0).values)
+
+    namespace = {
+        "torch": torch,
+        "dist": SimpleNamespace(
+            is_available=lambda: True, is_initialized=lambda: True,
+            all_reduce=reduce_flags, ReduceOp=SimpleNamespace(MIN="min"),
+        ),
+    }
+    exec(compile(ast.Module([boundary], []), "tp-publication", "exec"), namespace)
+    outcomes = []
+    for rank in range(2):
+        candidate = SimpleNamespace(
+            ready_event=SimpleNamespace(query=lambda: True),
+            intrinsic_ready_round=11, binding=SimpleNamespace(source_round=10),
+            host_validity=flags[rank], trace_index=0,
+            optimizer=SimpleNamespace(commit=lambda *_: pytest.fail("rejected commit")),
+            inference_bank=SimpleNamespace(publish=lambda: pytest.fail("rejected publish")),
+        )
+        runtime = SimpleNamespace(
+            pending=candidate, disabled_reason=None, round=11, device="cpu",
+            active_version=7, update_traces=[SimpleNamespace()],
+            config=SimpleNamespace(
+                method="lightcone", stride=1, extra_logical_delay=0,
+                topology=SimpleNamespace(tensor_parallel_size=2, data_parallel_size=1),
+            ),
+            _binding_valid=lambda _: True,
+            _record_invalid_candidate=lambda trace, **kw: outcomes.append(kw),
+        )
+        assert namespace["boundary"](runtime) is False
+        assert runtime.active_version == 7
+    expected = dict(zip(
+        ("finite_ok", "reconstruction_ok", "supervision_ok"),
+        map(bool, flags.min(dim=0).values.tolist()), strict=True,
+    ))
+    assert outcomes == [expected, expected]
+    assert len(decisions) == 2
+
+
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
     for patch in sorted(Path("patches/sglang").glob("*.diff")):
