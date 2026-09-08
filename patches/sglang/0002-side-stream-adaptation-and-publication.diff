@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1445 @@
+@@ -0,0 +1,1489 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -250,6 +250,55 @@ index 00000000..20e93274
 +    @staticmethod
 +    def backward(ctx, gradient: torch.Tensor):
 +        return gradient, None
++
++
++class _DFlashInferenceAttention(torch.autograd.Function):
++    """Inference-family forward with the mathematical softmax-attention VJP.
++
++    PyTorch's bf16 SDPA and FlashInfer use different reduction paths. At a
++    retained long-update candidate that alone dominated reconstruction error.
++    Do not anchor this operation to saved outputs: recompute from current
++    Q/K/V and the owned visibility mask. FlashInfer has no autograd kernel,
++    so backward recomputes the same attention equation in fp32 (fp64 in
++    numerical tests), including grouped-query accumulation into K/V.
++    """
++
++    @staticmethod
++    def forward(ctx, query, key, value, mask, scale):
++        from flashinfer import single_prefill_with_kv_cache
++
++        ctx.save_for_backward(query, key, value, mask)
++        ctx.scale = scale
++        rows = []
++        for i in range(query.shape[0]):
++            rows.append(single_prefill_with_kv_cache(
++                query[i].transpose(0, 1).contiguous(),
++                key[i].transpose(0, 1).contiguous(),
++                value[i].transpose(0, 1).contiguous(),
++                custom_mask=mask[i, 0].expand(query.shape[2], key.shape[2]).contiguous(),
++                causal=False,
++                kv_layout="NHD",
++                sm_scale=scale,
++                backend="fa2",
++            ).transpose(0, 1))
++        return torch.stack(rows)
++
++    @staticmethod
++    def backward(ctx, gradient):
++        from torch.nn.attention import SDPBackend, sdpa_kernel
++
++        query, key, value, mask = ctx.saved_tensors
++        dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
++        with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
++            leaves = tuple(x.detach().to(dtype).requires_grad_() for x in (query, key, value))
++            output = F.scaled_dot_product_attention(
++                *leaves, attn_mask=mask, dropout_p=0.0, is_causal=False,
++                scale=ctx.scale, enable_gqa=query.shape[1] != key.shape[1],
++            )
++            gradients = torch.autograd.grad(output, leaves, gradient.to(dtype))
++        return (*(g.to(x.dtype) if needed else None for g, x, needed in zip(
++            gradients, (query, key, value), ctx.needs_input_grad[:3], strict=True
++        )), None, None)
 +
 +
 +def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -1009,9 +1058,6 @@ index 00000000..20e93274
 +        )
 +        key = torch.cat((history_key, current_key), dim=1)
 +        value = torch.cat((history_value, current_value), dim=1)
-+        repeat = attention.num_heads // attention.num_kv_heads
-+        key = key.repeat_interleave(repeat, dim=2)
-+        value = value.repeat_interleave(repeat, dim=2)
 +        query = query.transpose(1, 2)
 +        key = key.transpose(1, 2)
 +        value = value.transpose(1, 2)
@@ -1027,14 +1073,12 @@ index 00000000..20e93274
 +            dim=1,
 +        )
 +        attention_mask = visible[:, None, None, :]
-+        attended = F.scaled_dot_product_attention(
++        attended = _DFlashInferenceAttention.apply(
 +            query,
 +            key,
 +            value,
-+            attn_mask=attention_mask,
-+            dropout_p=0.0,
-+            is_causal=False,
-+            scale=attention.scaling,
++            attention_mask,
++            attention.scaling,
 +        )
 +        attended = attended.transpose(1, 2).reshape(*hidden.shape[:2], -1)
 +        o_weight = self._parameter(

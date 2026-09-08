@@ -756,6 +756,50 @@ def _patched_logit_reconstruction_gate():
     return namespace["_logit_reconstruction_gate"]
 
 
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_dflash_inference_attention_vjp_masks_gqa_and_reset(monkeypatch, kv_heads):
+    # CPU oracle exercises the actual custom Function and mask/layout plumbing;
+    # GPU acceptance must separately check the real FlashInfer forward kernel.
+    _, tree = _patched_residual_rms()
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "_DFlashInferenceAttention")
+    namespace = {"torch": torch, "F": torch.nn.functional}
+    exec(compile(ast.Module([cls], []), "attention-test", "exec"), namespace)
+    calls = []
+    def oracle(q, k, v, *, custom_mask, causal, kv_layout, sm_scale, backend):
+        assert not causal and kv_layout == "NHD" and backend == "fa2"
+        calls.append(custom_mask.clone())
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+            attn_mask=custom_mask, scale=sm_scale, enable_gqa=q.shape[1] != k.shape[1],
+        ).transpose(0, 1)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(single_prefill_with_kv_cache=oracle))
+    run = namespace["_DFlashInferenceAttention"].apply
+    gen = torch.Generator().manual_seed(71)
+    q = torch.randn(2, 2, 3, 4, dtype=torch.float64, generator=gen).requires_grad_()
+    k = torch.randn(2, kv_heads, 7, 4, dtype=torch.float64, generator=gen).requires_grad_()
+    v = torch.randn(2, kv_heads, 7, 4, dtype=torch.float64, generator=gen).requires_grad_()
+    mask = torch.tensor([[[[False, True, True, False, True, True, True]]],
+                         [[[True, False, True, True, True, True, True]]]])
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=0.5, enable_gqa=kv_heads != 2)
+    actual = run(q, k, v, mask, 0.5)
+    torch.testing.assert_close(actual, expected)
+    upstream = torch.randn(actual.shape, dtype=torch.float64, generator=gen)
+    a = torch.autograd.grad(actual, (q, k, v), upstream)
+    b = torch.autograd.grad(expected, (q, k, v), upstream)
+    for left, right in zip(a, b, strict=True):
+        torch.testing.assert_close(left, right, rtol=1e-10, atol=1e-10)
+    assert torch.autograd.gradcheck(lambda *x: run(*x, mask, 0.5), (q, k, v), fast_mode=True)
+    first = run(q, k, v, mask, 0.5).detach()
+    changed = run(q, k + 0.1 * torch.randn(k.shape, generator=gen), v, mask, 0.5)
+    assert not torch.equal(first, changed)
+    torch.testing.assert_close(run(q, k, v, mask, 0.5), first, rtol=0, atol=0)
+    assert calls[0].shape == (3, 7) and not calls[0][:, 0].any()
+    # There is no saved production output argument to silently anchor a mismatch.
+    assert len(cls.body[1].args.args) == 6
+
+
 def _patched_residual_rms():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
     added = []
