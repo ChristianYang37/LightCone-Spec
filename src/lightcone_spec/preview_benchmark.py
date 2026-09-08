@@ -153,7 +153,9 @@ def calibrate(rows, environment):
                                        found["static", i, 0][name]) for i in range(12)])
             mean, sd = float(ratios.mean()), float(ratios.std(ddof=1))
             metrics[name] = {"mean_log_ratio": mean, "sample_std": sd,
-                             "upper_bound": mean + critical * sd / math.sqrt(12)}
+                             "upper_bound": mean + critical * sd / math.sqrt(12),
+                             "domain_log_ratios": {d: [float(ratios[i]) for i in range(12)
+                                 if found["static", i, bucket]["domain"] == d] for d in DOMAINS}}
         intervals.append({"bucket": bucket, "metrics": metrics,
                           "trigger": all(m["upper_bound"] < math.log(.95) for m in metrics.values())})
     threshold = next((a["bucket"] * 4096 for a, b in zip(intervals, intervals[1:])
@@ -173,12 +175,12 @@ def cached_gate(calibration, environment):
     return {"threshold": calibration["threshold"], "max_context": 40960}, calibration["status"]
 
 
-def summarize(rows, *, complete=False):
+def summarize(rows, *, complete=False, split="evaluation"):
     if complete:
         checked_rows(rows, "evaluation", MODES)
     groups = defaultdict(list)
     for row in rows:
-        if row.get("status") == "completed" and row["split"] == "evaluation":
+        if row.get("status") == "completed" and row["split"] == split:
             groups[row["mode"], row["domain"], row["bucket"]].append(row)
     tables, scores = [], {}
     for mode in MODES:
@@ -235,14 +237,16 @@ def write_report(directory, rows, provenance, *, complete=False):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     report = {**summarize(rows, complete=complete), "provenance": provenance, "rows": rows}
+    report["calibration_tables"] = [r for r in summarize(rows, split="calibration")["tables"] if r["mode"] == "static"]
     (directory / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False))
     lines = ["# Synthetic context benchmark", "", report["scope"], ""]
-    for mode in MODES:
+    for mode in (*MODES, "calibration_static"):
         for metric in ("throughput", "al"):
             lines.extend([f"## {mode}: {metric}", "", "|Domain|Short→+4K|" + "|".join(f"{j*4}–{(j+1)*4}K" for j in range(1, 10)) + "|",
                           "|---|" + "---|" * 10])
             for domain in DOMAINS:
-                values = [r[metric]["mean"] for r in report["tables"] if r["mode"] == mode and r["domain"] == domain]
+                source = report["calibration_tables"] if mode == "calibration_static" else report["tables"]
+                values = [r[metric]["mean"] for r in source if (mode == "calibration_static" or r["mode"] == mode) and r["domain"] == domain]
                 lines.append(f"|{domain}|" + "|".join("UNMEASURED" if v is None else f"{v:.3f}" for v in values) + "|")
             lines.append("")
     markdown = "\n".join(lines)
