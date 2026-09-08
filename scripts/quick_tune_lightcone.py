@@ -68,8 +68,9 @@ def main():
     if args.candidate_config:
         variants["new"] = ExperimentConfig.load(args.candidate_config)
         old, new = asdict(original), asdict(variants["new"])
-        old["server"].pop("sglang_root")
-        new["server"].pop("sglang_root")
+        for payload in (old, new):
+            payload.pop("sglang_root")
+            payload.pop("source")  # YAML file locations necessarily differ.
         if old != new:
             raise ValueError("A/B may differ only in verified runtime, not scientific configuration")
     with sqlite3.connect(f"file:{original.run_dir / 'state.sqlite'}?mode=ro", uri=True) as db:
@@ -85,7 +86,7 @@ def main():
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     configs = {}
     for variant, config in variants.items():
-        runtime = config.server.sglang_root
+        runtime = config.sglang_root
         configs[variant] = {"path": str(runtime), "marker": (runtime / ".lightcone-spec-patched").read_text().strip()}
     registration = {"version": 1, "phase": args.phase, "stride": args.stride,
                     "code": revision, "runtimes": configs, "window_seconds": 30, "warmup_seconds": 10,
@@ -139,7 +140,7 @@ def main():
                         job = replace(job, job_id=identity, parameters={**job.parameters, "clean_server_per_cell": False})
                         selection = _selection_for_job(state, job)
                         current = replace(variants[variant], results_root=args.output, run_name="excluded")
-                        runtime = str(current.server.sglang_root)
+                        runtime = str(current.sglang_root)
                         if (process is None or runtime != active_runtime
                                 or process.session_key != server_session_key(job, selection)):
                             if process is not None:

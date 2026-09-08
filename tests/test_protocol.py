@@ -54,6 +54,43 @@ from lightcone_spec.server import (
 from lightcone_spec.state import StateStore
 
 
+def test_quick_tuning_real_config_and_cpu_entrypoint(tmp_path, monkeypatch):
+    import importlib
+    import sys
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+    quick = importlib.import_module("quick_tune_lightcone")
+    config = replace(ExperimentConfig.load(Path(__file__).resolve().parents[1] / "examples/paper.yaml"),
+                     results_root=tmp_path / "formal", sglang_root=tmp_path / "runtime")
+    config.sglang_root.mkdir()
+    (config.sglang_root / ".lightcone-spec-patched").write_text("verified-test-marker")
+    StateStore(config.run_dir)
+    monkeypatch.setattr(quick.ExperimentConfig, "load", lambda _: config)
+    monkeypatch.setattr(quick, "qa_manifest", lambda _: ({"prompts": {}}, "test"))
+    template = Job("t", "E3b", 0, "lightcone", "Qwen/Qwen3-8B", "DFLASH", "MATH-500", block=0)
+    monkeypatch.setattr(quick, "preview_jobs", lambda _: [template])
+    monkeypatch.setattr(quick, "load_prompt_pool", lambda _: [])
+    monkeypatch.setattr(quick, "calibration_split", lambda *_: {"Code": {}, "Math": {}})
+    monkeypatch.setattr(sys, "argv", ["quick", "--config", str(config.source), "--output", str(tmp_path / "out"), "--plan-only"])
+    quick.main()
+    record = json.loads((tmp_path / "out/registration.json").read_text())
+    assert record["runtimes"]["old"]["path"] == str(config.sglang_root)
+    assert record["window_seconds"] == 30 and record["warmup_seconds"] == 10
+
+    # A/B configs may have different YAML locations but only the runtime may differ.
+    candidate = replace(config, source=tmp_path / "candidate.yaml", sglang_root=tmp_path / "candidate")
+    candidate.sglang_root.mkdir()
+    (candidate.sglang_root / ".lightcone-spec-patched").write_text("candidate-marker")
+    monkeypatch.setattr(quick.ExperimentConfig, "load", lambda p: candidate if p == candidate.source else config)
+    monkeypatch.setattr(sys, "argv", ["quick", "--config", str(config.source), "--candidate-config", str(candidate.source),
+                                     "--phase", "compare", "--output", str(tmp_path / "compare"), "--plan-only"])
+    quick.main()
+    assert json.loads((tmp_path / "compare/registration.json").read_text())["runtimes"]["new"]["marker"] == "candidate-marker"
+    candidate = replace(candidate, server=replace(candidate.server, requests_per_cell=999))
+    with pytest.raises(ValueError, match="scientific configuration"):
+        quick.main()
+
+
 def test_stride_audit_budget_split_identity_and_formal_isolation():
     from lightcone_spec.stride_audit import (
         audit_job,
