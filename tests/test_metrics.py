@@ -60,6 +60,7 @@ def test_quick_window_counts_cutoff_native_and_event_integrity():
     assert row["decode_window_speed"] == .1
     assert row["per_user_generation_speed"] == 1
     assert row["events"][-1]["inside_window"] is False
+    assert row["events"][-1]["native_timestamps_ns"] is None  # Do not reuse earlier-token stamps.
     with pytest.raises(ValueError, match="duplicate or missing"):
         evidence.observe(event(3, [3, 4, 5, 6], []))
     with pytest.raises(ValueError, match="identity/count"):

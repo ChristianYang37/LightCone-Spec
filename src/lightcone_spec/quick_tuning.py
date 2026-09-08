@@ -63,12 +63,14 @@ class WindowEvidence:
         inside = self.deadline is not None and now <= self.deadline
         if inside:
             row["counted"] += len(new)
+        current_native = None
         if "native_token_timestamp_events" in meta:
-            row["native"] = _native_events(meta, ids)
+            current_native = _native_events(meta, ids)
+            row["native"] = current_native
         # Preserve deltas, not a quadratic copy of every cumulative SSE payload.
         self.events.append({"request_id": rid, "sequence": event["sequence"],
                             "token_ids": list(new), "completion_tokens": len(ids),
-                            "native_timestamps_ns": list(row["native"][-len(new):]) if new and row["native"] is not None else None,
+                            "native_timestamps_ns": list(current_native[-len(new):]) if new and current_native is not None else None,
                             "observed_seconds": now - self.started, "inside_window": inside})
 
     def report(self):
