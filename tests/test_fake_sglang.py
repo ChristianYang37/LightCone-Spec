@@ -3,12 +3,14 @@ import json
 import math
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import accumulate
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -4064,3 +4066,100 @@ def test_excluded_target_state_audit_detects_byte_alias_and_kv_mutation(tmp_path
     with pytest.raises(RuntimeError, match="parameter"):
         audit.after_update(values, 0)
     assert not json.loads((tmp_path / "weight-fail.json").read_text())["target_parameters_unchanged"]
+
+
+def _speculative_window_functions():
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff").read_text()
+    section = patch.split("diff --git a/python/sglang/srt/layers/attention/triton_backend.py", 1)[1]
+    section = section.split("diff --git ", 1)[0]
+    additions = "\n".join(line[1:] for line in section.splitlines()
+                          if line.startswith("+") and not line.startswith("+++"))
+    helper = additions[additions.index("def update_speculative_window_buffer("):]
+    method_hunk = next(hunk for hunk in section.split("@@")
+                       if "+    def _init_speculative_window(" in hunk)
+    method = textwrap.dedent("\n".join(line[1:] for line in method_hunk.splitlines()
+                                      if line.startswith("+")))
+
+    class RaggedGather:
+        def __getitem__(self, grid):
+            def gather(source, rows, lengths, indptr, starts, output, stride):
+                assert stride == source.stride(0)
+                for row in range(grid[0]):
+                    start, length, dest = int(starts[row]), int(lengths[row]), int(indptr[row])
+                    output[dest:dest + length] = source[int(rows[row]), start:start + length]
+            return gather
+
+    namespace = {"torch": torch, "create_flashinfer_kv_indices_triton": RaggedGather()}
+    exec(compile(helper + "\n" + method, "speculative-window-patch", "exec"), namespace)
+    return namespace, section
+
+
+@pytest.mark.parametrize("rows", [[[], [7], list(range(18))], [[31, 91], [31, 92]], []])
+def test_speculative_window_uses_each_branch_tail_and_stable_replay_storage(rows):
+    namespace, _ = _speculative_window_functions()
+    update = namespace["update_speculative_window_buffer"]
+    ptr = torch.tensor([0] + list(accumulate(map(len, rows))), dtype=torch.int32)
+    kv = torch.tensor([value for row in rows for value in row], dtype=torch.int64)
+    original = kv.clone()
+    window_ptr = torch.full((len(rows) + 1,), -1, dtype=torch.int32)
+    eager_ptr, eager_indices, lengths = update(window_ptr, ptr, kv, 16, object())
+    expected = [value for row in rows for value in row[-16:]]
+    assert eager_indices[:len(expected)].tolist() == expected
+    assert lengths.tolist() == [min(16, len(row)) for row in rows]
+    assert eager_ptr.tolist() == [0] + list(accumulate(lengths.tolist()))
+    torch.testing.assert_close(kv, original)
+    # Capture/replay uses fixed storage, but a new step must see new draft slots.
+    buffer = torch.full((len(rows) * 16 + 16,), 999, dtype=torch.int64)
+    address = buffer.data_ptr()
+    for offset in (0, 100, 200):
+        _, replay, _ = update(window_ptr, ptr, kv + offset, 16, object(), buffer)
+        assert replay.data_ptr() == address
+        assert replay[:len(expected)].tolist() == [value + offset for value in expected]
+        assert torch.count_nonzero(replay[len(expected):]) == 0
+    # Shrinking to one row (reset / smaller graph batch) cannot retain stale KV.
+    _, replay, _ = update(window_ptr, torch.tensor([0, 1]), torch.tensor([77]), 16, object(), buffer)
+    assert replay[0] == 77 and torch.count_nonzero(replay[1:]) == 0
+
+
+def test_speculative_window_capture_replay_and_eager_bind_same_metadata():
+    namespace, section = _speculative_window_functions()
+    init = namespace["_init_speculative_window"]
+    backends = []
+    # Independent step buffers also model independent rank-local KV identifiers.
+    for step in range(2):
+        backend = SimpleNamespace(
+            sliding_window_size=2, window_kv_indptr=torch.zeros(3, dtype=torch.int32),
+            cuda_graph_window_kv_indices=torch.zeros(4, dtype=torch.int64),
+            cuda_graph_window_num_kv_splits=torch.ones(2, dtype=torch.int32),
+            token_to_kv_pool=object(), device="cpu",
+            get_num_kv_splits=lambda output, lens: output.copy_(lens.clamp(min=1)),
+        )
+        info = SimpleNamespace(kv_indptr=torch.tensor([0, 3, 4]),
+                               kv_indices=torch.tensor([1, 2, 3, 9]) + 100 * step)
+        eager = init(backend, info)
+        captured = init(backend, info, use_cuda_graph=True)
+        for left, right in zip(eager, captured, strict=True):
+            torch.testing.assert_close(left, right)
+        info.kv_indices += 10
+        init(backend, info, use_cuda_graph=True)
+        assert captured[1][:3].tolist() == [12 + 100 * step, 13 + 100 * step, 19 + 100 * step]
+        backends.append(backend)
+    assert backends[0].cuda_graph_window_kv_indices.data_ptr() != backends[1].cuda_graph_window_kv_indices.data_ptr()
+    assert "self._init_speculative_window(spec_info, use_cuda_graph=True)" in section
+    assert "self._init_speculative_window(spec_info)" in section
+    assert "step_batch.spec_info, use_cuda_graph=True" in section
+    assert "+            self.common_template(forward_batch, None, call_fn)" in section
+    assert "+            num_kv_splits = self.forward_metadata.window_num_kv_splits" in section
+
+
+def test_speculative_window_swa_translation_is_once_per_fresh_gather():
+    namespace, _ = _speculative_window_functions()
+    update = namespace["update_speculative_window_buffer"]
+    pool = SimpleNamespace(translate_loc_from_full_to_swa=lambda values: values * 2)
+    indices = torch.tensor([1, 3, 5])
+    buffer = torch.zeros(4, dtype=torch.int64)
+    for _ in range(2):
+        _, got, _ = update(torch.zeros(2, dtype=torch.int32), torch.tensor([0, 3]),
+                           indices, 2, pool, buffer)
+        assert got.tolist() == [6, 10, 0, 0]
+        assert indices.tolist() == [1, 3, 5]
