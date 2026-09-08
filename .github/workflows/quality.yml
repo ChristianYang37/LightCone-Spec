@@ -21,7 +21,21 @@ jobs:
       - run: pip install -c .github/constraints.txt 'torch==2.11.0+cpu' --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
       - run: pip install -c .github/constraints.txt -e '.[dev]'
       - run: ruff check src tests scripts
-      - run: pytest -q tests/test_protocol.py tests/test_resume.py tests/test_metrics.py tests/test_fake_sglang.py
+      - run: pytest -q --junitxml=/tmp/pytest.xml tests/test_protocol.py tests/test_resume.py tests/test_metrics.py tests/test_fake_sglang.py
+      - name: Expose test failure details in check annotations
+        if: failure()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          path = Path('/tmp/pytest.xml')
+          if path.exists():
+              for case in ET.parse(path).iter('testcase'):
+                  for failure in list(case.findall('failure')) + list(case.findall('error')):
+                      text = (case.attrib['name'] + ': ' + (failure.text or ''))[:10000]
+                      text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                      print('::error title=Pytest failure::' + text)
+          PY
       - run: lightcone-spec --help
       - run: preview-benchmark --help
       - run: python scripts/check_preview_benchmark.py --help
