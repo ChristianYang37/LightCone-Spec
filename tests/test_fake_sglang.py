@@ -4103,13 +4103,15 @@ def test_speculative_window_uses_each_branch_tail_and_stable_replay_storage(rows
     original = kv.clone()
     window_ptr = torch.full((len(rows) + 1,), -1, dtype=torch.int32)
     eager_ptr, eager_indices, lengths = update(window_ptr, ptr, kv, 16, object())
-    expected = [value for row in rows for value in row[-16:]]
+    # Match the extend kernel's q_pos - k_pos <= 16, including the query KV.
+    expected = [value for row in rows for position, value in enumerate(row)
+                if len(row) - 1 - position <= 16]
     assert eager_indices[:len(expected)].tolist() == expected
-    assert lengths.tolist() == [min(16, len(row)) for row in rows]
+    assert lengths.tolist() == [min(17, len(row)) for row in rows]
     assert eager_ptr.tolist() == [0] + list(accumulate(lengths.tolist()))
     torch.testing.assert_close(kv, original)
     # Capture/replay uses fixed storage, but a new step must see new draft slots.
-    buffer = torch.full((len(rows) * 16 + 16,), 999, dtype=torch.int64)
+    buffer = torch.full((len(rows) * 17 + 17,), 999, dtype=torch.int64)
     address = buffer.data_ptr()
     for offset in (0, 100, 200):
         _, replay, _ = update(window_ptr, ptr, kv + offset, 16, object(), buffer)
@@ -4129,7 +4131,7 @@ def test_speculative_window_capture_replay_and_eager_bind_same_metadata():
     for step in range(2):
         backend = SimpleNamespace(
             sliding_window_size=2, window_kv_indptr=torch.zeros(3, dtype=torch.int32),
-            cuda_graph_window_kv_indices=torch.zeros(4, dtype=torch.int64),
+            cuda_graph_window_kv_indices=torch.zeros(6, dtype=torch.int64),
             cuda_graph_window_num_kv_splits=torch.ones(2, dtype=torch.int32),
             token_to_kv_pool=object(), device="cpu",
             get_num_kv_splits=lambda output, lens: output.copy_(lens.clamp(min=1)),
@@ -4142,7 +4144,7 @@ def test_speculative_window_capture_replay_and_eager_bind_same_metadata():
             torch.testing.assert_close(left, right)
         info.kv_indices += 10
         init(backend, info, use_cuda_graph=True)
-        assert captured[1][:3].tolist() == [12 + 100 * step, 13 + 100 * step, 19 + 100 * step]
+        assert captured[1][:4].tolist() == [11 + 100 * step, 12 + 100 * step, 13 + 100 * step, 19 + 100 * step]
         backends.append(backend)
     assert backends[0].cuda_graph_window_kv_indices.data_ptr() != backends[1].cuda_graph_window_kv_indices.data_ptr()
     assert "self._init_speculative_window(spec_info, use_cuda_graph=True)" in section
@@ -4151,7 +4153,10 @@ def test_speculative_window_capture_replay_and_eager_bind_same_metadata():
     assert "+            self.common_template(forward_batch, None, call_fn)" in section
     assert "+            num_kv_splits = self.forward_metadata.window_num_kv_splits" in section
     assert "-                self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)" in section
-    assert "+                    (max_num_tokens * self.sliding_window_size)," in section
+    assert "+                    (max_num_tokens * (self.sliding_window_size + 1))," in section
+    assert "+                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None," in section
+    assert "+                kv_lens, req_pool_indices, bs," in section
+    assert "+            self.cuda_graph_window_kv_offsets[:bs].copy_(offsets)" in section
 
 
 def test_speculative_window_swa_translation_is_once_per_fresh_gather():
@@ -4163,5 +4168,33 @@ def test_speculative_window_swa_translation_is_once_per_fresh_gather():
     for _ in range(2):
         _, got, _ = update(torch.zeros(2, dtype=torch.int32), torch.tensor([0, 3]),
                            indices, 2, pool, buffer)
-        assert got.tolist() == [6, 10, 0, 0]
+        assert got.tolist() == [2, 6, 10, 0]
         assert indices.tolist() == [1, 3, 5]
+
+
+def test_draft_extend_graph_window_uses_prefix_lengths_and_refreshes_offsets():
+    _, section = _speculative_window_functions()
+    hunk = next(h for h in section.split("@@") if "+            # Extend K/V" in h)
+    body = "\n".join(line[1:] for line in hunk.splitlines() if line.startswith("+"))
+    body = body.split("\n    def _init_speculative_window", 1)[0]
+    calls = []
+
+    def update_window(indptr, pool, window, lengths, requests, bs, **kwargs):
+        calls.append((pool, window, lengths.clone(), requests.clone(), bs, kwargs))
+        kept = lengths.clamp(max=window)
+        indptr[1:bs + 1] = kept.cumsum(0)
+        return indptr, kwargs["window_kv_indices"], kept, lengths - kept
+
+    namespace = {"update_sliding_window_buffer": update_window}
+    exec("def update(self, bs, kv_lens, req_pool_indices):\n" + body, namespace)
+    backend = SimpleNamespace(sliding_window_size=16,
+        window_kv_indptr=torch.zeros(3, dtype=torch.int32), req_to_token=object(),
+        token_to_kv_pool=object(), _translate_kv_loc=None,
+        cuda_graph_window_kv_indices=torch.zeros(32, dtype=torch.int64),
+        cuda_graph_window_kv_offsets=torch.full((2,), -1, dtype=torch.int32))
+    for prefix in ([0, 35], [1, 12], [64, 0]):
+        namespace["update"](backend, 2, torch.tensor(prefix), torch.tensor([3, 7]))
+        assert backend.cuda_graph_window_kv_offsets.tolist() == [max(p - 16, 0) for p in prefix]
+        assert calls[-1][2].tolist() == prefix
+        assert calls[-1][-1]["window_kv_indices"] is backend.cuda_graph_window_kv_indices
+        assert calls[-1][-1]["skip_full_to_swa_translation"] is False

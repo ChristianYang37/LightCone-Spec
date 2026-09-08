@@ -148,6 +148,12 @@ capture/replay as well as eager decode. It does not substitute ordinary request
 pool indices, disable windows, or disable CUDA graphs. CPU ragged-buffer tests
 are not GPU acceptance; retain both initialization failures and require a new
 excluded full-condition take on the incremented runtime marker.
+Decode follows the existing prefill inequality `query_pos - key_pos <= W`:
+there are at most W left positions plus the current token (W+1 KV slots).
+Draft-extend instead retains at most W prefix slots because current/extended
+K/V are separate kernel inputs. Both capture and replay must supply non-null
+prefix window metadata, including when the prefix is empty. A passing decode
+capture alone does not establish draft-extend or full-request correctness.
 
 Freeze `formal_preview_manifest_v3` with version=3 and original stimuli. Enable
 `formal_preview_v3` only after CI and matched GPU QA. Acceptance stores the exact
