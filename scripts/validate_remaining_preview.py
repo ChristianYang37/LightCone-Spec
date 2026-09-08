@@ -25,6 +25,23 @@ def remaining_cases(manifest, node):
     return tuple(j for j in preview_jobs(manifest) if j.node == node and j.block == 0)
 
 
+def kv_admission_evidence(error, server_log, registered_context):
+    """Only a log-proven KV limit, not a model/context configuration error."""
+    match = re.search(r"Input length \((\d+) tokens\) exceeds the maximum allowed length \((\d+) tokens\)", error)
+    pools = re.findall(r"KV Cache is allocated\.[^\n]*#tokens: (\d+)", server_log)
+    contexts = re.findall(r"\bcontext_len=(\d+)", server_log)
+    if not match or not pools or not contexts or not registered_context:
+        return None
+    requested, allowed = map(int, match.groups())
+    pool = min(map(int, pools))
+    if not (allowed <= pool < requested <= registered_context <= int(contexts[-1])):
+        return None
+    if any(word in error for word in ("reconstruction", "nonfinite", "NCCL", "connection")):
+        return None
+    return {"input_tokens": requested, "allowed_input_tokens": allowed,
+            "kv_pool_tokens": pool, "registered_context": registered_context}
+
+
 def review_case(metrics, requests, job):
     ranks = metrics.get("rank_local_after", [])
     if len(ranks) != job.gpu_count:
@@ -107,7 +124,10 @@ def main():
             _execute_cell(config, state, job, gpus=gpus, selection=selection, server=process)
         directory = state.completed_attempt_dir(job.job_id)
         if directory is None:
-            raise RuntimeError("QA did not complete; inspect retained attempt")
+            with state.connect() as db:
+                failed = db.execute("SELECT error FROM attempts WHERE job_id=? ORDER BY attempt DESC LIMIT 1",
+                                    (job.job_id,)).fetchone()
+            raise RuntimeError(f"QA did not complete: {failed[0] if failed else 'no attempt'}")
         metrics = json.loads((directory / "metrics.json").read_text())
         with gzip.open(directory / "requests.jsonl.gz", "rt") as stream:
             requests = [json.loads(line) for line in stream if line.strip()]
@@ -127,11 +147,14 @@ def main():
         # Only explicit allocator/KV admission failures authorize trying TP2.
         # Budget-estimator overflow, safety or arbitrary startup errors never do.
         message = str(error)
-        if re.search(r"CUDA out of memory|torch\.OutOfMemoryError|leave no GPU memory for the KV cache", message):
+        log_path = server_dir / "server.log"
+        admission = kv_admission_evidence(message, log_path.read_text(errors="replace") if log_path.exists() else "", source.context)
+        if admission or re.search(r"CUDA out of memory|torch\.OutOfMemoryError|leave no GPU memory for the KV cache", message):
             (args.output / "result.json").write_text(json.dumps({
                 "status": "capacity_infeasible", "correct": False, "job": source.to_dict(),
                 "tp": source.gpu_count, "formal_acceptance": False,
-                "case": f"{source.backend}:{source.method}:{source.load}", "error": message}, indent=2))
+                "case": f"{source.backend}:{source.method}:{source.load}", "error": message,
+                "kv_admission_evidence": admission}, indent=2))
             return
         raise
 

@@ -54,6 +54,37 @@ from lightcone_spec.server import (
 from lightcone_spec.state import StateStore
 
 
+def test_stride_audit_budget_split_identity_and_formal_isolation():
+    from lightcone_spec.stride_audit import (
+        audit_job,
+        calibration_split,
+        refinement_candidates,
+        stage_jobs,
+    )
+
+    records = [{"problem_id": f"{source}-{i}", "source": source, "prompt": f"{source} question {i}"}
+               for source in ("APPS", "OpenR1-Math") for i in range(15)]
+    split = calibration_split(records, records[:1])
+    assert split == calibration_split(list(reversed(records)), records[:1])
+    for domain in split.values():
+        assert len(domain["search"]) == 4 and len(domain["confirmation"]) == 8
+        assert not {r["problem_id"] for r in domain["search"]} & {r["problem_id"] for r in domain["confirmation"]}
+    template = Job("t", "E3b", 0, "lightcone", "Qwen/Qwen3-8B", "DFLASH", "MATH-500",
+                   parameters={"panel": "preview_v1", "preview_revision": 3, "frozen_recipe": {"stride": 1},
+                               "generation_tokens": 32768, "respect_eos": True})
+    coarse = stage_jobs(template, split, phase="coarse", implementation="test")
+    assert len(coarse) == 20 and len({j.job_id for j in coarse}) == 20
+    assert len(stage_jobs(template, split, phase="refine", implementation="test", strides=(2, 8))) == 8
+    assert len(stage_jobs(template, split, phase="confirmation", implementation="test", strides=(10,))) == 16
+    assert refinement_candidates(32) == (16,)
+    assert all(j.gpu_count == 2 and j.load == "c1" and j.parameters["generation_tokens"] == 32768 for j in coarse)
+    audit = audit_job(template, split, phase="baseline", domain="Code", method="lightcone",
+                      stride=32, block=0, implementation="test")
+    assert not uses_formal_adaptation_stride(audit)
+    assert uses_formal_adaptation_stride(replace(audit, parameters={**audit.parameters, "excluded_from_analysis": False}))
+    assert template.parameters["frozen_recipe"]["stride"] == 1
+
+
 def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     from collections import Counter
 

@@ -295,6 +295,8 @@ def uses_formal_adaptation_stride(job: Job) -> bool:
         and job.parameters.get("workload") not in EXPLORATORY_STRIDE_WORKLOADS
         and not (job.parameters.get("panel") == "preview_v1"
                  and job.parameters.get("preview_revision") == 3)
+        and not (job.parameters.get("stride_audit_v1")
+                 and job.parameters.get("excluded_from_analysis"))
     )
 
 

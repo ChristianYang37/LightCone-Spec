@@ -33,6 +33,106 @@ from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
 
 
+def test_timing_union_does_not_sum_nested_streams_or_ranks(tmp_path):
+    from lightcone_spec.timing_audit import overlap_ms, summarize_timing, write_timing_report
+
+    assert overlap_ms([(0, 10), (2, 8)], [(5, 15)]) == 5
+    snapshots = []
+    for rank in (0, 1):
+        snapshots.append({"rank": rank, "valid": True, "dropped_records": 0, "pending_events": 0,
+            "records": [{"name": name, "rank": rank, "clock": "cuda", "lane": lane,
+                         "start_ms": start, "end_ms": end}
+                        for name, lane, start, end in (("forward", "main", 0, 10),
+                            ("nested", "main", 2, 8), ("train<script>", "side", 5, 15))]})
+    report = summarize_timing(snapshots, expected_ranks=(0, 1), wall_seconds=.02, tokens=100)
+    assert [r["main_interval_union_ms"] for r in report["rank_reports"]] == [10, 10]
+    assert [r["event_interval_overlap_ms"] for r in report["rank_reports"]] == [5, 5]
+    assert report["main_blocked_ms"] is None and report["unattributed_wall_ms"] is None
+    write_timing_report(report, tmp_path)
+    assert "train&lt;script&gt;" in (tmp_path / "index.html").read_text()
+    with pytest.raises(ValueError, match="exactly once"):
+        summarize_timing(snapshots[:1], expected_ranks=(0, 1))
+    snapshots[0]["dropped_records"] = 1
+    with pytest.raises(ValueError, match="incomplete"):
+        summarize_timing(snapshots, expected_ranks=(0, 1))
+
+
+def test_timing_queue_never_waits_inside_round_and_nested_overflow_is_visible():
+    from types import SimpleNamespace
+
+    from lightcone_spec.timing_audit import TimingRecorder
+
+    class Event:
+        counter = 0
+        waits = 0
+
+        def __init__(self, **kwargs):
+            self.ready = False
+
+        def record(self):
+            Event.counter += 1
+            self.timestamp = Event.counter
+
+        def query(self):
+            return self.ready
+
+        def synchronize(self):
+            Event.waits += 1
+            self.ready = True
+
+        def elapsed_time(self, other):
+            return other.timestamp - self.timestamp
+
+    cuda = SimpleNamespace(Event=Event, current_stream=lambda: SimpleNamespace(cuda_stream=1))
+    recorder = TimingRecorder(cuda=cuda, max_pending=1)
+    with recorder.span("outer", gpu=True):
+        with recorder.span("inner", gpu=True):
+            assert Event.waits == 0
+    assert Event.waits == 0 and recorder.dropped == 1
+    with recorder.span("request_reset"):
+        pass
+    snapshot = recorder.snapshot()
+    assert Event.waits == 1 and not snapshot["valid"]
+    assert snapshot["pending_high_water"] == 1
+    assert {r["name"] for r in snapshot["records"]} == {"outer", "inner", "request_reset"}
+
+
+def test_timing_boundary_retains_rank_evidence_without_profiling(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import lightcone_spec.timing_diagnostic as diagnostic
+
+    monkeypatch.setattr(diagnostic, "_settings", {"mode": "off", "output_directory": str(tmp_path)})
+    monkeypatch.setattr(diagnostic, "_recorder", None)
+    monkeypatch.setattr(diagnostic, "_window", None)
+    monkeypatch.setattr(diagnostic, "_installed", set())
+    monkeypatch.setenv("LIGHTCONE_TIMING_AUDIT", json.dumps({"output_directory": str(tmp_path)}))
+
+    class Scheduler:
+        ps = SimpleNamespace(tp_rank=1, tp_size=2)
+
+        def get_internal_state(self):
+            return SimpleNamespace(internal_state={"speed_study_metrics": {"fallbacks": 0}})
+
+    diagnostic._instrument(SimpleNamespace(__name__="sglang.srt.managers.scheduler", Scheduler=Scheduler))
+    scheduler = Scheduler()
+    diagnostic.checkpoint("begin", "cell-1")
+    scheduler.get_internal_state()
+    first = diagnostic._recorder
+    scheduler.get_internal_state()
+    assert first is diagnostic._recorder  # repeated observation cannot reset the cell
+    with first.span("request_reset"):
+        pass
+    diagnostic.checkpoint("end", "cell-1")
+    scheduler.get_internal_state()
+    snapshot = json.loads((tmp_path / "rank-1-timing.json").read_text())
+    assert snapshot["job_id"] == "cell-1" and snapshot["rank"] == 1
+    assert snapshot["records"][0]["name"] == "request_reset"
+    rows = [json.loads(line) for line in (tmp_path / "rank-1-metrics.jsonl").read_text().splitlines()]
+    assert len(rows) == 3 and all(r["tp_rank"] == 1 and r["tp_size"] == 2 for r in rows)
+    assert diagnostic._recorder is None
+
+
 def test_video_native_final_accounting_rejects_loss_duplicates_and_wrong_denominator():
     from copy import deepcopy
 

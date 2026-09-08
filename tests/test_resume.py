@@ -199,6 +199,23 @@ def test_preview_controller_child_failure_and_sigint_preserve_boundary(monkeypat
     assert len(list(tmp_path.glob("interrupted-*.log"))) == 1
 
 
+def test_remaining_qa_kv_admission_requires_pool_and_valid_context(monkeypatch):
+    import runpy
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    classify = runpy.run_path(str(scripts / "validate_remaining_preview.py"))["kv_admission_evidence"]
+    error = "RuntimeError: Input length (40672 tokens) exceeds the maximum allowed length (23440 tokens)."
+    log = "KV Cache is allocated. dtype: torch.bfloat16, #tokens: 23446, K size: 1.61 GB\ncontext_len=40960"
+    assert classify(error, log, 40928)["kv_pool_tokens"] == 23446
+    assert classify(error, "", 40928) is None
+    assert classify(error, log.replace("40960", "23440"), 40928) is None
+    assert classify(error, log.replace("23446", "50000"), 40928) is None
+    assert classify(error, log, 32768) is None
+    assert classify("connection refused", log, 40928) is None
+    assert classify(error + " reconstruction mismatch", log, 40928) is None
+
+
 def test_remaining_qa_candidates_keep_complete_budgets(monkeypatch):
     import runpy
 

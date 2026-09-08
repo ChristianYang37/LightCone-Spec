@@ -266,6 +266,11 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     if uses_formal_adaptation_stride(job):
         chosen["stride"] = FORMAL_ADAPTATION_STRIDE
     stride = int(chosen.get("stride", FORMAL_ADAPTATION_STRIDE))
+    if job.parameters.get("stride_audit_v1"):
+        from .stride_audit import ALL_STRIDES
+        if (not job.parameters.get("excluded_from_analysis") or stride not in ALL_STRIDES
+                or stride != job.parameters.get("stride")):
+            raise ValueError("stride audit requires excluded registered configuration")
     if job.parameters.get("preview_revision") == 3:
         expected_stride = 1 if job.method == "lightcone" else 10
         if stride != expected_stride:

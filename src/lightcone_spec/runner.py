@@ -1855,6 +1855,11 @@ def _execute_cell(
                     cuda_range=profiler in {"nsys", "ncu", "activity_proxy"},
                     activity_proxy=profiler == "activity_proxy",
                 )
+            if os.environ.get("LIGHTCONE_TIMING_AUDIT"):
+                from .timing_diagnostic import checkpoint
+                if not job.parameters.get("excluded_from_analysis"):
+                    raise RuntimeError("unvalidated full timing is restricted to excluded cells")
+                checkpoint("begin", job.job_id)
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
             scheduled: ScheduledRun | None = None
@@ -1984,6 +1989,8 @@ def _execute_cell(
                 client.stop_profile()
             if request_scoped:
                 _wait_request_scope_release(client)
+            if os.environ.get("LIGHTCONE_TIMING_AUDIT"):
+                checkpoint("end", job.job_id)
             after = _speed_metrics(client.server_info(), topology)
             if runtime_job.parameters.get("controlled_pair_baseline"):
                 pair_seed = config.protocol.seed + (job.block or 0)
@@ -1997,7 +2004,7 @@ def _execute_cell(
                     {"policy": "target_only", **result.to_dict()} for result in controlled
                 ]
             request_rows = [_request_metrics(result) for result in results]
-            if runtime_job.parameters.get("preview_revision") == 3:
+            if runtime_job.parameters.get("preview_revision") == 3 or runtime_job.parameters.get("stride_audit_v1"):
                 for row, result in zip(request_rows, results, strict=True):
                     row["output_ids"] = list(result.output_ids)
             measured_user_speed = per_user_generation_speed(request_rows)
@@ -2040,6 +2047,15 @@ def _execute_cell(
                 _write_json(
                     output_dir / "metrics.json",
                     {
+                        **execution_resources,
+                        "rank_local_before": before["rank_local"],
+                        "rank_local_after": after["rank_local"],
+                        "rank_aggregates_before": before["rank_aggregates"],
+                        "rank_aggregates_after": after["rank_aggregates"],
+                        "declared_concurrency": declared_concurrency,
+                        "dispatcher_concurrency": dispatcher_concurrency,
+                        "effective_load": f"c{dispatcher_concurrency}",
+                        "memory_budget_policy": memory_budget_policy(runtime_job),
                         "scientific_outcome": scientific_outcome,
                         "feasible": False,
                         "hard_feasible": False,
