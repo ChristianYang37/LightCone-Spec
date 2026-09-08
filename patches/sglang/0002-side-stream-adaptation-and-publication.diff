@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1602 @@
+@@ -0,0 +1,1614 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -1295,25 +1295,34 @@ index 00000000..20e93274
 +            float(self.model.norm.variance_epsilon),
 +        )
 +
++    def _distillation_targets(self, target_logits, valid_mask):
++        # Owned teacher logits and mask are constant for this update. Keep the
++        # original operations/order, but share their results across objectives.
++        with torch.no_grad():
++            target = target_logits.to(torch.float32)
++            weights = self.config.loss_position_decay ** torch.arange(
++                target.shape[1], device=self.device, dtype=torch.float32
++            )
++            weights = weights[None, :] * valid_mask.to(torch.float32)
++            return torch.softmax(target, dim=-1), torch.log_softmax(target, dim=-1), weights
++
 +    def _distillation_loss(
 +        self,
 +        draft_logits: torch.Tensor,
 +        target_logits: torch.Tensor,
 +        valid_mask: torch.Tensor,
++        *,
++        prepared=None,
 +    ) -> torch.Tensor:
-+        target = target_logits.to(torch.float32)
 +        draft = draft_logits.to(torch.float32)
-+        weights = self.config.loss_position_decay ** torch.arange(
-+            draft.shape[1],
-+            device=self.device,
-+            dtype=torch.float32,
++        probability, target_log_probability, weights = (
++            self._distillation_targets(target_logits, valid_mask)
++            if prepared is None else prepared
 +        )
-+        weights = weights[None, :] * valid_mask.to(torch.float32)
-+        probability = torch.softmax(target, dim=-1)
 +        return (
 +            (
 +                probability
-+                * (torch.log_softmax(target, dim=-1) - torch.log_softmax(draft, dim=-1))
++                * (target_log_probability - torch.log_softmax(draft, dim=-1))
 +            ).sum(-1)
 +            * weights
 +        ).sum() / weights.sum().clamp_min(1.0)
@@ -1512,10 +1521,12 @@ index 00000000..20e93274
 +                            replay_logits=active_logits,
 +                            valid_mask=training_mask,
 +                        )
++                    distillation_targets = self._distillation_targets(target, training_mask)
 +                    loss = self._distillation_loss(
 +                        inference_logits,
 +                        target,
 +                        training_mask,
++                        prepared=distillation_targets,
 +                    )
 +
 +                    def member_feedback(parameters):
@@ -1552,6 +1563,7 @@ index 00000000..20e93274
 +                                draft_logits,
 +                                target,
 +                                training_mask,
++                                prepared=distillation_targets,
 +                            )
 +                            return torch.where(
 +                                reconstruction_ok,

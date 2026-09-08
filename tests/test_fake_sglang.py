@@ -1043,7 +1043,7 @@ def test_dflash_microbatch_supervision_matches_loss_gate_and_publication(selecte
     initial = tuple(value.clone() for value in optimizer.state_tensors)
     masks = []
     submissions = []
-    def loss(logits, target, mask):
+    def loss(logits, target, mask, **kwargs):
         masks.append(mask)
         return (logits.square().sum(-1) * mask).sum()
 
@@ -1092,6 +1092,7 @@ def test_dflash_microbatch_supervision_matches_loss_gate_and_publication(selecte
         _frozen_replay_prefix=lambda values: None,
         _surrogate_hidden=lambda values, *args, **kwargs: values["weight"],
         _full_vocab_logits=lambda logits, size: logits, _distillation_loss=loss,
+        _distillation_targets=lambda target, mask: None,
         inference=SimpleNamespace(stage=lambda values: None),
     )
     owned = torch.tensor([[selected_valid, selected_valid], [True, True]])
@@ -1170,6 +1171,47 @@ def test_dflash_update_local_frozen_prefix_preserves_value_and_gradient(first, n
         assert torch.equal(prefix[1], saved) and not torch.equal(refreshed[1], saved)
     adapter.names = ("norm.weight",)
     assert adapter._frozen_replay_prefix(values) is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("empty", [False, True])
+def test_dflash_update_local_teacher_reuse_preserves_loss_and_gradient(dtype, empty):
+    import types
+
+    _, tree = _patched_residual_rms()
+    adapter_class = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                         and n.name == "DFlashDrafterAdapter")
+    methods = [n for n in adapter_class.body if isinstance(n, ast.FunctionDef)
+               and n.name in {"_distillation_targets", "_distillation_loss"}]
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(methods, []), "patched-teacher-reuse", "exec"), namespace)
+    adapter = SimpleNamespace(device="cpu", config=SimpleNamespace(loss_position_decay=.9))
+    for name in ("_distillation_targets", "_distillation_loss"):
+        setattr(adapter, name, types.MethodType(namespace[name], adapter))
+    torch.manual_seed(12)
+    target = torch.randn(2, 4, 19).to(dtype)
+    draft = torch.randn_like(target).requires_grad_()
+    mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool)
+    if empty:
+        mask.zero_()
+    weights = .9 ** torch.arange(4, dtype=torch.float32)
+    weights = weights[None, :] * mask.float()
+    reference = ((torch.softmax(target.float(), -1) * (
+        torch.log_softmax(target.float(), -1) - torch.log_softmax(draft.float(), -1)
+    )).sum(-1) * weights).sum() / weights.sum().clamp_min(1.)
+    expected = torch.autograd.grad(reference, draft)[0]
+    prepared = adapter._distillation_targets(target, mask)
+    assert not any(value.requires_grad for value in prepared)
+    for payload in (None, prepared):
+        actual = adapter._distillation_loss(draft, target, mask, prepared=payload)
+        gradient = torch.autograd.grad(actual, draft)[0]
+        assert torch.equal(actual, reference)
+        assert torch.equal(gradient, expected)
+    changed = adapter._distillation_targets(target + 1, ~mask)
+    assert not torch.equal(prepared[2], changed[2])  # no cached mask across windows
+    invalid = target.clone()
+    invalid[0, 0, 0] = float("nan")
+    assert not torch.isfinite(adapter._distillation_loss(draft, invalid, mask))
 
 
 def test_logit_reconstruction_replays_published_model_dtype_source():

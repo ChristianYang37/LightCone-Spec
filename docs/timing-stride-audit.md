@@ -15,6 +15,12 @@ opt out when independence is not established. Reconstruction, gradient anchoring
 and publication gates remain unchanged. A separate candidate runtime is compared
 against the baseline with the same S=1 configuration before any acceptance.
 
+The second, separately measured candidate prepares the owned teacher probability,
+log-probability and masked position weights once per update. The original KL
+operations and gradient are preserved; teacher data are not cached across windows.
+Its comparison baseline must be the last retained implementation, not an unrelated
+historical speed. Neither candidate is accepted for formal results by CPU tests.
+
 The approved quick-tuning protocol no longer waits for all 24 long-baseline cells.
 Preserve completed/partial old evidence, stop its supervisor from claiming more
 work, and record an intentional interruption separately from a safety failure.
