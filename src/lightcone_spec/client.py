@@ -12,6 +12,14 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 
 
+class StreamAborted(RuntimeError):
+    """Preserve a server abort cause; ordinary callers still fail closed."""
+
+    def __init__(self, request_id, reason):
+        self.request_id, self.reason = request_id, dict(reason)
+        super().__init__(f"SGLang request aborted: {reason.get('message') or reason}")
+
+
 @dataclass(frozen=True)
 class GenerationResult:
     request_id: str
@@ -279,7 +287,7 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float, obse
         if isinstance(reason, dict) and reason.get("type") == "abort":
             # Abort responses may intentionally contain only the final token.
             # Preserve the server's cause instead of reporting a trajectory gap.
-            raise RuntimeError(f"SGLang request aborted: {reason.get('message') or reason}")
+            raise StreamAborted(meta.get("id"), reason)
         index = chunk.get("index", 0)
         if not isinstance(index, int) or not 0 <= index < count:
             raise RuntimeError("stream response has an invalid batch index")
@@ -367,11 +375,13 @@ class SGLangClient:
             pass
         return False
 
-    def reset(self) -> None:
+    def reset(self, *, timeout_seconds: float | None = None) -> None:
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        cache_timeout = 30 if timeout_seconds is None else min(30, timeout)
         request = urllib.request.Request(
-            f"{self.base_url}/flush_cache?timeout=30", data=b"", method="POST"
+            f"{self.base_url}/flush_cache?timeout={cache_timeout}", data=b"", method="POST"
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             if response.status != 200:
                 raise RuntimeError("SGLang cache reset failed")
 
@@ -506,14 +516,14 @@ class SGLangClient:
             results = _consume_stream(response, request_ids, started, self.stream_observer)
         return results, time.perf_counter() - started
 
-    def abort(self, request_id: str) -> None:
+    def abort(self, request_id: str, *, timeout_seconds: float | None = None) -> None:
         request = urllib.request.Request(
             f"{self.base_url}/abort_request",
             data=json.dumps({"rid": request_id}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds if timeout_seconds is None else timeout_seconds) as response:
             if response.status != 200:
                 raise RuntimeError("SGLang request cancellation failed")
 

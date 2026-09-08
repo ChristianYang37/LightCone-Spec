@@ -1,8 +1,48 @@
 # Timing audit and global stride freeze
 
-Status: instrumentation and excluded harness implemented; GPU validation, optimization
-rounds, and global stride selection are **UNMEASURED**. No formal recipe is changed.
+Status: native-RoPE retained-candidate TP2 forward/gradient QA passed on v66/marker-v48.
+The new bounded-window harness still needs GPU cancellation/reset acceptance;
+optimization rounds and global stride selection are **UNMEASURED**. No formal recipe is changed.
 Preview performance numbers do not propagate into the manuscript.
+
+## Fast feedback supersedes the long-baseline prerequisite
+
+The approved quick-tuning protocol no longer waits for all 24 long-baseline cells.
+Preserve completed/partial old evidence, stop its supervisor from claiming more
+work, and record an intentional interruption separately from a safety failure.
+Do not alter formal results or the first 40 completed preview cells.
+
+`scripts/quick_tune_lightcone.py` has independent baseline/compare/stride phases:
+
+- Same 8B DFlash, TP2, c1 and frozen non-display Code/Math calibration pool.
+  Compatible jobs reuse a server; each warmup and measured window resets state.
+  Incompatible resource/layout or runtime changes restart a separate server session.
+- Ten-second warmup, reset, then thirty seconds from first token. EOS advances
+  the fixed prompt sequence, cycling only within this excluded diagnostic window.
+  All methods use the same prompt/seed sequence; request counts are not repetitions.
+- At cutoff, abort only the known active diagnostic request. Preserve every event,
+  including late arrivals; count only arrivals within the window. Abort, stream exit,
+  pre-reset rank safety, flush and reset validation have a combined ten-second limit.
+  Failure discards that server. A missing first token after sixty seconds fails;
+  it does not silently become a zero-throughput capacity result.
+- Report stream-observed committed tokens / (prefill + window) and / window
+  separately. These include online learning but are not full-request benchmark
+  measurements. Per-user prefix speed requires valid native timestamps; absent
+  evidence stays UNMEASURED. Loading/configuration/warmup/cleanup are separate.
+- First comparison: old/new in two domains, thirty seconds each. Both domains
+  worse than -3% discard immediately; both better than +3% trigger confirmation.
+  Otherwise repeat up to three pairs per domain (ninety seconds per side).
+  A mixed direction or less than 1% aggregate gain retains the old implementation.
+  Comparisons cannot change science parameters or runtime precision.
+- Baseline is six short windows (Static, LC S1, LC S10, two domains). Stride
+  screening is sixteen short windows (seven LC strides and Static, two domains).
+  Short evidence only nominates candidates; it does not freeze a recipe.
+
+Keep at least three documented single-hotspot optimization or exclusion rounds.
+Deep profiling is a separate short diagnostic, never used to rank performance.
+Only retained candidates incur long-request/multi-update/reset/TP regression and
+the original independent confirmation/common-method acceptance. All raw evidence
+is retained; the formal public CLI, YAML and SQLite schemas remain unchanged.
 
 ## Immediate failure repair
 

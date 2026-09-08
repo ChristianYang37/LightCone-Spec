@@ -33,6 +33,62 @@ from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
 
 
+def test_quick_window_counts_cutoff_native_and_event_integrity():
+    from lightcone_spec.quick_tuning import WindowEvidence
+
+    now = [10.]
+    evidence = WindowEvidence(30, clock=lambda: now[0])
+
+    def event(sequence, ids, new, stamps=None):
+        meta = {"id": "r", "completion_tokens": len(ids)}
+        if stamps is not None:
+            meta["native_token_timestamp_events"] = [
+                {"token_index": i, "token_id": token, "committed_ns": stamp}
+                for i, (token, stamp) in enumerate(zip(ids, stamps, strict=True))]
+        return {"request_id": "r", "sequence": sequence, "token_ids": new,
+                "chunk": {"output_ids": ids, "meta_info": meta}}
+
+    now[0] = 12
+    evidence.observe(event(1, [3, 4], [3, 4], [100, 1_000_000_100]))
+    now[0] = 41
+    evidence.observe(event(2, [3, 4, 5], [5], [100, 1_000_000_100, 2_000_000_100]))
+    now[0] = 43
+    evidence.observe(event(3, [3, 4, 5, 6], [6]))
+    row = evidence.report()
+    assert row["observed_committed_tokens"] == 3
+    assert row["window_goodput"] == 3 / 32
+    assert row["decode_window_speed"] == .1
+    assert row["per_user_generation_speed"] == 1
+    assert row["events"][-1]["inside_window"] is False
+    with pytest.raises(ValueError, match="duplicate or missing"):
+        evidence.observe(event(3, [3, 4, 5, 6], []))
+    with pytest.raises(ValueError, match="identity/count"):
+        evidence.observe(event(4, [3, 9], [9]))
+    evidence.requests["r"]["native"] = None
+    assert evidence.report()["per_user_generation_speed"] is None
+
+
+def test_quick_pair_decision_is_bounded_and_not_request_pseudoreplication():
+    from lightcone_spec.quick_tuning import paired_decision
+
+    def rows(gains, repeats):
+        return [{"domain": domain, "repeat": repeat, "variant": variant,
+                 "comparison_key": {"domain": domain, "repeat": repeat, "tp": 2},
+                 "status": "budget_end", "window_goodput": 100 * (1 + gains[domain]) if variant == "new" else 100}
+                for repeat in range(repeats) for domain in ("Code", "Math") for variant in ("old", "new")]
+
+    assert paired_decision(rows({"Code": .05, "Math": .04}, 1))["decision"] == "repeat_promising"
+    assert paired_decision(rows({"Code": -.05, "Math": -.04}, 1))["decision"] == "reject"
+    assert paired_decision(rows({"Code": .02, "Math": .02}, 3))["decision"] == "candidate_for_long_validation"
+    assert paired_decision(rows({"Code": -.001, "Math": .05}, 3))["decision"] == "keep_old"
+    assert paired_decision(rows({"Code": .001, "Math": .001}, 3))["decision"] == "keep_old"
+    assert paired_decision(rows({"Code": .02, "Math": .02}, 1)[:-1])["decision"] == "await_pairs"
+    bad = rows({"Code": .02, "Math": .02}, 1)
+    bad[1]["comparison_key"] = {"tp": 1}
+    with pytest.raises(ValueError, match="mismatched"):
+        paired_decision(bad)
+
+
 def test_timing_union_does_not_sum_nested_streams_or_ranks(tmp_path):
     from lightcone_spec.timing_audit import overlap_ms, summarize_timing, write_timing_report
 

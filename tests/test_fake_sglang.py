@@ -4464,3 +4464,119 @@ def test_draft_extend_graph_window_uses_prefix_lengths_and_refreshes_offsets():
         assert calls[-1][2].tolist() == prefix
         assert calls[-1][-1]["window_kv_indices"] is backend.cuda_graph_window_kv_indices
         assert calls[-1][-1]["skip_full_to_swa_translation"] is False
+def test_quick_stream_budget_abort_and_runtime_error_are_distinct():
+    import threading
+    import time
+
+    import pytest
+
+    from lightcone_spec.client import StreamAborted
+    from lightcone_spec.quick_tuning import WindowEvidence, run_window
+
+    class Fake:
+        stream_observer = None
+
+        def __init__(self, failure=None):
+            self.failure = failure
+            self.cancelled = threading.Event()
+            self.active = False
+            self.resets = 0
+            self.aborts = []
+
+        def run_batch(self, prompts, **kwargs):
+            assert kwargs["ignore_eos"] is False and len(prompts) == 1
+            rid = kwargs["request_ids"][0]
+            self.active = True
+            try:
+                self.stream_observer({"request_id": rid, "sequence": 1, "token_ids": [1, 2],
+                    "chunk": {"output_ids": [1, 2], "meta_info": {"id": rid, "completion_tokens": 2}}})
+                assert self.cancelled.wait(1)
+                if self.failure == "connection":
+                    raise ConnectionError("server connection lost at cutoff")
+                reason = {"type": "abort", "message": "Aborted by AbortReq."}
+                if self.failure == "numerical":
+                    reason["message"] = "non-finite logits"
+                raise StreamAborted(rid, reason)
+            finally:
+                self.active = False
+
+        def abort(self, rid, **kwargs):
+            self.aborts.append(rid)
+            self.cancelled.set()
+
+        def reset(self, deadline):
+            assert not self.active and time.perf_counter() < deadline
+            self.resets += 1
+            return {"idle": True, "reset": True}
+
+    client = Fake()
+    result = run_window(client, ["fixed"], seconds=.025, seed=0, prefix="excluded", reset_and_verify=client.reset)
+    assert result["status"] == "budget_end" and result["observed_committed_tokens"] == 2
+    assert result["outcomes"] == [{"request_id": "excluded-000000", "status": "budget_end"}]
+    assert client.resets == 1 and client.stream_observer is None and not client.active
+    for failure in ("connection", "numerical"):
+        client = Fake(failure)
+        evidence = WindowEvidence(.025)
+        with pytest.raises((ConnectionError, StreamAborted)):
+            run_window(client, ["fixed"], seconds=.025, seed=0, prefix="excluded",
+                       reset_and_verify=client.reset, evidence=evidence)
+        assert evidence.events and client.resets == 0
+
+
+def test_quick_cleanup_deadline_and_signal_cannot_make_success():
+    import threading
+    import time
+
+    import pytest
+
+    from lightcone_spec.quick_tuning import bounded_call, run_window
+
+    with pytest.raises(TimeoutError, match="discard server"):
+        bounded_call(lambda: time.sleep(.1), .005)
+
+    class Fake:
+        stream_observer = None
+
+        def run_batch(self, *args, **kwargs):
+            time.sleep(.1)
+
+        def abort(self, *args, **kwargs):
+            pass
+
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(TimeoutError, match="discard server"):
+        run_window(Fake(), ["fixed"], seconds=.01, seed=0, prefix="test",
+                   reset_and_verify=lambda deadline: None, cleanup_seconds=.005, stop=stop)
+
+
+def test_quick_eos_cycles_fixed_order_and_repeats_start_fresh():
+    import time
+
+    from lightcone_spec.quick_tuning import run_window
+
+    class Fake:
+        stream_observer = None
+
+        def __init__(self):
+            self.calls = []
+
+        def run_batch(self, prompts, **kwargs):
+            rid = kwargs["request_ids"][0]
+            self.calls.append((prompts[0], kwargs["seed"]))
+            self.stream_observer({"request_id": rid, "sequence": 1, "token_ids": [5],
+                "chunk": {"output_ids": [5], "meta_info": {"id": rid, "completion_tokens": 1}}})
+            time.sleep(.003)
+
+        def abort(self, *args, **kwargs):
+            pass  # Natural EOS raced the diagnostic cutoff; no error was hidden.
+
+    client = Fake()
+    for iteration in range(2):
+        client.calls.clear()
+        row = run_window(client, ["a", "b"], seconds=.02, seed=7,
+                         prefix=f"run-{iteration}", reset_and_verify=lambda _: {"reset": True})
+        assert client.calls[:3] == [("a", 7), ("b", 8), ("a", 9)]
+        assert row["request_count"] == len(client.calls)
+        assert row["events"][0]["sequence"] == 1
+        assert all(r["request_id"].startswith(f"run-{iteration}-") for r in row["outcomes"])
