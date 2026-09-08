@@ -106,5 +106,8 @@ class FailedReconstructionCapture:
         path = self.directory / f"candidate-{trace.source_round}-pid{os.getpid()}.pt"
         with path.open("xb") as stream:
             torch.save(cpu(payload), stream)
+        # A bounded diagnostic supervisor must not mistake a partial torch.save
+        # file for a completed snapshot and terminate its writer.
+        path.with_suffix(".complete").touch(exist_ok=False)
         self.saved = True
         self.payload = None

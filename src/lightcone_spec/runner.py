@@ -2450,14 +2450,8 @@ def _execute_cell(
             _write_json(
                 output_dir / "metrics.json",
                 {
+                    **_scientific_rejection(metrics, offered, error),
                     "status": "failed",
-                    "error": str(error),
-                    "request_outcomes": {
-                        "offered": offered,
-                        "completed": 0,
-                        "error": int(offered > 0),
-                        "unfinished": max(0, offered - 1),
-                    },
                 },
             )
             return

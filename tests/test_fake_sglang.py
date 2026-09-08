@@ -3880,6 +3880,7 @@ def test_failed_dflash_capture_is_opt_in_and_retains_rejected_candidate(tmp_path
     assert rejected == [flags] and trace.diagnosed
     paths = list(tmp_path.glob("*.pt"))
     assert len(paths) == 1
+    assert paths[0].with_suffix(".complete").is_file()
     evidence = torch.load(paths[0], weights_only=True)
     assert evidence["flags"] == flags
     assert evidence["source_version"] == 7

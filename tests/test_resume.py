@@ -61,6 +61,36 @@ from lightcone_spec.runner import (
 from lightcone_spec.state import StateStore
 
 
+def test_failed_safety_keeps_completed_request_and_rank_evidence():
+    from lightcone_spec.runner import _scientific_rejection
+
+    metrics = {"request_outcomes": {"offered": 4, "completed": 4, "error": 0},
+               "rank_local_after": [{"fallbacks": 1}, {"fallbacks": 1}], "committed_tokens": 35431}
+    result = _scientific_rejection(metrics, 4, ScientificFailure("fallbacks=1"))
+    assert result["request_outcomes"] == metrics["request_outcomes"]
+    assert result["rank_local_after"] == metrics["rank_local_after"]
+    assert result["committed_tokens"] == 35431 and result["hard_feasible"] is False
+    assert "error" not in metrics
+
+
+def test_stride_capture_preserves_frozen_scientific_configuration(monkeypatch):
+    import runpy
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    capture = runpy.run_path(str(scripts / "capture_stride_rejection.py"))["capture_job"]
+    source = Job("audit", "Stride-audit-v1", 0, "lightcone", "Qwen/Qwen3-8B", "DFLASH", "Code",
+                 gpu_count=2, block=0, parameters={"stride_audit_v1": True, "stride": 1,
+                     "frozen_recipe": {"lr": .001}, "execution_request_count": 4, "generation_tokens": 32768,
+                     "preview_prompt_records": [{"problem_id": "p", "prompt": "frozen"}]})
+    job = capture(source)
+    assert job.job_id != source.job_id and job.gpu_count == source.gpu_count
+    assert all(job.parameters[k] == v for k, v in source.parameters.items())
+    assert job.parameters["excluded_from_analysis"] and job.parameters["replays_job_id"] == source.job_id
+    with pytest.raises(ValueError):
+        capture(replace(source, gpu_count=1))
+
+
 def _continuation_manifest():
     from lightcone_spec.preview import QWEN38_CHECKPOINTS
     records = [{"prompt": str(i), "problem_id": str(i)} for i in range(32)]
