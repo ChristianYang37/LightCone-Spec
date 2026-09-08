@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1489 @@
+@@ -0,0 +1,1519 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -301,21 +301,58 @@ index 00000000..20e93274
 +        )), None, None)
 +
 +
-+def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
-+    """Match SGLang RMSNorm's fp32 reduction and affine arithmetic.
++class _DFlashInferenceRMS(torch.autograd.Function):
++    """Use inference normalization kernels, with the RMS equation's VJP.
 +
-+    Casting the reciprocal RMS to bf16 before the affine multiply introduces
-+    a systematic error that is amplified by the frozen LM head.  Keep the
-+    entire normalization in fp32 and cast only the final activation, matching
-+    ``RMSNorm.forward_native`` and the non-residual CUDA kernel behavior.
++    An eager fp32 reduction is not numerically identical to the CUDA fused
++    reduction: retained long-update candidates amplify its bf16 differences.
++    Recompute from current inputs/weights, never substitute saved activations.
++    Clone the residual-kernel arguments because the native kernel is in-place;
++    the original tensors are needed by autograd and must remain immutable.
 +    """
-+    variance = hidden.to(torch.float32).square().mean(-1, keepdim=True)
-+    normalized = (
-+        hidden.to(torch.float32)
-+        * torch.rsqrt(variance + epsilon)
-+        * weight.to(torch.float32)
-+    )
-+    return normalized.to(hidden.dtype)
++
++    @staticmethod
++    def forward(ctx, hidden, weight, epsilon, residual):
++        from sgl_kernel import fused_add_rmsnorm, rmsnorm
++
++        ctx.epsilon = epsilon
++        ctx.has_residual = residual is not None
++        ctx.set_materialize_grads(False)
++        ctx.save_for_backward(hidden, weight, *(() if residual is None else (residual,)))
++        flat = hidden.reshape(-1, hidden.shape[-1]).contiguous()
++        if residual is None:
++            return rmsnorm(flat, weight, epsilon).reshape_as(hidden), None
++        output = flat.clone()
++        stored = residual.reshape_as(flat).contiguous().clone()
++        fused_add_rmsnorm(output, stored, weight, epsilon)
++        return output.reshape_as(hidden), stored.reshape_as(residual)
++
++    @staticmethod
++    def backward(ctx, output_gradient, residual_gradient):
++        saved = ctx.saved_tensors
++        dtype = torch.float64 if saved[0].dtype == torch.float64 else torch.float32
++        with torch.enable_grad():
++            leaves = tuple(x.detach().to(dtype).requires_grad_() for x in saved)
++            hidden, weight = leaves[:2]
++            summed = hidden + leaves[2] if ctx.has_residual else hidden
++            inverse = torch.rsqrt(summed.square().mean(-1, keepdim=True) + ctx.epsilon)
++            normalized = (summed * inverse * weight).to(saved[0].dtype)
++            outputs, gradients = [], []
++            if output_gradient is not None:
++                outputs.append(normalized)
++                gradients.append(output_gradient)
++            if ctx.has_residual and residual_gradient is not None:
++                outputs.append(summed.to(saved[2].dtype))
++                gradients.append(residual_gradient)
++            vjp = torch.autograd.grad(outputs, leaves, gradients, allow_unused=True)
++        needed = ctx.needs_input_grad[:2] + (ctx.needs_input_grad[3:4] if ctx.has_residual else ())
++        converted = tuple(None if g is None or not required else g.to(x.dtype)
++            for g, x, required in zip(vjp, saved, needed, strict=True))
++        return converted[0], converted[1], None, converted[2] if ctx.has_residual else None
++
++
++def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
++    return _DFlashInferenceRMS.apply(hidden, weight, epsilon, None)[0]
 +
 +
 +def _residual_rms(
@@ -324,14 +361,7 @@ index 00000000..20e93274
 +    weight: torch.Tensor,
 +    epsilon: float,
 +) -> tuple[torch.Tensor, torch.Tensor]:
-+    """Replay fused add/RMSNorm without rounding its normalization input.
-+
-+    FlashInfer normalizes the fp32 sum and separately stores a model-dtype
-+    residual. Rounding that sum before RMSNorm changes the replay operator.
-+    """
-+    summed = hidden.to(torch.float32) + residual.to(torch.float32)
-+    output = _rms(summed, weight, epsilon).to(hidden.dtype)
-+    return output, summed.to(residual.dtype)
++    return _DFlashInferenceRMS.apply(hidden, weight, epsilon, residual)
 +
 +
 +def _linear(

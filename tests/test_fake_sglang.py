@@ -812,15 +812,40 @@ def _patched_residual_rms():
     tree = ast.parse("\n".join(added))
     functions = [
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"_rms", "_residual_rms"}
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+        and node.name in {"_rms", "_residual_rms", "_DFlashInferenceRMS"}
     ]
     namespace = {"torch": torch}
     exec(compile(ast.Module(functions, []), str(patch), "exec"), namespace)
     return namespace["_residual_rms"], tree
 
 
+@pytest.fixture
+def native_rms_oracle(monkeypatch):
+    # CPU equation oracle tests autograd/plumbing, not CUDA-kernel parity.
+    calls = []
+    def equation(x, weight, epsilon, residual=None):
+        dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        summed = x.to(dtype) if residual is None else x.to(dtype) + residual.to(dtype)
+        return (summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + epsilon)
+                * weight.to(dtype)).to(x.dtype), summed.to(x.dtype)
+    def rmsnorm(x, weight, epsilon):
+        calls.append("rms")
+        assert x.ndim == 2 and x.is_contiguous()
+        return equation(x, weight, epsilon)[0]
+    def fused_add_rmsnorm(x, residual, weight, epsilon):
+        calls.append("residual")
+        assert x.ndim == 2 and x.is_contiguous() and residual.is_contiguous()
+        output, stored = equation(x, weight, epsilon, residual)
+        x.copy_(output)
+        residual.copy_(stored)
+    monkeypatch.setitem(sys.modules, "sgl_kernel", SimpleNamespace(
+        rmsnorm=rmsnorm, fused_add_rmsnorm=fused_add_rmsnorm))
+    return calls
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_residual_rms_preserves_fused_fp32_sum_and_gradients(dtype):
+def test_residual_rms_preserves_fused_fp32_sum_and_gradients(dtype, native_rms_oracle):
     replay, tree = _patched_residual_rms()
     generator = torch.Generator().manual_seed(0)
     hidden = torch.randn(16, 128, generator=generator).to(dtype).requires_grad_()
@@ -855,7 +880,7 @@ def test_residual_rms_preserves_fused_fp32_sum_and_gradients(dtype):
         assert len(calls) == expected_calls
 
 
-def test_residual_rms_repeated_weight_changes_and_fresh_request():
+def test_residual_rms_repeated_weight_changes_and_fresh_request(native_rms_oracle):
     replay, _ = _patched_residual_rms()
     generator = torch.Generator().manual_seed(42)
     hidden = torch.randn(4, 64, generator=generator).bfloat16()
@@ -871,6 +896,30 @@ def test_residual_rms_repeated_weight_changes_and_fresh_request():
         assert torch.equal(stored, summed.bfloat16())
     reset = replay(hidden, residual, initial.bfloat16(), 1e-6)
     assert all(torch.equal(x, y) for x, y in zip(first, reset, strict=True))
+
+
+def test_native_rms_vjp_both_outputs_noncontiguous_inputs_and_no_mutation(native_rms_oracle):
+    residual_rms, tree = _patched_residual_rms()
+    definitions = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+                   and n.name in {"_DFlashInferenceRMS", "_rms"}]
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(definitions, []), "native-rms-test", "exec"), namespace)
+    rms = namespace["_rms"]
+    gen = torch.Generator().manual_seed(1935)
+    h = torch.randn(2, 3, 8, generator=gen, dtype=torch.float64).transpose(0, 1).requires_grad_()
+    r = torch.randn(h.shape, generator=gen, dtype=torch.float64).requires_grad_()
+    w = torch.randn(8, generator=gen, dtype=torch.float64).requires_grad_()
+    original = tuple(x.detach().clone() for x in (h, r, w))
+    assert torch.autograd.gradcheck(lambda x, y: rms(x, y, 1e-6), (h, w), fast_mode=True)
+    assert torch.autograd.gradcheck(lambda x, y, z: residual_rms(x, y, z, 1e-6),
+                                   (h, r, w), fast_mode=True)
+    # The stored residual is an independently consumed output; no weight VJP.
+    stored = residual_rms(h, r, w, 1e-6)[1]
+    gradients = torch.autograd.grad(stored.sum(), (h, r, w), allow_unused=True)
+    assert torch.equal(gradients[0], torch.ones_like(h))
+    assert torch.equal(gradients[1], torch.ones_like(r)) and gradients[2] is None
+    assert all(torch.equal(x, old) for x, old in zip((h, r, w), original, strict=True))
+    assert "rms" in native_rms_oracle and "residual" in native_rms_oracle
 
 
 def test_logit_reconstruction_ignores_only_masked_canvas_positions():
