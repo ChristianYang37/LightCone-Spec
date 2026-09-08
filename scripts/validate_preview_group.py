@@ -28,6 +28,22 @@ CASES = {
 }
 
 
+def qa_manifest(selections):
+    """An excluded candidate may precede formal v3 freezing; never write it back."""
+    if "formal_preview_manifest_v3" in selections:
+        manifest = deepcopy(selections["formal_preview_manifest_v3"])
+        if manifest.get("version") != 3:
+            raise ValueError("invalid formal v3 manifest; no legacy fallback")
+        return manifest, "formal_preview_manifest_v3"
+    source = selections.get("formal_preview_manifest_v1")
+    if not isinstance(source, dict) or source.get("version") not in (1, 2):
+        raise ValueError("missing frozen preview input manifest")
+    candidate = deepcopy(source)
+    candidate["version"] = 3
+    candidate.pop("tts_recipe", None)
+    return candidate, "excluded_candidate_from_formal_preview_manifest_v1"
+
+
 def full_condition_job(manifest, task, case, tp):
     """Clone a block-0 row, changing only topology and excluded provenance."""
     if manifest.get("version") != 3 or task not in ("MATH-500", "LiveCodeBench"):
@@ -110,7 +126,7 @@ def main():
     with sqlite3.connect(f"file:{original.run_dir / 'state.sqlite'}?mode=ro", uri=True) as source:
         selections = {name: json.loads(value) for name, value in
                       source.execute("SELECT name,value_json FROM selections")}
-    manifest = selections["formal_preview_manifest_v3"]
+    manifest, provenance = qa_manifest(selections)
     job = full_condition_job(manifest, args.task, args.case, args.tp)
     args.output.mkdir(parents=True, exist_ok=False)
     config = replace(original, results_root=args.output, run_name="excluded")
@@ -119,6 +135,9 @@ def main():
         state.set_selection(name, value)
     state.add_internal_jobs((job,))
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (args.output / "manifest-provenance.json").write_text(json.dumps({
+        "source": provenance, "formal_manifest_written": False,
+        "scope": "excluded 8B candidate; topology is tested, not frozen by this script"}, indent=2))
     (args.output / "qa-job.json").write_text(json.dumps(job.to_dict(), indent=2))
     gpus = original.gpu_ids[:args.tp]
     server_dir = args.output / "server"

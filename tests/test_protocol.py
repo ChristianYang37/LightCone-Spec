@@ -204,6 +204,14 @@ def test_preview_v3_exact_96_isolates_recipes_and_all_baselines(monkeypatch):
     scripts = Path(__file__).resolve().parents[1] / "scripts"
     monkeypatch.syspath_prepend(str(scripts))
     qa = runpy.run_path(str(scripts / "validate_preview_group.py"))
+    candidate, source_name = qa["qa_manifest"]({"formal_preview_manifest_v1": {**manifest, "version": 1}})
+    assert candidate == manifest and source_name.startswith("excluded_candidate")
+    assert qa["qa_manifest"]({"formal_preview_manifest_v3": manifest}) == (manifest, "formal_preview_manifest_v3")
+    with pytest.raises(ValueError, match="no legacy fallback"):
+        qa["qa_manifest"]({"formal_preview_manifest_v3": {"version": 2},
+                           "formal_preview_manifest_v1": {**manifest, "version": 1}})
+    with pytest.raises(ValueError, match="missing frozen"):
+        qa["qa_manifest"]({})
     for tp in (1, 2):
         for task in ("MATH-500", "LiveCodeBench"):
             rows = [qa["full_condition_job"](manifest, task, case, tp) for case in qa["CASES"]]

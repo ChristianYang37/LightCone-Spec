@@ -130,6 +130,12 @@ any rank's safety error fails the check. Passing one case writes no formal
 acceptance and does not replace the original trajectory diagnosis. No benchmark
 gain may be inferred from these excluded runs.
 
+If formal v3 freezing has not yet occurred, this QA explicitly constructs an
+excluded v3 candidate from the frozen legacy inputs and records its provenance.
+It does not write that candidate back to the formal database, authorize legacy
+TTS jobs, or freeze the tested TP. An existing malformed v3 manifest still fails
+closed instead of falling back. The 27B manifest remains a separate prerequisite.
+
 Freeze `formal_preview_manifest_v3` with version=3 and original stimuli. Enable
 `formal_preview_v3` only after CI and matched GPU QA. Acceptance stores the exact
 manifest, `trajectory_diagnosis=reviewed` and per-node accepted status. Old v1/v2
