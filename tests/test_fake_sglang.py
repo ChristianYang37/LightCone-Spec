@@ -1089,7 +1089,8 @@ def test_dflash_microbatch_supervision_matches_loss_gate_and_publication(selecte
         _captured_history=SimpleNamespace(locations=torch.zeros(2), valid_mask=torch.ones(2)),
         _active_inference_parameters=lambda: {"weight": optimizer.master[0] + (8 if mismatch else 0)},
         _effective_parameters=lambda parameters: {"weight": parameters[0]},
-        _surrogate_hidden=lambda values, *args: values["weight"],
+        _frozen_replay_prefix=lambda values: None,
+        _surrogate_hidden=lambda values, *args, **kwargs: values["weight"],
         _full_vocab_logits=lambda logits, size: logits, _distillation_loss=loss,
         inference=SimpleNamespace(stage=lambda values: None),
     )
@@ -1115,6 +1116,60 @@ def test_dflash_microbatch_supervision_matches_loss_gate_and_publication(selecte
         else:
             assert runtime.disabled_reason == "logit_reconstruction_mismatch"
             assert runtime.counters["fallbacks"] == 1
+
+
+@pytest.mark.parametrize("first", [0, 1, 4])
+def test_dflash_update_local_frozen_prefix_preserves_value_and_gradient(first, native_rms_oracle):
+    import types
+
+    rms, tree = _patched_residual_rms()
+    adapter_class = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                         and n.name == "DFlashDrafterAdapter")
+    methods = [n for n in adapter_class.body if isinstance(n, ast.FunctionDef)
+               and n.name in {"_frozen_replay_prefix", "_surrogate_hidden"}]
+    namespace = {"torch": torch, "_CapturedHistory": object, "_residual_rms": rms}
+    exec(compile(ast.Module(methods, []), "patched-frozen-prefix", "exec"), namespace)
+    torch.manual_seed(41)
+    weights = [torch.randn(3, 3, dtype=torch.float64) / 4 for _ in range(5)]
+    calls = []
+    def layer(values, *, layer_index, hidden, residual, **kwargs):
+        calls.append(layer_index)
+        w = values.get(f"layers.{layer_index}.weight", weights[layer_index])
+        combined = hidden if residual is None else hidden + residual
+        return torch.tanh(combined @ w), combined
+
+    adapter = SimpleNamespace(
+        names=tuple(f"layers.{i}.weight" for i in range(first, 5)),
+        model=SimpleNamespace(layers=weights, norm=SimpleNamespace(weight=torch.ones(3, dtype=torch.float64), variance_epsilon=1e-6)),
+        worker=SimpleNamespace(block_size=2), _layer_forward=layer,
+        _parameter=lambda values, name, default: values.get(name, default),
+        _captured_input=torch.randn(2, 2, 3, dtype=torch.float64),
+        _captured_positions=torch.tensor([0, 1, 3, 4]), _captured_request_ids=("a", "b"),
+        _captured_history=SimpleNamespace(locations=torch.zeros(2, 4), valid_mask=torch.ones(2, 4)),
+    )
+    for name, function in namespace.items():
+        if name.startswith("_frozen") or name == "_surrogate_hidden":
+            setattr(adapter, name, types.MethodType(function, adapter))
+    parameters = tuple(weights[i].clone().requires_grad_() for i in range(first, 5))
+    values = dict(zip(adapter.names, parameters, strict=True))
+    args = (adapter._captured_input, adapter._captured_positions, adapter._captured_request_ids, adapter._captured_history)
+    reference = adapter._surrogate_hidden(values, *args)
+    expected = torch.autograd.grad(reference.square().sum(), parameters)
+    calls.clear()
+    prefix = adapter._frozen_replay_prefix(values)
+    active = adapter._surrogate_hidden(values, *args, frozen_prefix=prefix)
+    replay = adapter._surrogate_hidden(values, *args, frozen_prefix=prefix)
+    actual = torch.autograd.grad(replay.square().sum(), parameters)
+    assert torch.equal(active, reference) and torch.equal(replay, reference)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+    assert calls == list(range(first)) + 2 * list(range(first, 5))
+    if first:
+        saved = prefix[1].clone()
+        adapter._captured_input = adapter._captured_input + .1  # next request/update
+        refreshed = adapter._frozen_replay_prefix(values)
+        assert torch.equal(prefix[1], saved) and not torch.equal(refreshed[1], saved)
+    adapter.names = ("norm.weight",)
+    assert adapter._frozen_replay_prefix(values) is None
 
 
 def test_logit_reconstruction_replays_published_model_dtype_source():

@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1561 @@
+@@ -0,0 +1,1602 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -1219,6 +1219,36 @@ index 00000000..20e93274
 +            output = _TensorParallelSum.apply(output, self.tp_group.device_group)
 +        return output, residual
 +
++    def _frozen_replay_prefix(self, values):
++        """Reuse only this update's parameter-independent prefix, never inference activations.
++
++        The active-weight gate still recomputes every layer. Its frozen prefix
++        is also the exact constant input to the selected layers' gradient
++        objective. This tuple is local to one launch, not stored across updates,
++        requests, versions, or resets. Unknown/non-layer selections opt out.
++        """
++        if not self.names or any(not name.startswith("layers.") for name in self.names):
++            return None
++        first = min(int(name.split(".", 2)[1]) for name in self.names)
++        if first == 0:
++            return None
++        if not 0 < first < len(self.model.layers):
++            raise ValueError("selected draft layer is outside the model")
++        block = int(self.worker.block_size)
++        batch_size = len(self._captured_request_ids)
++        hidden = self._captured_input.view(batch_size, block, -1)
++        positions = self._captured_positions.view(batch_size, block)
++        residual = None
++        with torch.no_grad():
++            for layer_index in range(first):
++                hidden, residual = self._layer_forward(
++                    values, layer_index=layer_index, hidden=hidden,
++                    residual=residual, positions=positions,
++                    history_locations=self._captured_history.locations,
++                    history_valid=self._captured_history.valid_mask,
++                )
++        return first, hidden.detach(), None if residual is None else residual.detach()
++
 +    def _surrogate_hidden(
 +        self,
 +        values: dict[str, torch.Tensor],
@@ -1226,13 +1256,21 @@ index 00000000..20e93274
 +        positions: torch.Tensor,
 +        request_ids: tuple[str, ...],
 +        history: _CapturedHistory,
++        *,
++        frozen_prefix=None,
 +    ) -> torch.Tensor:
 +        block = int(self.worker.block_size)
 +        batch_size = len(request_ids)
 +        hidden = input_embeds.view(batch_size, block, -1)
 +        positions = positions.view(batch_size, block)
 +        residual = None
-+        for layer_index in range(len(self.model.layers)):
++        first = 0
++        if frozen_prefix is not None:
++            first, prefix_hidden, prefix_residual = frozen_prefix
++            # Preserve ownership even if a downstream native primitive is in-place.
++            hidden = prefix_hidden.clone()
++            residual = None if prefix_residual is None else prefix_residual.clone()
++        for layer_index in range(first, len(self.model.layers)):
 +            hidden, residual = self._layer_forward(
 +                values,
 +                layer_index=layer_index,
@@ -1438,12 +1476,14 @@ index 00000000..20e93274
 +                        local_inference_logits, target.shape[-1]
 +                    )
 +                    active_values = self._active_inference_parameters()
++                    frozen_prefix = self._frozen_replay_prefix(active_values)
 +                    active_surrogate = self._surrogate_hidden(
 +                        active_values,
 +                        self._captured_input,
 +                        self._captured_positions,
 +                        self._captured_request_ids,
 +                        self._captured_history,
++                        frozen_prefix=frozen_prefix,
 +                    )
 +                    local_active_logits = (
 +                        active_surrogate[:, 1:, :].to(lm_head_weight.dtype)
@@ -1489,6 +1529,7 @@ index 00000000..20e93274
 +                                self._captured_positions,
 +                                self._captured_request_ids,
 +                                self._captured_history,
++                                frozen_prefix=frozen_prefix,
 +                            )
 +                            local_draft_logits = (
 +                                surrogate[:, 1:, :].to(lm_head_weight.dtype)

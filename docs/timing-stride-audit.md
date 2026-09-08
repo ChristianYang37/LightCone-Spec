@@ -1,11 +1,19 @@
 # Timing audit and global stride freeze
 
 Status: native-RoPE retained-candidate TP2 forward/gradient QA passed on v66/marker-v48.
-The new bounded-window harness still needs GPU cancellation/reset acceptance;
-optimization rounds and global stride selection are **UNMEASURED**. No formal recipe is changed.
+The bounded-window harness passed six excluded TP2 baseline windows, including
+cancellation/reset acceptance. Optimization gains and global stride selection
+remain **UNMEASURED**. No formal recipe is changed.
 Preview performance numbers do not propagate into the manuscript.
 
 ## Fast feedback supersedes the long-baseline prerequisite
+
+The first implementation candidate reuses only the parameter-independent frozen
+layer prefix within one update, between active-weight reconstruction and gradient
+replay. It never caches across requests or updates; selected/non-layer parameters
+opt out when independence is not established. Reconstruction, gradient anchoring,
+and publication gates remain unchanged. A separate candidate runtime is compared
+against the baseline with the same S=1 configuration before any acceptance.
 
 The approved quick-tuning protocol no longer waits for all 24 long-baseline cells.
 Preserve completed/partial old evidence, stop its supervisor from claiming more
