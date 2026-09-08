@@ -1,7 +1,8 @@
 # GitHub preview v3: 96 registered cells
 
-Status: implementation and excluded validation in progress; all v3 GPU results
-are UNMEASURED. This changes GitHub preview only, not paper or formal S10 recipes.
+Status: first-40 collection is running; remaining-group acceptance and video
+validation are separate gates. Consult the live SQLite for counts, not this document.
+This changes GitHub preview only, not paper or formal S10 recipes.
 
 | Panel | Methods | Four-block cells |
 |---|---|---:|
@@ -117,6 +118,35 @@ independent recordings with 1x aligned playback. Real committed token chunks are
 displayed together; no artificial typing. Video data is excluded from 96 cells.
 
 ## Resume contract
+
+The server-local `scripts/continue_preview.py` controller waits for all first 40
+cells and their runner/server to exit, then backs up SQLite and fast-forwards the
+pre-staged CI-green commit. It never edits the active runner's checkout. Its order
+is DSpark full-condition QA / 32 cells, 27B full-condition QA / 24 cells, both
+six-method video sets, then the original full DAG with E5-last. The controller
+and its children share an exclusive lease; another new runner cannot recover or
+claim their active work. An interrupted QA/take without a passing result is not
+automatically overwritten or silently rerun.
+
+`scripts/validate_remaining_preview.py` uses block-0's complete frozen workloads,
+normal execution/reset and rank-complete checks in a separate excluded database.
+Common TP1 is attempted first, then TP2 only for explicit capacity evidence.
+Runtime, numerical and reconstruction failures stop for diagnosis. If DSpark
+needs TP2, supplemental matched Target/Static anchors are measured separately;
+the frozen arrival sequence and sample budget remain unchanged. QA and these
+anchors are not extra preview cells. Acceptance binds exact group rows, so an
+unstarted 27B topology change cannot invalidate or remap the first forty rows.
+Each node rereads its acceptance; completed raw evidence is never rewritten.
+
+Video `--qa` validates the full c8/16K/1024 workload without a capture or acceptance
+write. All six methods must pass at one TP before recording. The event sink is
+checked against every final native token trajectory, timestamps, stop record and
+throughput denominator. Post-warmup reset bounds allocator peaks; the separate
+100-ms NVML file bounds generation-only sampling. TP2 captures both ranks.
+Chromium and FFmpeg are installed by `scripts/prepare_preview_recording.py` in a
+separate Linux-server tools directory, never in the experiment venv or local model
+cache. Each set retains six originals and its 1x composite; technical failed
+takes remain visible and require an explicit audited retry directory.
 
 `scripts/validate_preview_group.py` prepares excluded full-condition checks for
 the 8B long-generation comparison. Each invocation uses one block-0 method/task

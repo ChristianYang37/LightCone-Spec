@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import threading
 import time
@@ -20,9 +21,15 @@ from lightcone_spec.metrics import SAFETY_COUNTERS, per_user_generation_speed
 from lightcone_spec.preview import QWEN38_MODEL, QWEN38_VIDEO_METHODS, VIDEO_METHODS
 from lightcone_spec.preview_revision import preview_recipe
 from lightcone_spec.protocol import Job
-from lightcone_spec.recording import StreamRecording
-from lightcone_spec.runner import _cell_inputs, _runtime_job, _selection_for_job, _speed_metrics
-from lightcone_spec.server import ServerProcess
+from lightcone_spec.recording import StreamRecording, recording_nvml_peaks, validate_recording
+from lightcone_spec.runner import (
+    _cell_inputs,
+    _dispatcher_concurrency,
+    _runtime_job,
+    _selection_for_job,
+    _speed_metrics,
+)
+from lightcone_spec.server import GpuSampler, ServerProcess
 from lightcone_spec.state import StateStore
 
 
@@ -35,17 +42,22 @@ def main():
     parser.add_argument("--model", choices=("Qwen/Qwen3-8B", QWEN38_MODEL), default="Qwen/Qwen3-8B")
     parser.add_argument("--tp", type=int, choices=(1, 2), default=1)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--qa", action="store_true", help="Excluded full c8 validation; never grants acceptance")
     args = parser.parse_args()
     config = ExperimentConfig.load(args.config)
     if args.gpu not in config.gpu_ids:
         parser.error("GPU must belong to the configured instance")
     args.output.mkdir(parents=True, exist_ok=False)
-    state = StateStore(config.run_dir)
+    from lightcone_spec.preview_continuation import read_state
+    selections, _, _ = read_state(config.run_dir)
+    state = StateStore(args.output / "excluded-state")
+    for name, value in selections.items():
+        state.set_selection(name, value)
     acceptance = state.selection("formal_preview_video_acceptance_v3", {}).get(args.model, {})
-    if acceptance.get("status") != "accepted" or acceptance.get("tp") != args.tp:
+    if not args.qa and (acceptance.get("status") != "accepted" or acceptance.get("tp") != args.tp):
         raise RuntimeError("video needs full-workload six-method common-TP acceptance")
     manifest = state.selection("formal_preview_manifest_v3", {})
-    if manifest.get("version") != 3 or acceptance.get("manifest") != manifest:
+    if manifest.get("version") != 3 or (not args.qa and acceptance.get("manifest") != manifest):
         raise RuntimeError("video requires matching preview-v3 manifest acceptance")
     newer = args.model == QWEN38_MODEL
     backend, method, label = (QWEN38_VIDEO_METHODS if newer else VIDEO_METHODS)[args.method_index]
@@ -65,13 +77,24 @@ def main():
                     "frozen_recipe": preview_recipe(method, backend, manifest)},
     )
     job = _runtime_job(config, state, job)
+    if _dispatcher_concurrency(job) != 8 or len(prompts) != 8:
+        raise RuntimeError("video requires actual c8 and exactly eight frozen inputs")
     selection = _selection_for_job(state, job)
     if method in {"lightcone", "onlinespec_ens"} and not selection:
         raise RuntimeError("video requires frozen adaptation recipe")
     (args.output / "server").mkdir()
-    process = ServerProcess(config, job, gpus=gpus, port=config.server.base_port + 20,
+    if args.tp == 2:
+        from validate_preview_group import RankCompleteProcess
+        os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
+            "output_directory": str((args.output / "server").resolve()), "rank_metrics": True, "trace_verify": False})
+        os.environ["PYTHONPATH"] = os.pathsep.join((
+            str(Path(__file__).resolve().parent / "preview_verify_trace"), os.environ.get("PYTHONPATH", "")))
+    process_class = RankCompleteProcess if args.tp == 2 else ServerProcess
+    process = process_class(config, job, gpus=gpus, port=config.server.base_port + 20,
                             output_dir=args.output / "server", selection=selection)
     with process as client:
+        if args.tp == 2:
+            client = process.configure(job, selection)
         prompts, _, input_metadata = _cell_inputs(config, state, client, job)
         client.run_batch(prompts[:1], max_new_tokens=16, seed=0)
         client.reset()
@@ -85,9 +108,15 @@ def main():
         start_lock = threading.Lock()
 
         def generate():
+            sampler = GpuSampler(gpus, args.output / "measurement-gpu.csv", interval_seconds=.1)
             try:
                 before = _speed_metrics(client.server_info(), f"tp{args.tp}_dp1")
+                if len(before.get("rank_local", [])) != args.tp or any(
+                    row.get(key) != 0 for row in before["rank_local"] for key in (*SAFETY_COUNTERS, "updates_published")
+                ):
+                    raise RuntimeError("video post-warmup reset telemetry is not clean")
                 client.stream_observer = sink
+                sampler.start()
                 status["submitted_at_ns"] = time.time_ns()
                 results, duration = client.run_batch(
                     prompts, max_new_tokens=1024, seed=0, ignore_eos=False,
@@ -95,7 +124,12 @@ def main():
                     request_id_prefix=f"video-{args.method_index}",
                 )
                 sink.close()
+                sampler.stop()
                 after = _speed_metrics(client.server_info(), f"tp{args.tp}_dp1")
+                accounting = validate_recording(sink.events, [r.to_dict() for r in results], duration)
+                ranks = after.get("rank_local", [])
+                if len(ranks) != args.tp or any(r.get(k) != 0 for r in ranks for k in SAFETY_COUNTERS if k != "retractions"):
+                    raise RuntimeError("video requires complete clean rank-local telemetry")
                 safety = {key: after[key] - before[key] for key in SAFETY_COUNTERS}
                 if any(value for key, value in safety.items() if key != "retractions"):
                     raise RuntimeError(f"video safety counters: {safety}")
@@ -110,10 +144,18 @@ def main():
                                   max(1, after["target_calls"] - before["target_calls"])),
                               peak_hbm_bytes=after.get("peak_hbm_bytes"),
                               per_user_tok_s=per_user_generation_speed(row.to_dict() for row in results), safety=safety)
+                status.update(accounting, rank_memory=[{k: r.get(k) for k in (
+                    "peak_hbm_bytes", "peak_hbm_reserved_bytes", "memory_budget", "memory_ledger",
+                    "kv_token_capacity", "measured_update_peak_bytes")} for r in ranks],
+                    memory_peak_scope="since post-warmup cache reset; NVML measurement-gpu.csv is generation only",
+                    full_workload=True, reset_verified=True, formal_acceptance=False,
+                    updates_published=after["updates_published"]-before["updates_published"])
+                status.update(recording_nvml_peaks(args.output / "measurement-gpu.csv", gpus))
                 (args.output / "requests.json").write_text(json.dumps([row.to_dict() for row in results]))
             except Exception as error:
                 status.update(status="failed", error=str(error))
             finally:
+                sampler.stop()
                 client.stream_observer = None
                 if not sink.closed:
                     try:
@@ -121,6 +163,14 @@ def main():
                     except RuntimeError as error:
                         status.update(status="failed", error=str(error))
                 (args.output / "recording.json").write_text(json.dumps(status, indent=2))
+
+        (args.output / "job.json").write_text(json.dumps(job.to_dict(), indent=2))
+        if args.qa:
+            status["status"] = "running"
+            generate()
+            if status["status"] != "completed":
+                raise RuntimeError(status.get("error", "video QA failed"))
+            return
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):

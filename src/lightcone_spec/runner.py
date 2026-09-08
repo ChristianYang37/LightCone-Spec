@@ -7665,24 +7665,30 @@ def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: thr
 
 def _run_preview_v3(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> bool:
     """A versioned deployment gate; old acceptance cannot authorize new recipes."""
+    from .preview_continuation import group_accepted
     from .preview_revision import PREVIEW_V3_NODES
     enabled = state.selection("formal_preview_v3", {})
-    if not enabled.get("enabled") or enabled.get("status") == "completed":
+    if not enabled.get("enabled"):
         return False
+    if enabled.get("status") == "completed":
+        continuation = state.selection("formal_preview_continuation_v1", {})
+        return continuation.get("enabled", False) and continuation.get("videos") != "completed"
     manifest = state.selection("formal_preview_manifest_v3", {})
     if manifest.get("version") != 3:
         raise RuntimeError("preview-v3 requires a frozen revision-3 manifest")
     acceptance = state.selection("formal_preview_acceptance_v3", {})
-    if acceptance.get("manifest") != manifest or acceptance.get("trajectory_diagnosis") != "reviewed":
+    if acceptance.get("trajectory_diagnosis") != "reviewed":
         raise RuntimeError("preview-v3 lacks matching acceptance and reviewed output divergence")
     jobs = preview_jobs(manifest)
+    waiting = []
     for node in PREVIEW_V3_NODES:
         rows = tuple(j for j in jobs if j.node == node)
         if not rows:
             continue
-        if acceptance.get("nodes", {}).get(node) != "accepted":
-            state.set_selection("formal_preview_v3", {**enabled, "status": "awaiting_acceptance", "node": node})
-            return True
+        acceptance = state.selection("formal_preview_acceptance_v3", {})
+        if not group_accepted(acceptance, manifest, node):
+            waiting.append(node)
+            continue
         state.add_internal_jobs(rows, storage_node=node)
         state.set_stage_status(node, "running", row_count=len(rows))
         _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
@@ -7695,8 +7701,12 @@ def _run_preview_v3(config: ExperimentConfig, state: StateStore, stop_event: thr
         if any(counts.get(s) for s in ("failed", "running", "pending")):
             raise RuntimeError(f"preview-v3 runtime failures: {node}: {counts}")
         state.set_stage_status(node, "completed", row_count=len(rows))
+    if waiting:
+        state.set_selection("formal_preview_v3", {**enabled, "status": "awaiting_acceptance", "nodes": waiting})
+        return True
     state.set_selection("formal_preview_v3", {**enabled, "status": "completed", "leaf_cells": len(jobs)})
-    return False
+    continuation = state.selection("formal_preview_continuation_v1", {})
+    return continuation.get("enabled", False) and continuation.get("videos") != "completed"
 
 
 def _run_priority_window_v1(
@@ -8704,6 +8714,11 @@ class PaperRunner:
         self.stop_event.set()
 
     def run(self) -> None:
+        from .preview_continuation import gpu_lease
+        with gpu_lease(self.config.run_dir):
+            self._run_with_lease()
+
+    def _run_with_lease(self) -> None:
         self.config.validate_local_paths()
         _cleanup_interrupted_servers(self.config.run_dir)
         self.state.recover_interrupted()

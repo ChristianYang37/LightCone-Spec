@@ -33,6 +33,62 @@ from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
 
 
+def test_video_native_final_accounting_rejects_loss_duplicates_and_wrong_denominator():
+    from copy import deepcopy
+
+    from lightcone_spec.recording import validate_recording
+    rows = [{"request_id": "r", "completion_tokens": 2, "output_ids": [8, 9],
+             "stop_reason": "stop", "native_token_timestamps_ns": [100, 200]}]
+    events = [{"request_id": "r", "sequence": 1, "elapsed_seconds": .5, "token_ids": [8, 9],
+               "chunk": {"output_ids": [8, 9], "meta_info": {"finish_reason": {"type": "stop"}}}}]
+    value = validate_recording(events, rows, 2., expected_requests=1)
+    assert value["aggregate_tok_s"] == 1. and value["committed_tokens"] == 2
+    for broken in (events * 2, [], [{**events[0], "sequence": 2}], [{**events[0], "token_ids": [8]}]):
+        with pytest.raises(RuntimeError):
+            validate_recording(broken, rows, 2., expected_requests=1)
+    bad = deepcopy(rows)
+    bad[0]["native_token_timestamps_ns"] = [200, 100]
+    with pytest.raises(RuntimeError, match="native"):
+        validate_recording(events, bad, 2., expected_requests=1)
+    with pytest.raises(RuntimeError, match="duration"):
+        validate_recording(events, rows, float("nan"), expected_requests=1)
+
+
+def test_remaining_preview_qa_capacity_and_runtime_are_distinct(monkeypatch):
+    import runpy
+    from pathlib import Path
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    review = runpy.run_path(str(scripts / "validate_remaining_preview.py"))["review_case"]
+    job = Job("qa", "E5-preview-v3", 0, "lightcone", "Qwen/Qwen3-8B", "DSPARK", "LiveCodeBench")
+    metrics = {"hard_feasible": True, "rank_local_after": [{k: 0 for k in SAFETY_COUNTERS}],
+               "resolved_stride": 1, "updates_published": 2}
+    rows = [{"request_id": "r", "stop_reason": "length", "completion_tokens": 1,
+             "output_ids": [1], "native_token_timestamps_ns": [100]}]
+    assert review(metrics, rows, job) == "passed"
+    capacity = {**metrics, "hard_feasible": False, "capacity_feasible": False,
+                "request_outcomes": {"timed_out": 1}}
+    assert review(capacity, rows, job) == "capacity_infeasible"
+    capacity["request_outcomes"]["error"] = 1
+    with pytest.raises(RuntimeError, match="runtime failure"):
+        review(capacity, rows, job)
+    metrics["rank_local_after"][0]["fallbacks"] = 1
+    with pytest.raises(RuntimeError, match="safety"):
+        review(metrics, rows, job)
+
+
+def test_video_nvml_window_keeps_rank_peaks_separate(tmp_path):
+    from lightcone_spec.recording import recording_nvml_peaks
+    path = tmp_path / "measurement-gpu.csv"
+    path.write_text("timestamp,index,memory_used_mb\nnow,0,10\nnow,1,20\nnext,0,30\nnext,1,15\n")
+    metrics = recording_nvml_peaks(path, (0, 1))
+    assert metrics["sum_nvml_rank_peak_bytes"] == 50 * 1024**2
+    assert metrics["nvml_peak_hbm_bytes"] == 30 * 1024**2
+    with pytest.raises(RuntimeError, match="unassigned"):
+        recording_nvml_peaks(path, (0,))
+
+
 def test_preview_four_block_effects_keep_missing_and_exclude_private_data(tmp_path):
     from lightcone_spec.preview import preview_summary
     from lightcone_spec.protocol import Job

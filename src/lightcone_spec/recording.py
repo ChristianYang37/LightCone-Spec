@@ -6,10 +6,65 @@ New contributions: LicenseRef-LightCone-Source-Available-1.0. See LICENSE.
 from __future__ import annotations
 
 import json
+import math
 import queue
 import threading
 import time
 from pathlib import Path
+
+
+def validate_recording(events, requests, duration, *, expected_requests=8):
+    """Compare the complete observer trajectory with native final records."""
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("invalid recording duration")
+    rows = {r["request_id"]: r for r in requests}
+    if len(requests) != expected_requests or len(rows) != expected_requests:
+        raise RuntimeError("recording request count/identity mismatch")
+    tokens = {rid: [] for rid in rows}
+    finished = set()
+    last_time = -1.
+    for sequence, event in enumerate(events, 1):
+        rid = event["request_id"]
+        elapsed = event["elapsed_seconds"]
+        if (event["sequence"] != sequence or rid not in rows
+                or not math.isfinite(elapsed) or elapsed < last_time or elapsed > duration):
+            raise RuntimeError("recording event order/identity mismatch")
+        last_time = elapsed
+        ids = event["token_ids"]
+        if not isinstance(ids, list) or any(type(token) is not int for token in ids):
+            raise RuntimeError("recording token IDs missing")
+        tokens[rid].extend(ids)
+        chunk = event["chunk"]
+        if chunk.get("output_ids") != tokens[rid]:
+            raise RuntimeError("recording trajectory mismatch")
+        if chunk.get("meta_info", {}).get("finish_reason") is not None:
+            finished.add(rid)
+    if finished != set(rows):
+        raise RuntimeError("recording missing final events")
+    for rid, row in rows.items():
+        timestamps = row.get("native_token_timestamps_ns", [])
+        if (tokens[rid] != list(row["output_ids"]) or len(tokens[rid]) != row["completion_tokens"]
+                or not row.get("stop_reason") or len(timestamps) != len(tokens[rid])
+                or any(b < a for a, b in zip(timestamps, timestamps[1:]))):
+            raise RuntimeError("recording final/native token count mismatch")
+    total = sum(len(ids) for ids in tokens.values())
+    return {"event_count": len(events), "committed_tokens": total,
+            "aggregate_tok_s": total / duration, "event_accounting": "verified_native_final_records"}
+
+
+def recording_nvml_peaks(path, gpus):
+    peaks = {int(gpu): 0 for gpu in gpus}
+    for line in Path(path).read_text().splitlines()[1:]:
+        fields = line.split(",")
+        gpu = int(fields[1])
+        if gpu not in peaks:
+            raise RuntimeError("recording NVML sampled an unassigned GPU")
+        peaks[gpu] = max(peaks[gpu], int(float(fields[2]) * 1024 * 1024))
+    if any(value <= 0 for value in peaks.values()):
+        raise RuntimeError("recording NVML window missing a GPU")
+    return {"nvml_rank_peak_bytes": peaks, "nvml_peak_hbm_bytes": max(peaks.values()),
+            "sum_nvml_rank_peak_bytes": sum(peaks.values()),
+            "nvml_peak_scope": "generation-window sampled per-rank peaks; sum is not simultaneous peak"}
 
 
 class StreamRecording:

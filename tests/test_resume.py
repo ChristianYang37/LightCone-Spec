@@ -61,6 +61,161 @@ from lightcone_spec.runner import (
 from lightcone_spec.state import StateStore
 
 
+def _continuation_manifest():
+    from lightcone_spec.preview import QWEN38_CHECKPOINTS
+    records = [{"prompt": str(i), "problem_id": str(i)} for i in range(32)]
+    return {"version": 3, "lightcone_recipe": {"stride": 10},
+            "dspark_recipe": {"confidence_temperatures": [1.] * 7},
+            "dflash_width": 16, "dspark_width": 16, "trace_request_count": 16,
+            "serving_output_tokens": 256, "trace_offset": 17,
+            "trace_anchor": {"source_job_ids": ["anchor"], "request_rate": 2., "concurrency": 8},
+            "trace": {"arrivals": list(range(16)), "lengths": [[128, 64]] * 16},
+            "comparison_topologies": {"dflash_long": 2, "dspark_serving": 1},
+            "prompts": {task: records for task in ("MATH-500", "LiveCodeBench")},
+            "qwen38": {"tp": 2, "checkpoints": QWEN38_CHECKPOINTS, "prompts": records[:8]}}
+
+
+def test_preview_continuation_scoped_topology_and_immutable_first40(tmp_path):
+    from copy import deepcopy
+
+    from lightcone_spec.preview import preview_jobs
+    from lightcone_spec.preview_continuation import (
+        group_accepted,
+        group_rows,
+        replace_unstarted_group,
+    )
+    manifest = _continuation_manifest()
+    candidate = deepcopy(manifest)
+    candidate["qwen38"]["tp"] = 1
+    state = StateStore(tmp_path)
+    first = tuple(j for j in preview_jobs(manifest) if j.node == "E3b-preview-v3")
+    state.add_internal_jobs(first)
+    acceptance = {"manifest": manifest, "trajectory_diagnosis": "reviewed",
+                  "nodes": {"E3b-preview-v3": "accepted"}}
+    replace_unstarted_group(state, manifest, candidate, "Qwen38-preview-v3")
+    assert group_accepted(acceptance, candidate, "E3b-preview-v3")
+    assert not group_accepted(acceptance, candidate, "Qwen38-preview-v3")
+    assert state.jobs("E3b-preview-v3") == first
+    changed = deepcopy(candidate)
+    changed["comparison_topologies"]["dflash_long"] = 1
+    with pytest.raises(RuntimeError, match="unrelated"):
+        replace_unstarted_group(state, candidate, changed, "Qwen38-preview-v3")
+    with pytest.raises(RuntimeError, match="materialized"):
+        replace_unstarted_group(state, candidate, changed, "E3b-preview-v3")
+    assert len(group_rows(candidate, "Qwen38-preview-v3")) == 24
+
+
+def test_preview_continuation_lock_and_inherited_lease(monkeypatch, tmp_path):
+    import os
+
+    from lightcone_spec.preview_continuation import (
+        continuation_lock,
+        first_group_complete,
+        gpu_lease,
+    )
+    with continuation_lock(tmp_path / "preview-continuation.lock") as fd:
+        with pytest.raises(RuntimeError, match="already owns"):
+            with continuation_lock(tmp_path / "preview-continuation.lock"):
+                pass
+        monkeypatch.setenv("LIGHTCONE_PREVIEW_LEASE_FD", str(fd))
+        with gpu_lease(tmp_path):
+            assert os.fstat(fd).st_ino == (tmp_path / "preview-continuation.lock").stat().st_ino
+        with pytest.raises(RuntimeError, match="already owns"):
+            with continuation_lock(tmp_path / "preview-continuation.lock"):
+                pass
+    assert first_group_complete({("E3b-preview-v3", "completed"): 40})
+    assert not first_group_complete({("E3b-preview-v3", "completed"): 39, ("E3b-preview-v3", "running"): 1})
+    assert not first_group_complete({("E3b-preview-v3", "completed"): 40, ("E3b-preview-v3", "failed"): 1})
+
+
+def test_preview_refreshes_acceptance_and_holds_dag_for_videos(monkeypatch, tmp_path):
+    from lightcone_spec.preview_continuation import group_rows
+    from lightcone_spec.runner import _run_preview_v3
+    state = StateStore(tmp_path)
+    manifest = _continuation_manifest()
+    state.set_selection("formal_preview_manifest_v3", manifest)
+    state.set_selection("formal_preview_v3", {"enabled": True})
+    state.set_selection("formal_preview_continuation_v1", {"enabled": True})
+    state.set_selection("formal_preview_acceptance_v3", {
+        "manifest": manifest, "trajectory_diagnosis": "reviewed",
+        "nodes": {"E3b-preview-v3": "accepted", "Qwen38-preview-v3": "accepted"}})
+    executed = []
+
+    def run(config, store, node, stop, jobs):
+        executed.append(node)
+        for job in jobs:
+            attempt = store.start(job, tuple(range(job.gpu_count)), tmp_path / job.job_id)
+            store.complete(job.job_id, attempt)
+        if node == "E3b-preview-v3":
+            acceptance = store.selection("formal_preview_acceptance_v3")
+            acceptance["groups"] = {"E5-preview-v3": {"status": "accepted", "jobs": group_rows(manifest, "E5-preview-v3")}}
+            store.set_selection("formal_preview_acceptance_v3", acceptance)
+
+    monkeypatch.setattr("lightcone_spec.runner._run_pending_jobs", run)
+    monkeypatch.setattr("lightcone_spec.runner._metric_rows", lambda *_: [])
+    monkeypatch.setattr("lightcone_spec.runner.preview_summary", lambda *_: {"counts": {}})
+    config = _config(tmp_path)
+    assert _run_preview_v3(config, state, threading.Event())
+    assert executed == ["E3b-preview-v3", "E5-preview-v3", "Qwen38-preview-v3"]
+    assert _run_preview_v3(config, state, threading.Event())  # no duplicate claim, still holds for video
+    assert len(executed) == 3
+    state.set_selection("formal_preview_continuation_v1", {"enabled": True, "videos": "completed"})
+    assert not _run_preview_v3(config, state, threading.Event())
+
+
+def test_preview_controller_child_failure_and_sigint_preserve_boundary(monkeypatch, tmp_path):
+    import os
+    import runpy
+    from types import SimpleNamespace
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    cls = runpy.run_path(str(scripts / "continue_preview.py"))["Controller"]
+    controller = object.__new__(cls)
+    controller.out = tmp_path
+    controller.args = SimpleNamespace(repo=tmp_path)
+    controller.env = dict(os.environ)
+    controller.lock_fd = 1
+    monkeypatch.setattr(controller, "check_boundary", lambda: None)
+    monkeypatch.setattr(controller, "status", lambda *a, **kw: None)
+    signals = []
+
+    class Child:
+        calls = 0
+
+        def wait(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            return 0
+
+        def send_signal(self, sig):
+            signals.append(sig)
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: Child())
+    with pytest.raises(KeyboardInterrupt):
+        controller.child(["unused"], "interrupted")
+    assert signals == [signal.SIGINT]
+    assert len(list(tmp_path.glob("interrupted-*.log"))) == 1
+
+
+def test_remaining_qa_candidates_keep_complete_budgets(monkeypatch):
+    import runpy
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    cases = runpy.run_path(str(scripts / "validate_remaining_preview.py"))["remaining_cases"]
+    manifest = _continuation_manifest()
+    serving = cases(manifest, "E5-preview-v3")
+    qwen = cases(manifest, "Qwen38-preview-v3")
+    assert len(serving) == 8 and len(qwen) == 6
+    assert {j.load for j in serving} == {"closed_loop_c1", "closed_loop_c8", "closed_loop_c32", "burstgpt_shape"}
+    assert all(j.parameters["execution_request_count"] == 8 and j.parameters["generation_tokens"] == 1024 for j in qwen)
+    assert all(j.block == 0 for j in serving + qwen)
+    with pytest.raises(ValueError, match="first forty"):
+        cases(manifest, "E3b-preview-v3")
+
+
 def test_preview_frozen_selection_and_atomic_resume(tmp_path):
     from lightcone_spec.runner import _arrival_offsets, _dispatcher_concurrency, _runtime_job
 
