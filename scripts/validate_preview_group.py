@@ -30,18 +30,21 @@ CASES = {
 
 def qa_manifest(selections):
     """An excluded candidate may precede formal v3 freezing; never write it back."""
+    from lightcone_spec.preview_revision import s10_manifest
     if "formal_preview_manifest_v3" in selections:
         manifest = deepcopy(selections["formal_preview_manifest_v3"])
         if manifest.get("version") != 3:
             raise ValueError("invalid formal v3 manifest; no legacy fallback")
-        return manifest, "formal_preview_manifest_v3"
+        candidate = s10_manifest(manifest)
+        return candidate, ("formal_preview_manifest_v3" if candidate == manifest
+                           else "excluded_candidate_s10_from_formal_preview_manifest_v3")
     source = selections.get("formal_preview_manifest_v1")
     if not isinstance(source, dict) or source.get("version") not in (1, 2):
         raise ValueError("missing frozen preview input manifest")
     candidate = deepcopy(source)
     candidate["version"] = 3
     candidate.pop("tts_recipe", None)
-    return candidate, "excluded_candidate_from_formal_preview_manifest_v1"
+    return s10_manifest(candidate), "excluded_candidate_from_formal_preview_manifest_v1"
 
 
 def full_condition_job(manifest, task, case, tp):

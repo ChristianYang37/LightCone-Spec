@@ -12,6 +12,53 @@ from .preview import preview_jobs
 from .preview_revision import PREVIEW_V3_NODES
 
 
+def restore_preview_s10(state):
+    """Boundary-only, atomic migration; raw attempts/configs are never rewritten."""
+    from .preview_revision import preview_lightcone_stride, s10_manifest
+
+    with state.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        selections = {row[0]: json.loads(row[1]) for row in db.execute(
+            "SELECT name,value_json FROM selections")}
+        manifest = selections.get("formal_preview_manifest_v3", {})
+        if manifest.get("version") != 3 or preview_lightcone_stride(manifest) == 10:
+            return False
+        if db.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
+            raise RuntimeError("preview S10 migration requires an idle cell boundary")
+        candidate = s10_manifest(manifest)
+        replacements = {job.parameters["replaces_job_id"]: job.job_id
+                        for job in preview_jobs(candidate) if job.method == "lightcone"}
+        for source_id in replacements:
+            # Move only the scheduler index. Keep status, config, attempts and files.
+            db.execute("UPDATE jobs SET node=node || '-legacy-s1' WHERE job_id=? AND node IN (?,?,?)",
+                       (source_id, *PREVIEW_V3_NODES))
+        enabled = selections.get("formal_preview_v3", {})
+        continuation = selections.get("formal_preview_continuation_v1", {})
+        updates = {
+            "formal_preview_s10_restore_v1": {
+                "reason": "user restored GitHub preview LightCone S10",
+                "previous_manifest": manifest, "replacements": replacements,
+                "previous_acceptance": selections.get("formal_preview_acceptance_v3", {}),
+                "previous_video_acceptance": selections.get("formal_preview_video_acceptance_v3", {}),
+                "previous_progress": selections.get("formal_preview_progress_v3", {}),
+                "previous_continuation": continuation,
+            },
+            "formal_preview_manifest_v3": candidate,
+            "formal_preview_v3": {**enabled, "status": "awaiting_acceptance"},
+            "formal_preview_acceptance_v3": {},
+            "formal_preview_video_acceptance_v3": {},
+            "formal_preview_progress_v3": {"status": "awaiting_s10_acceptance"},
+            "formal_preview_continuation_v1": {**continuation, "videos": "pending"},
+        }
+        for name, value in updates.items():
+            db.execute("INSERT INTO selections(name,value_json) VALUES(?,?) "
+                       "ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json, updated_at=CURRENT_TIMESTAMP",
+                       (name, json.dumps(value, sort_keys=True)))
+        for node in PREVIEW_V3_NODES:
+            db.execute("UPDATE stage_state SET status='pending', updated_at=CURRENT_TIMESTAMP WHERE node=?", (node,))
+    return True
+
+
 def group_rows(manifest, node):
     if node not in PREVIEW_V3_NODES:
         raise ValueError("unknown preview group")

@@ -19,6 +19,20 @@ ENSEMBLE_TRANSFER = {
 }
 
 
+def preview_lightcone_stride(manifest):
+    """Absent means historical S1; never reinterpret an archived manifest."""
+    stride = manifest.get("preview_lightcone_stride", 1)
+    if type(stride) is not int or stride not in (1, 10):
+        raise ValueError("preview LightCone stride must be 1 (legacy) or 10")
+    return stride
+
+
+def s10_manifest(manifest):
+    candidate = deepcopy(manifest)
+    candidate["preview_lightcone_stride"] = 10
+    return candidate
+
+
 def preview_recipe(method, backend, manifest):
     if method == "onlinespec_ens":
         return deepcopy(ENSEMBLE_TRANSFER)
@@ -26,7 +40,8 @@ def preview_recipe(method, backend, manifest):
         return None
     recipe = deepcopy(manifest["dspark_recipe" if backend == "DSPARK" else "lightcone_recipe"])
     recipe.update(optimizer="chronobelief", parameterization="lora", rank=8,
-                  scope="last1", lr=1e-3, learning_rate=1e-3, schedule="constant", stride=1)
+                  scope="last1", lr=1e-3, learning_rate=1e-3, schedule="constant",
+                  stride=preview_lightcone_stride(manifest))
     if backend == "DSPARK":
         import math
         temperatures = recipe.get("confidence_temperatures", [])
@@ -70,7 +85,7 @@ def revision_jobs(manifest):
                 raise ValueError("preview needs common TP1 or TP2")
             params = deepcopy(job.parameters)
             params.update(preview_revision=3, pairing_key=key, topology=f"tp{tp}_dp1",
-                          stride=1 if job.method == "lightcone" else 10,
+                          stride=preview_lightcone_stride(manifest) if job.method == "lightcone" else 10,
                           frozen_recipe=preview_recipe(job.method, job.backend, manifest))
             if panel == "burstgpt" and tp == 2:
                 anchor = manifest.get("tp2_trace_anchor", {})
@@ -82,11 +97,16 @@ def revision_jobs(manifest):
             elif job.method == "target_only":
                 label = "Target-only"
             elif job.method == "lightcone":
-                label = f"LightCone ({job.backend}, S=1)"
+                label = f"LightCone ({job.backend}, S={preview_lightcone_stride(manifest)})"
             else:
                 label = "Native MTP" if job.backend == "NEXTN" else f"Static {job.backend}"
             params["method_label"] = label
             identity = f"preview-v3__{panel}__{job.task}__{job.load}__b{job.block}__{job.backend}__{job.method}__tp{tp}"
+            if job.method == "lightcone" and preview_lightcone_stride(manifest) == 10:
+                params["preview_lightcone_stride"] = 10
+                params["replaces_job_id"] = identity
+                params["replacement_reason"] = "user restored preview LightCone S10; retain legacy S1 raw evidence"
+                identity += "__s10"
             result.append(replace(job, job_id=identity, node=PREVIEW_V3_NODES[PREVIEW_NODES.index(job.node)],
                                   ordinal=len(result), gpu_count=tp, parameters=params))
     expected = 96 if manifest.get("qwen38") else 72

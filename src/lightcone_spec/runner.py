@@ -7675,11 +7675,13 @@ def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: thr
 
 def _run_preview_v3(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> bool:
     """A versioned deployment gate; old acceptance cannot authorize new recipes."""
-    from .preview_continuation import group_accepted
+    from .preview_continuation import group_accepted, restore_preview_s10
     from .preview_revision import PREVIEW_V3_NODES
     enabled = state.selection("formal_preview_v3", {})
     if not enabled.get("enabled"):
         return False
+    restore_preview_s10(state)
+    enabled = state.selection("formal_preview_v3", {})
     if enabled.get("status") == "completed":
         continuation = state.selection("formal_preview_continuation_v1", {})
         return continuation.get("enabled", False) and continuation.get("videos") != "completed"

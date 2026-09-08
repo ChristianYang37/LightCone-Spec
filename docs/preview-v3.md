@@ -1,7 +1,7 @@
 # GitHub preview v3: 96 registered cells
 
-Status: first-40 collection is running; remaining-group acceptance and video
-validation are separate gates. Consult the live SQLite for counts, not this document.
+Status: user restored preview LightCone to S=10. Local implementation is updated;
+deployment and S10 acceptance must be verified separately. Consult live SQLite for counts.
 This changes GitHub preview only, not paper or formal S10 recipes.
 
 | Panel | Methods | Four-block cells |
@@ -18,9 +18,19 @@ upgrade, quantization, offload, workload shortening, or default DSpark calibrati
 
 ## Frozen recipes and interpretation
 
-Preview LightCone is ChronoBelief, LoRA rank8, last1, LR=1e-3, constant, S=1.
-This is the user-specified deployment recipe, not a claim of optimality at S1.
+Preview LightCone is ChronoBelief, LoRA rank8, last1, LR=1e-3, constant, S=10.
+This is the user-specified deployment recipe, not a claim of measured optimality.
 DSpark retains its seven fitted confidence temperatures. Formal S10 is unchanged.
+
+The frozen manifest now explicitly records `preview_lightcone_stride=10`.
+Missing this field retains historical S1 interpretation; archived manifests are
+never relabelled. At the next idle runner boundary, `restore_preview_s10` archives
+the old manifest/acceptance and moves only legacy LightCone scheduler entries to
+`*-legacy-s1` storage nodes without changing their configs, status, attempts or raw
+files. New LightCone IDs end in `__s10` and point to their previous IDs. Unchanged
+baseline IDs and frozen pairing/stimuli are retained. All group/video acceptance
+must be refreshed; S1 cannot authorize S10. This does not freeze the global tuning
+search or modify formal S10 recipes, and requires no SGLang hot-path change.
 
 OnlineSPEC-Ensemble is an explicitly named **algorithm transfer**, not the
 authors' engine or best-on-DFlash claim. Source: [OnlineSPEC v2, B.10](https://arxiv.org/html/2603.12617v2#A2.SS10).
@@ -33,12 +43,14 @@ uses a previous-loss softmax and differs from the paper's cumulative-loss rule;
 this transfer explicitly chooses the paper rule. Updates, merge and synchronization
 are included in end-to-end timing. Rejected proposals commit no weights, Adam
 moments, cumulative losses or steps. The legacy E0 OGD-based ensemble is unchanged.
-S1 vs S10 is not an equal-update-budget mechanism ablation.
+Both preview methods now use S10, but this alone does not equalize training cost
+or make their different parameterizations an equal-compute mechanism ablation.
 
 TTS is removed from new preview execution, tables and both video method lists.
 All legacy raw TTS and other attempts remain auditable under their old protocol.
 No old metric is rewritten. New identities and frozen pairing keys prevent mixing
-legacy S10 timings with v3; supersession is protocol-driven, never gain-driven.
+legacy S1 LightCone timings with restored S10; supersession is protocol-driven,
+never gain-driven. Historical S1 pressure diagnostics below remain excluded.
 
 ## Required correctness review
 

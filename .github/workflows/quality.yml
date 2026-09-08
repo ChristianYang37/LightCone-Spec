@@ -23,6 +23,8 @@ jobs:
       - run: ruff check src tests scripts
       - run: pytest -q tests/test_protocol.py tests/test_resume.py tests/test_metrics.py tests/test_fake_sglang.py
       - run: lightcone-spec --help
+      - run: preview-benchmark --help
+      - run: python scripts/check_preview_benchmark.py --help
       - run: |
           sed 's#/root/#/tmp/lightcone/#g' examples/paper.yaml > /tmp/paper.yaml
           lightcone-spec plan --config /tmp/paper.yaml
@@ -60,6 +62,8 @@ jobs:
       - run: npm install --no-save --ignore-scripts playwright@1.55.0
       - run: npx --no-install playwright install --with-deps chromium
       - run: python -m pip install imageio-ffmpeg==0.6.0
+      - run: pip install --no-deps -e . && pip install numpy==2.3.3 scipy==1.16.2
+      - run: node scripts/test_context_benchmark_ui.cjs
       - name: Synthetic UI and actual local frame capture
         run: |
           FFMPEG="$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" \

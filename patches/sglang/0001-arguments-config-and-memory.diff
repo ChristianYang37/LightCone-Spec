@@ -151,7 +151,7 @@ new file mode 100644
 index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,304 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -258,6 +258,7 @@ index 00000000..8ec8b2c7
 +    lora_matrix_policy: str = "linear_weights"
 +    native_head_policy: str = "include_for_hybrid_scope"
 +    failure_injection: str | None = None
++    context_gate_v1: dict | None = None
 +
 +    @classmethod
 +    def load(
@@ -382,6 +383,9 @@ index 00000000..8ec8b2c7
 +            raise ValueError("controlled_candidate_role must be capture or compare")
 +        if (tp_size, dp_size) not in {(1, 1), (2, 1), (1, 2)}:
 +            raise ValueError("online adaptation supports TP1, TP2, and two TP1 replicas")
++        from lightcone_spec.context_gate import validate_gate
++        validate_gate(value.get("context_gate_v1"), algorithm=algorithm, method=method,
++                      max_in_flight=max_in_flight, reset_scope=reset_scope, dp_size=dp_size)
 +        return cls(
 +            method=method,
 +            algorithm=algorithm,
@@ -416,6 +420,7 @@ index 00000000..8ec8b2c7
 +            confidence_temperatures=confidence_temperatures,
 +            save_confidence_outcomes=bool(value.get("save_confidence_outcomes", False)),
 +            failure_injection=value.get("failure_injection"),
++            context_gate_v1=value.get("context_gate_v1"),
 +        )
 +
 +

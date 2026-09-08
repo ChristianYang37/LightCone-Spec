@@ -1413,3 +1413,62 @@ def test_attempt_summary_serializes_mixed_nested_parquet_columns(tmp_path):
     summarize_attempts(attempts, output)
     assert (output / "summary.csv").is_file()
     assert (output / "summary.parquet").is_file()
+
+
+def context_benchmark_rows(split="evaluation"):
+    from lightcone_spec.preview_benchmark import MODES
+    modes = ("static",) if split == "calibration" else MODES
+    return [{"id": f"{split}-{mode}-{i}-{j}", "split": split, "mode": mode,
+             "sample": i, "bucket": j, "domain": ("Chat", "Code", "Math")[i // 4],
+             "status": "completed", "output_tokens": 4096, "throughput": 100 + i,
+             "decode_speed": 100 if j < 3 else 80, "al": 5 if j < 3 else 4}
+            for mode in modes for i in range(12) for j in range(10)]
+
+
+def test_context_calibration_joint_bonferroni_and_two_consecutive_bins():
+    from lightcone_spec.preview_benchmark import cached_gate, calibrate
+    rows = context_benchmark_rows("calibration")
+    calibration = calibrate(rows, {"runtime": "test"})
+    assert calibration["threshold"] == 12288
+    assert calibration["critical_t"] > 3
+    assert cached_gate(calibration, {"runtime": "changed"})[1] == "uncalibrated"
+    for row in rows:
+        row["al"] = 5
+    assert calibrate(rows, {})["status"] == "no_trigger_detected"
+    for row in rows:
+        row["al"] = 4 if row["bucket"] in (3, 5, 7, 9) else 5
+    assert calibrate(rows, {})["threshold"] is None
+    with pytest.raises(ValueError, match="missing"):
+        calibrate(rows[:-1], {})
+
+
+def test_context_report_uses_four_sample_mean_and_twelve_paired_units(tmp_path):
+    from lightcone_spec.preview_benchmark import write_report
+    rows = context_benchmark_rows()
+    report = write_report(tmp_path, rows, {"commit": "abc"}, complete=True)
+    cell = report["tables"][0]
+    assert cell["throughput"]["mean"] == 101.5
+    assert cell["throughput"]["sample_variance"] == pytest.approx(5 / 3)
+    assert report["paired_effects"]["static"]["independent_samples"] == 12
+    assert report["paired_effects"]["static"]["ratio"] == 1
+    assert len(report["tables"]) == 90
+    with pytest.raises(ValueError, match="duplicate"):
+        write_report(tmp_path, rows + rows[:1], {}, complete=True)
+
+
+def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_path):
+    from lightcone_spec.preview_benchmark import digest, validate_report, write_report
+    manifest = {"environment": {"gpu": "synthetic-test-not-GPU"}}
+    provenance = {"commit": "candidate", "manifest": digest(manifest), "environment": manifest["environment"]}
+    rows = context_benchmark_rows("calibration") + context_benchmark_rows()
+    for row in rows:
+        row.update(provenance=provenance, duration_seconds=4096 / row["throughput"],
+                   delivered_verify_tokens=4095, prefill_generated_tokens=1, target_calls=4095 / row["al"],
+                   native_first_token_ns=1, native_last_token_ns=1 + 4095 * 1e9 / row["decode_speed"])
+    report = write_report(tmp_path, rows, provenance, complete=True)
+    assert validate_report(report, manifest, candidate_commit="candidate", environment=manifest["environment"])["status"] == "verified"
+    with pytest.raises(ValueError, match="mismatch"):
+        validate_report(report, manifest, candidate_commit="different", environment=manifest["environment"])
+    report["rows"][0]["duration_seconds"] *= 2
+    with pytest.raises(ValueError, match="raw counts"):
+        validate_report(report, manifest, candidate_commit="candidate", environment=manifest["environment"])

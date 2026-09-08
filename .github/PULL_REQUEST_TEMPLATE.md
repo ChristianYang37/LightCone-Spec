@@ -15,3 +15,11 @@
 - [ ] SGLang changes, if any, are patch-first and preserve measured behavior
 
 ## Compatibility and memory impact
+
+## Preview benchmark (performance changes)
+
+- Candidate commit and trusted maintainer GPU run:
+- Matched benchmark manifest/environment and verified report:
+- Absolute throughput/AL, matched ratios, domains and worst cell:
+- [ ] Report verifier passed; producer/log origin reviewed by maintainer
+- [ ] Not applicable: documentation-only (explain)

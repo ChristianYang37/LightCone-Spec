@@ -222,7 +222,7 @@ def _execution_backend(job: Job) -> str:
 
 
 def _request_scoped_adaptation(job: Job) -> bool:
-    return job.method in {"tts", "l0_naive"}
+    return job.method in {"tts", "l0_naive"} or bool(job.parameters.get("context_benchmark_v1"))
 
 
 def _telemetry_round_items(job: Job) -> int:
@@ -272,7 +272,8 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
                 or stride != job.parameters.get("stride")):
             raise ValueError("stride audit requires excluded registered configuration")
     if job.parameters.get("preview_revision") == 3:
-        expected_stride = 1 if job.method == "lightcone" else 10
+        from .preview_revision import preview_lightcone_stride
+        expected_stride = preview_lightcone_stride(job.parameters) if job.method == "lightcone" else 10
         if stride != expected_stride:
             raise ValueError("preview-v3 stride differs from frozen method recipe")
     if uses_formal_adaptation_stride(job) and stride != FORMAL_ADAPTATION_STRIDE:
@@ -350,6 +351,11 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "controlled_candidate_role": chosen.get("controlled_candidate_role"),
         "failure_injection": chosen.get("failure"),
     }
+    if chosen.get("context_gate_v1") is not None:
+        from .context_gate import validate_gate
+        validate_gate(chosen["context_gate_v1"], algorithm=payload["algorithm"], method=method,
+                      max_in_flight=payload["max_in_flight"], reset_scope=payload["reset_scope"], dp_size=1)
+        payload["context_gate_v1"] = chosen["context_gate_v1"]
     if chosen.get("verification") == "fixed_budget":
         payload["fixed_total_token_budget"] = int(
             chosen.get("proposal_budget", 8)
@@ -587,6 +593,7 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
         job.model,
         job.backend,
         job.parameters.get("preview_revision"),
+        json.dumps(job.parameters.get("context_gate_v1"), sort_keys=True),
         memory_budget_policy(job),
         _execution_backend(job),
         job.parameters.get("draft_key"),
@@ -804,6 +811,10 @@ class ServerProcess:
         # Always override inherited values: old experiments must retain their
         # fixed reservation even when resumed by a coverage-enabled runner.
         environment["LIGHTCONE_MEMORY_BUDGET_POLICY"] = memory_budget_policy(self.job)
+        environment.pop("LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB", None)
+        if self.job.parameters.get("context_benchmark_v1"):
+            environment["LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB"] = str(
+                self.config.server.adaptation_reserve_mb)
         environment.pop("LIGHTCONE_MEMORY_BUDGET_QA", None)
         environment.pop("LIGHTCONE_QA_ALLOCATOR_TRACE_DIR", None)
         if (self.job.parameters.get("excluded_from_analysis") is True

@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from lightcone_spec.config import ExperimentConfig
 from lightcone_spec.metrics import SAFETY_COUNTERS, per_user_generation_speed
 from lightcone_spec.preview import QWEN38_MODEL, QWEN38_VIDEO_METHODS, VIDEO_METHODS
-from lightcone_spec.preview_revision import preview_recipe
+from lightcone_spec.preview_revision import preview_lightcone_stride, preview_recipe
 from lightcone_spec.protocol import Job
 from lightcone_spec.recording import StreamRecording, recording_nvml_peaks, validate_recording
 from lightcone_spec.runner import (
@@ -59,6 +59,8 @@ def main():
     manifest = state.selection("formal_preview_manifest_v3", {})
     if manifest.get("version") != 3 or (not args.qa and acceptance.get("manifest") != manifest):
         raise RuntimeError("video requires matching preview-v3 manifest acceptance")
+    if preview_lightcone_stride(manifest) != 10:
+        raise RuntimeError("video requires restored S10 preview manifest; migrate at idle boundary first")
     newer = args.model == QWEN38_MODEL
     backend, method, label = (QWEN38_VIDEO_METHODS if newer else VIDEO_METHODS)[args.method_index]
     prompts = manifest["qwen38"]["prompts"] if newer else manifest["prompts"]["LiveCodeBench"][:8]
@@ -69,10 +71,11 @@ def main():
         context=17408, load="c8", width=(4 if backend == "NEXTN" else 8 if newer else 16) if backend != "NONE" else None,
         parameters={"excluded_from_analysis": True, "coverage_runtime": True,
                     "panel": "preview_v1", "preview_panel": "excluded_video", "preview_revision": 3,
+                    "preview_lightcone_stride": 10,
                     "topology": f"tp{args.tp}_dp1", "sampling_seed": 0,
                     "preview_prompt_records": prompts, "regime": "preview_constructed_chat",
                     "input_tokens": 16384, "enable_thinking": False, "respect_eos": True,
-                    "execution_request_count": 8, "stride": 1 if method == "lightcone" else 10, "generation_tokens": 1024,
+                    "execution_request_count": 8, "stride": 10, "generation_tokens": 1024,
                     "memory_budget_policy": "method_peak_v1" if newer else "fixed_reserve_v1",
                     "frozen_recipe": preview_recipe(method, backend, manifest)},
     )

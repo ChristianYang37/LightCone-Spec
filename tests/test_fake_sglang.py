@@ -70,6 +70,44 @@ from lightcone_spec.server import (
 from lightcone_spec.state import StateStore
 
 
+def test_context_static_and_adaptive_share_reserved_budget(monkeypatch):
+    budget = _memory_budget_functions()["adaptation_budget"]
+    monkeypatch.setenv("LIGHTCONE_MEMORY_BUDGET_POLICY", "fixed_reserve_v1")
+    monkeypatch.setenv("LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB", "53248")
+    static = budget(SimpleNamespace())
+    adaptive = budget(SimpleNamespace(_speculative_adaptation_resident_bytes=1024))
+    assert static["headroom_bytes"] == 53248 * 1024**2
+    assert adaptive["headroom_bytes"] + 1024 == static["headroom_bytes"]
+    monkeypatch.delenv("LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB")
+    assert budget(SimpleNamespace())["headroom_bytes"] == 0
+
+
+def test_context_gate_native_round_uses_committed_not_reserved_and_skips_capture():
+    from lightcone_spec.context_gate import ContextGate
+    _, tree = _patched_residual_rms()
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DFlashDrafterAdapter")
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("begin_round", "capture_canvas")]
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(methods, []), "context-gate", "exec"), namespace)
+    runtime = SimpleNamespace(context_gate=ContextGate(4096), context_update_allowed=False,
+        context_gate_activations=0, context_gate_activation_context=None, context_gate_blocked_rounds=0,
+        begin_round=lambda ids, lengths: 7)
+    runtime.update_due = lambda: runtime.context_update_allowed
+    adapter = SimpleNamespace(runtime=runtime, request_slots=None)
+    batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r")], seq_lens=torch.tensor([4090]),
+                            seq_lens_cpu=torch.tensor([9000]))
+    assert namespace["begin_round"](adapter, batch) == (7,)
+    assert not runtime.context_update_allowed
+    # None has no clone(): any preparation before activation would fail here.
+    namespace["capture_canvas"](adapter, batch, input_embeds=None, positions=None)
+    assert adapter._captured_input is None
+    batch.seq_lens[0] = 4095
+    namespace["begin_round"](adapter, batch)
+    assert runtime.context_update_allowed and runtime.context_gate_activation_context == 4096
+    namespace["begin_round"](adapter, batch)
+    assert runtime.context_gate_activations == 1
+
+
 def test_live_stream_observer_uses_real_chunks_and_detects_disk_failure(tmp_path):
     from lightcone_spec.client import _consume_stream
     from lightcone_spec.recording import StreamRecording
@@ -4158,7 +4196,8 @@ def test_video_entry_creates_server_directory(monkeypatch, tmp_path):
     config = SimpleNamespace(gpu_ids=(0, 1), run_dir=tmp_path / "state",
                              server=SimpleNamespace(base_port=30000))
     state = StateStore(config.run_dir)
-    manifest = {"version": 3, "prompts": {"LiveCodeBench": [{"prompt": str(i)} for i in range(8)]}}
+    manifest = {"version": 3, "preview_lightcone_stride": 10,
+                "prompts": {"LiveCodeBench": [{"prompt": str(i)} for i in range(8)]}}
     state.set_selection("formal_preview_video_acceptance_v3", {
         "Qwen/Qwen3-8B": {"status": "accepted", "tp": 1, "manifest": manifest}})
     state.set_selection("formal_preview_manifest_v3", manifest)

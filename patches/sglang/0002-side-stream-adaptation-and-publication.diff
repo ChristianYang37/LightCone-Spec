@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1614 @@
+@@ -0,0 +1,1628 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -881,6 +881,23 @@ index 00000000..20e93274
 +                slot = self.request_slots.acquire(request_id)
 +                self.slot_rounds[slot.index] += 1
 +        version = self.runtime.begin_round(request_ids, batch.seq_lens)
++        if self.runtime.context_gate is not None:
++            if len(batch.reqs) != 1:
++                raise RuntimeError("context gate supports exactly one request")
++            gate = self.runtime.context_gate
++            if gate.threshold is not None and not gate.active:
++                # CPU allocation bounds can lag in overlap mode. The native GPU
++                # length excludes the already sampled bonus token; include it,
++                # but never include draft padding. This scalar sync is measured
++                # gate overhead, not hidden from benchmark throughput.
++                committed_context = int(batch.seq_lens[0].item()) + 1
++                self.runtime.context_update_allowed = gate.observe(
++                    request_ids[0], committed_context)
++                if gate.active:
++                    self.runtime.context_gate_activations += 1
++                    self.runtime.context_gate_activation_context = committed_context
++            if not self.runtime.context_update_allowed:
++                self.runtime.context_gate_blocked_rounds += 1
 +        return (version,) * len(request_ids)
 +
 +    def capture_canvas(
@@ -1521,12 +1538,10 @@ index 00000000..20e93274
 +                            replay_logits=active_logits,
 +                            valid_mask=training_mask,
 +                        )
-+                    distillation_targets = self._distillation_targets(target, training_mask)
 +                    loss = self._distillation_loss(
 +                        inference_logits,
 +                        target,
 +                        training_mask,
-+                        prepared=distillation_targets,
 +                    )
 +
 +                    def member_feedback(parameters):
@@ -1563,7 +1578,6 @@ index 00000000..20e93274
 +                                draft_logits,
 +                                target,
 +                                training_mask,
-+                                prepared=distillation_targets,
 +                            )
 +                            return torch.where(
 +                                reconstruction_ok,
@@ -2044,7 +2058,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2641 @@
+@@ -0,0 +1,2666 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -3291,6 +3305,13 @@ index 00000000..7b2cb5db
 +        max_trace_batch: int,
 +    ) -> None:
 +        self.config = config
++        from lightcone_spec.context_gate import ContextGate
++        gate = getattr(config, "context_gate_v1", None)
++        self.context_gate = ContextGate(**gate) if gate is not None else None
++        self.context_update_allowed = gate is None
++        self.context_gate_activations = 0
++        self.context_gate_activation_context = None
++        self.context_gate_blocked_rounds = 0
 +        self.device = _canonical_runtime_device(device)
 +        self.reserve_bytes = int(reserve_bytes)
 +        if self.reserve_bytes <= 0:
@@ -3786,7 +3807,8 @@ index 00000000..7b2cb5db
 +
 +    def update_due(self) -> bool:
 +        return (
-+            self.disabled_reason is None
++            self.context_update_allowed
++            and self.disabled_reason is None
 +            and self.round > 0
 +            and self.round
 +            % (self.config.stride * self.config.update_coalescing)
@@ -4205,6 +4227,9 @@ index 00000000..7b2cb5db
 +        self.disabled_reason = None
 +        self.quota_shadow.reset()
 +        self.active_request_id = None
++        if self.context_gate is not None:
++            self.context_gate.reset()
++            self.context_update_allowed = False
 +        return True
 +
 +    def reset(self) -> None:
@@ -4227,6 +4252,12 @@ index 00000000..7b2cb5db
 +        self.quota_shadow.reset()
 +        for key in self.counters:
 +            self.counters[key] = 0
++        self.context_gate_activations = 0
++        self.context_gate_activation_context = None
++        self.context_gate_blocked_rounds = 0
++        if self.context_gate is not None:
++            self.context_gate.reset()
++            self.context_update_allowed = False
 +        for key in self.timings_ms:
 +            self.timings_ms[key] = 0.0
 +        self.load_samples = 0
@@ -4535,6 +4566,14 @@ index 00000000..7b2cb5db
 +            "trainable_parameters": self.trainable_parameters,
 +            "memory_ledger": dict(self.memory_ledger),
 +            "parameter_layout": self.parameter_layout,
++            "context_gate_v1": None if self.context_gate is None else {
++                "threshold": self.context_gate.threshold,
++                "active": self.context_gate.active,
++                "activation_context": self.context_gate.activation_context,
++            },
++            "context_gate_activations": self.context_gate_activations,
++            "context_gate_activation_context": self.context_gate_activation_context,
++            "context_gate_blocked_rounds": self.context_gate_blocked_rounds,
 +            "batch_fill": (
 +                self.running_requests_sum / load_samples if load_samples else 0.0
 +            ),

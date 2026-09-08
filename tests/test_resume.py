@@ -105,6 +105,52 @@ def _continuation_manifest():
             "qwen38": {"tp": 2, "checkpoints": QWEN38_CHECKPOINTS, "prompts": records[:8]}}
 
 
+def test_preview_s10_restore_is_atomic_preserves_old_attempts_and_baselines(tmp_path):
+    from lightcone_spec.preview import preview_jobs
+    from lightcone_spec.preview_continuation import group_accepted, restore_preview_s10
+    from lightcone_spec.preview_revision import PREVIEW_V3_NODES
+
+    state = StateStore(tmp_path)
+    manifest = _continuation_manifest()
+    jobs = preview_jobs(manifest)
+    state.set_selection("formal_preview_manifest_v3", manifest)
+    acceptance = {"trajectory_diagnosis": "reviewed", "manifest": manifest,
+                  "nodes": dict.fromkeys(PREVIEW_V3_NODES, "accepted")}
+    state.set_selection("formal_preview_acceptance_v3", acceptance)
+    state.set_selection("formal_preview_v3", {"enabled": True, "status": "completed"})
+    state.set_selection("lightcone_recipe", {"stride": 10, "formal": True})
+    state.add_internal_jobs(jobs)
+    lc = next(j for j in jobs if j.method == "lightcone")
+    attempt_dir = tmp_path / "legacy-attempt"
+    attempt_dir.mkdir()
+    raw = attempt_dir / "metrics.json"
+    raw.write_text('{"resolved_stride":1}')
+    attempt = state.start(lc, (0,), attempt_dir)
+    with pytest.raises(RuntimeError, match="idle cell boundary"):
+        restore_preview_s10(state)
+    assert state.selection("formal_preview_manifest_v3") == manifest
+    state.complete(lc.job_id, attempt)
+    with state.connect() as db:
+        before = [tuple(r) for r in db.execute("SELECT job_id,config_json,status FROM jobs ORDER BY job_id")]
+        attempts = [tuple(r) for r in db.execute("SELECT * FROM attempts")]
+    assert restore_preview_s10(state)
+    assert not restore_preview_s10(state)
+    assert raw.read_text() == '{"resolved_stride":1}'
+    with state.connect() as db:
+        assert before == [tuple(r) for r in db.execute("SELECT job_id,config_json,status FROM jobs ORDER BY job_id")]
+        assert attempts == [tuple(r) for r in db.execute("SELECT * FROM attempts")]
+    candidate = state.selection("formal_preview_manifest_v3")
+    assert candidate["preview_lightcone_stride"] == 10
+    assert not group_accepted(acceptance, candidate, lc.node)
+    assert state.selection("formal_preview_acceptance_v3") == {}
+    assert state.selection("lightcone_recipe") == {"stride": 10, "formal": True}
+    assert all(j.method != "lightcone" for n in PREVIEW_V3_NODES for j in state.jobs(n))
+    state.add_internal_jobs(preview_jobs(candidate))
+    state.add_internal_jobs(preview_jobs(candidate))
+    assert sum(len(state.jobs(n)) for n in PREVIEW_V3_NODES) == 96
+    assert state.job_status(lc.job_id + "__s10") == "pending"
+
+
 def test_preview_continuation_scoped_topology_and_immutable_first40(tmp_path):
     from copy import deepcopy
 
@@ -162,7 +208,7 @@ def test_preview_refreshes_acceptance_and_holds_dag_for_videos(monkeypatch, tmp_
     from lightcone_spec.preview_continuation import group_rows
     from lightcone_spec.runner import _run_preview_v3
     state = StateStore(tmp_path)
-    manifest = _continuation_manifest()
+    manifest = {**_continuation_manifest(), "preview_lightcone_stride": 10}
     state.set_selection("formal_preview_manifest_v3", manifest)
     state.set_selection("formal_preview_v3", {"enabled": True})
     state.set_selection("formal_preview_continuation_v1", {"enabled": True})
@@ -309,7 +355,7 @@ def test_preview_v3_cannot_reuse_legacy_acceptance_or_execute_tts(tmp_path):
     assert state.jobs("E3b-preview-v1") == ()
     with pytest.raises(RuntimeError, match="revision-3 manifest"):
         _run_preview_v3(config, state, stop)
-    state.set_selection("formal_preview_manifest_v3", {"version": 3})
+    state.set_selection("formal_preview_manifest_v3", {"version": 3, "preview_lightcone_stride": 10})
     state.set_selection("formal_preview_qwen38_acceptance_v1", {"status": "accepted"})
     with pytest.raises(RuntimeError, match="reviewed output divergence"):
         _run_preview_v3(config, state, stop)

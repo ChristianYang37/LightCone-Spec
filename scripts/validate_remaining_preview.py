@@ -88,6 +88,9 @@ def main():
     if active:
         raise RuntimeError("formal jobs still active; QA requires an exclusive boundary")
     manifest = json.loads(args.manifest.read_text())
+    from lightcone_spec.preview_revision import preview_lightcone_stride
+    if preview_lightcone_stride(manifest) != 10:
+        raise RuntimeError("remaining preview QA requires restored S10 manifest")
     source = remaining_cases(manifest, args.node)[args.case]
     if args.anchor:
         if source.method != "static" or not source.load.startswith("closed_loop_c"):

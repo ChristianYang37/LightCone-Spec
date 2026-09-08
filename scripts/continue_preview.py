@@ -303,7 +303,10 @@ class Controller:
 
     def run(self):
         while True:
-            _, counts, active = read_state(self.config.run_dir)
+            selections, counts, active = read_state(self.config.run_dir)
+            from lightcone_spec.preview_revision import preview_lightcone_stride
+            if preview_lightcone_stride(selections.get("formal_preview_manifest_v3", {})) != 10:
+                raise RuntimeError("restore preview S10 at idle boundary and revalidate first40 before continuation")
             if counts.get(("E3b-preview-v3", "failed"), 0):
                 raise RuntimeError("first forty failed; diagnose without replacing active work")
             if first_group_complete(counts) and not active and not gpu_owners():

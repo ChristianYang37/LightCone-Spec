@@ -3651,7 +3651,7 @@ new file mode 100644
 index 0000000..70493fc
 --- /dev/null
 +++ b/python/sglang/srt/speculative/adaptation_memory_budget.py
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,77 @@
 +"""Pre-KV budget from the already constructed, TP-local adapter layout."""
 +
 +import os
@@ -3667,6 +3667,12 @@ index 0000000..70493fc
 +def adaptation_budget(server_args):
 +    policy = memory_policy()
 +    cap = int(getattr(server_args, "speculative_adaptation_reserve_mb", 0)) * (1 << 20)
++    benchmark_reserve = os.environ.get("LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB")
++    if benchmark_reserve is not None:
++        if policy != "fixed_reserve_v1" or int(benchmark_reserve) <= 0:
++            raise ValueError("invalid matched context benchmark reserve")
++        # Match Static's reserved budget too; no adapter config/state is invented.
++        cap = int(benchmark_reserve) * (1 << 20)
 +    resident = int(getattr(server_args, "_speculative_adaptation_resident_bytes", 0))
 +    ledger = getattr(server_args, "_speculative_adaptation_memory_ledger", None)
 +    adaptive = bool(getattr(server_args, "speculative_adaptation_config", None))

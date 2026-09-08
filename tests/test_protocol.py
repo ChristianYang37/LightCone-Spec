@@ -294,8 +294,10 @@ def test_preview_v3_exact_96_isolates_recipes_and_all_baselines(monkeypatch):
     monkeypatch.syspath_prepend(str(scripts))
     qa = runpy.run_path(str(scripts / "validate_preview_group.py"))
     candidate, source_name = qa["qa_manifest"]({"formal_preview_manifest_v1": {**manifest, "version": 1}})
-    assert candidate == manifest and source_name.startswith("excluded_candidate")
-    assert qa["qa_manifest"]({"formal_preview_manifest_v3": manifest}) == (manifest, "formal_preview_manifest_v3")
+    from lightcone_spec.preview_revision import s10_manifest
+    assert candidate == s10_manifest(manifest) and source_name.startswith("excluded_candidate")
+    assert qa["qa_manifest"]({"formal_preview_manifest_v3": manifest})[0] == s10_manifest(manifest)
+    assert qa["qa_manifest"]({"formal_preview_manifest_v3": candidate}) == (candidate, "formal_preview_manifest_v3")
     with pytest.raises(ValueError, match="no legacy fallback"):
         qa["qa_manifest"]({"formal_preview_manifest_v3": {"version": 2},
                            "formal_preview_manifest_v1": {**manifest, "version": 1}})
@@ -323,6 +325,21 @@ def test_preview_v3_exact_96_isolates_recipes_and_all_baselines(monkeypatch):
     legacy = replace(next(j for j in jobs if j.method == "lightcone"),
                      parameters={"stride": 1})
     assert adaptation_payload(legacy)["stride"] == 10
+
+    restored = preview_jobs(s10_manifest(manifest))
+    assert len(restored) == 96 and manifest == original
+    for old, new in zip(jobs, restored, strict=True):
+        if old.method != "lightcone":
+            assert new == old  # baseline identity, recipe, prompts and pairing remain reusable
+            continue
+        assert new.job_id == old.job_id + "__s10"
+        assert new.parameters["replaces_job_id"] == old.job_id
+        assert new.parameters["pairing_key"] == old.parameters["pairing_key"]
+        assert new.parameters["preview_prompt_records"] == old.parameters["preview_prompt_records"]
+        assert new.parameters["stride"] == 10 and "S=10" in new.parameters["method_label"]
+        payload = adaptation_payload(new, new.parameters["frozen_recipe"])
+        assert payload["stride"] == 10
+        assert payload["optimizer"]["learning_rate"] == .001
 
 
 def test_full_condition_qa_requires_complete_safe_rank_evidence(tmp_path, monkeypatch):
@@ -1211,3 +1228,50 @@ def test_excluded_trajectory_logprobs_preserve_supported_paths():
                   model="Qwen/Qwen3-8B", backend="DFLASH", task="MATH-500", parameters=frozen)
     from lightcone_spec.server import adaptation_payload
     assert adaptation_payload(control, frozen["frozen_recipe"])["stride"] == 32769
+
+
+def test_context_benchmark_exact_inputs_and_disjoint_source_splits():
+    from lightcone_spec.preview_benchmark import DOMAINS, cases, construct_inputs, sample_sets
+    pools = {name: [{"problem_id": str(i), "prompt": f"{name}/{i}:" + "x" * 20000}
+                    for i in range(10)] for datasets in DOMAINS.values() for name in datasets}
+    splits = sample_sets(pools, [])
+    assert len(splits["calibration"]) == len(splits["evaluation"]) == 12
+    identities = [{(r["dataset"], r["problem_id"]) for r in splits[s]} for s in splits]
+    assert all(not a & b for n, a in enumerate(identities) for b in identities[n + 1:])
+    # Compact task text, independent long background. The tokenizer models full template IDs.
+    for split in ("calibration", "evaluation"):
+        for row in splits[split]:
+            row["prompt"] = row["prompt"][:40]
+
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return list(map(ord, text))
+
+        def apply_chat_template(self, messages, tokenize, **kwargs):
+            text = "<user>" + messages[0]["content"] + "</user><assistant>"
+            return self.encode(text) if tokenize else text
+
+    inputs = construct_inputs(Tokenizer(), splits)
+    assert len(inputs) == 240
+    assert all(r["input_tokens"] == r["bucket"] * 4096 for r in inputs if r["bucket"])
+    manifest = {"inputs": inputs}
+    assert len(cases(manifest, "calibrate")) == 120
+    assert len({c["id"] for c in cases(manifest, "run")}) == 360
+    assert sum(c["output_tokens"] for p in ("calibrate", "run") for c in cases(manifest, p)) == 1966080
+
+
+def test_context_gate_committed_boundary_reset_retraction_and_scope():
+    from lightcone_spec.context_gate import ContextGate, validate_gate
+    gate = ContextGate(4096)
+    assert not gate.observe("request", 4090)
+    assert gate.observe("request", 4096)
+    assert gate.observe("request", 4080)  # Retraction does not clear activation.
+    assert gate.activation_context == 4096
+    with pytest.raises(RuntimeError):
+        gate.observe("different-request", 5000)
+    gate.reset()
+    assert gate.observe("different-request", 8192)
+    assert not ContextGate(None).observe("r", 40000)
+    with pytest.raises(ValueError):
+        validate_gate({"threshold": 4096, "max_context": 40960}, algorithm="DFLASH",
+                      method="l0", max_in_flight=2, reset_scope="request", dp_size=1)
