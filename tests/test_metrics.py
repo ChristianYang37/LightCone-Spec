@@ -133,6 +133,17 @@ def test_timing_boundary_retains_rank_evidence_without_profiling(monkeypatch, tm
     assert diagnostic._recorder is None
 
 
+def test_target_verify_is_not_mislabeled_as_prefill():
+    from types import SimpleNamespace
+
+    from lightcone_spec.timing_diagnostic import _model_phase
+
+    mode = SimpleNamespace(is_target_verify=lambda: True, is_extend=lambda: True)
+    batch = SimpleNamespace(forward_mode=mode)
+    assert _model_phase(SimpleNamespace(is_draft_worker=False), (batch,), {}) == "target_verification"
+    assert _model_phase(SimpleNamespace(is_draft_worker=True), (batch,), {}) == "draft_forward"
+
+
 def test_video_native_final_accounting_rejects_loss_duplicates_and_wrong_denominator():
     from copy import deepcopy
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -138,6 +139,8 @@ def main():
         for job in jobs:
             if stopping or (args.max_cells is not None and count >= args.max_cells):
                 break
+            if shutil.disk_usage(args.output).free < 12 * 1024**3:
+                raise RuntimeError("below 12 GiB free at audit cell boundary; archive before continuing")
             status = state.job_status(job.job_id)
             if status == "completed":
                 continue
@@ -170,6 +173,13 @@ def main():
                 if any(s["job_id"] != job.job_id for s in snapshots):
                     raise RuntimeError("timing window identity mismatch")
                 if job.parameters["timing_mode"] == "full":
+                    for snapshot in snapshots:
+                        measured = {r["name"] for r in snapshot["records"] if r["clock"] == "cuda"}
+                        required = {"draft_forward", "target_verification"}
+                        if job.method == "lightcone":
+                            required |= {"training", "optimizer", "publish", "reconstruction_check"}
+                        if not required <= measured:
+                            raise RuntimeError(f"incomplete full timing coverage: {sorted(required - measured)}")
                     report = summarize_timing(snapshots, expected_ranks=(0, 1), wall_seconds=metrics["duration_seconds"],
                                               tokens=metrics["committed_tokens"], updates=metrics.get("updates_published"))
                     write_timing_report(report, directory / "timing")

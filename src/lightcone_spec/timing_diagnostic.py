@@ -83,9 +83,12 @@ def _model_phase(self, args, kwargs):
         return "draft_forward"
     batch = kwargs.get("forward_batch", args[0] if args else None)
     mode = getattr(batch, "forward_mode", None)
+    # TARGET_VERIFY is also is_extend() upstream; distinguish it first.
+    if mode is not None and mode.is_target_verify():
+        return "target_verification"
     if mode is not None and mode.is_extend():
-        return "target_prefill_or_verify_extend"
-    return "target_decode_or_verify"
+        return "target_prefill"
+    return "target_decode"
 
 
 def _instrument(module):
