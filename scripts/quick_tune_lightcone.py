@@ -47,8 +47,11 @@ def safe_metrics(client, *, adaptive, reset=False):
             raise RuntimeError("adapter/reset state not clear")
         if not reset and any(r.get("updates_published", 0) < 1 for r in ranks):
             raise RuntimeError("adaptive short window published no update")
-    if reset and any(r.get("committed_tokens") != 0 for r in ranks):
-        raise RuntimeError("request counters not reset")
+    # v48 flush clears the request/cache and target-call counters, but its
+    # committed-token reporter is lifetime cumulative. Keep that raw counter
+    # and use explicit per-window offsets, never confuse it with a live RID.
+    if reset and any(r.get("target_calls") != 0 or r.get("accepted_drafts") != 0 for r in ranks):
+        raise RuntimeError("request/cache counters not reset")
     return measured
 
 
@@ -163,14 +166,23 @@ def main():
 
                         def cleanup(deadline):
                             after = safe_metrics(client, adaptive=method == "lightcone")
+                            audit = {"before": before, "after": after}
+                            (directory / f"{phase}-cleanup.json").write_text(json.dumps(audit))
+                            deltas = [a["committed_tokens"] - b["committed_tokens"]
+                                      for b, a in zip(before["rank_local"], after["rank_local"], strict=True)]
+                            if any(d < 0 for d in deltas):
+                                raise RuntimeError("lifetime committed-token counter regressed")
                             client.reset(timeout_seconds=max(.001, deadline-time.perf_counter()))
                             reset = safe_metrics(client, adaptive=method == "lightcone", reset=True)
-                            return {"after": after, "reset": reset}
+                            audit.update(reset=reset, rank_committed_token_deltas=deltas,
+                                         committed_token_scope="lifetime reporter; window offsets retained")
+                            (directory / f"{phase}-cleanup.json").write_text(json.dumps(audit))
+                            return audit
 
                         result = {"status": "failed", "formal_acceptance": False}
                         try:
                             for phase, seconds in (("warmup", 10), ("measure", 30)):
-                                safe_metrics(client, adaptive=method == "lightcone", reset=True)
+                                before = safe_metrics(client, adaptive=method == "lightcone", reset=True)
                                 evidence = WindowEvidence(seconds)
                                 try:
                                     payload = run_window(client, prompts, seconds=seconds, seed=repeat,

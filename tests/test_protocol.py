@@ -90,6 +90,27 @@ def test_quick_tuning_real_config_and_cpu_entrypoint(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="scientific configuration"):
         quick.main()
 
+    # Real v48 reporter retains committed_tokens across successful flush.
+    # Request counters and adaptive reset state must still clear; no gate removed.
+    from lightcone_spec.metrics import SAFETY_COUNTERS
+
+    class Client:
+        def server_info(self):
+            return {}
+
+    ranks = [{**dict.fromkeys(SAFETY_COUNTERS, 0), "committed_tokens": 2048,
+              "target_calls": 0, "accepted_drafts": 0, "active_version": 0,
+              "round": 0, "updates_published": 0, "disabled_reason": None} for _ in range(2)]
+    monkeypatch.setattr(quick, "_speed_metrics", lambda *_: {"rank_local": ranks})
+    assert quick.safe_metrics(Client(), adaptive=True, reset=True)["rank_local"] == ranks
+    ranks[0]["target_calls"] = 1
+    with pytest.raises(RuntimeError, match="request/cache counters"):
+        quick.safe_metrics(Client(), adaptive=True, reset=True)
+    ranks[0]["target_calls"] = 0
+    ranks[0]["active_version"] = 1
+    with pytest.raises(RuntimeError, match="TP ranks disagree"):
+        quick.safe_metrics(Client(), adaptive=True, reset=True)
+
 
 def test_stride_audit_budget_split_identity_and_formal_isolation():
     from lightcone_spec.stride_audit import (
