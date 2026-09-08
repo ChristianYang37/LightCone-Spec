@@ -1418,9 +1418,9 @@ def test_attempt_summary_serializes_mixed_nested_parquet_columns(tmp_path):
 def context_benchmark_rows(split="evaluation"):
     from lightcone_spec.preview_benchmark import MODES
     modes = ("static",) if split == "calibration" else MODES
-    return [{"id": f"{split}-{mode}-{i}-{j}", "split": split, "mode": mode,
+    return [{"id": f"preview-context-v1-{split}-{i:02d}-{j:02d}-{mode}", "split": split, "mode": mode,
              "sample": i, "bucket": j, "domain": ("Chat", "Code", "Math")[i // 4],
-             "status": "completed", "output_tokens": 4096, "throughput": 100 + i,
+             "status": "completed", "output_tokens": 4096, "input_tokens": j * 4096 if j else 100, "throughput": 100 + i,
              "decode_speed": 100 if j < 3 else 80, "al": 5 if j < 3 else 4}
             for mode in modes for i in range(12) for j in range(10)]
 
@@ -1458,9 +1458,11 @@ def test_context_report_uses_four_sample_mean_and_twelve_paired_units(tmp_path):
 
 def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_path):
     from lightcone_spec.preview_benchmark import digest, validate_report, write_report
-    manifest = {"environment": {"gpu": "synthetic-test-not-GPU"}}
-    provenance = {"commit": "candidate", "manifest": digest(manifest), "environment": manifest["environment"]}
     rows = context_benchmark_rows("calibration") + context_benchmark_rows()
+    manifest = {"environment": {"gpu": "synthetic-test-not-GPU"},
+                "inputs": [{k: r[k] for k in ("split", "sample", "bucket", "domain", "input_tokens", "output_tokens")}
+                           for r in rows if r["mode"] == "static"]}
+    provenance = {"commit": "candidate", "manifest": digest(manifest), "environment": manifest["environment"]}
     for row in rows:
         row.update(provenance=provenance, duration_seconds=4096 / row["throughput"],
                    delivered_verify_tokens=4095, prefill_generated_tokens=1, target_calls=4095 / row["al"],

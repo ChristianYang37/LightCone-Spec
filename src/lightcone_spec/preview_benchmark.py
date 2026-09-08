@@ -290,7 +290,13 @@ def validate_report(report, manifest, *, candidate_commit, environment):
         raise ValueError("report candidate/manifest/environment mismatch")
     checked_rows(report["rows"], "calibration", ("static",))
     checked_rows(report["rows"], "evaluation", MODES)
+    expected_cases = {c["id"]: c for phase in ("calibrate", "run") for c in cases(manifest, phase)}
+    if {r["id"] for r in report["rows"]} != set(expected_cases) or len(report["rows"]) != 480:
+        raise ValueError("report call identities differ from manifest")
     for row in report["rows"]:
+        case = expected_cases[row["id"]]
+        if any(row[k] != case[k] for k in ("sample", "bucket", "split", "mode", "domain", "input_tokens", "output_tokens")):
+            raise ValueError("call configuration differs from manifest")
         if row.get("provenance") != provenance:
             raise ValueError("call has mismatched provenance")
         derived = {"throughput": row["output_tokens"] / row["duration_seconds"],
