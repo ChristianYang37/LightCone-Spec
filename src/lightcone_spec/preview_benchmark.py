@@ -6,6 +6,7 @@ import json
 import math
 import random
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -83,7 +84,13 @@ def construct_inputs(tokenizer, splits):
             before, after = text.split(sentinel)
             prefix, suffix = encode(before), encode(after)
             short = tokenizer.apply_chat_template([{"role": "user", "content": row["prompt"]}],
-                tokenize=True, add_generation_prompt=True, enable_thinking=False)
+                tokenize=True, add_generation_prompt=True, enable_thinking=False, return_dict=False)
+            # Transformers versions/tokenizer wrappers can return BatchEncoding.
+            # Iterating it yields field names, not the actual token IDs.
+            if isinstance(short, Mapping):
+                short = short["input_ids"]
+            if not isinstance(short, (list, tuple)) or any(type(token) is not int or token < 0 for token in short):
+                raise ValueError("chat template must supply flat nonnegative integer token IDs")
             if not 0 < len(short) < 4096:
                 raise ValueError("frozen task does not fit the short-input reference")
             for bucket in range(10):
@@ -108,6 +115,10 @@ def cases(manifest, phase):
     for row in sorted(manifest["inputs"], key=lambda r: (r["bucket"], r["sample"])):
         if row["split"] != split:
             continue
+        tokens = row["input_ids"]
+        if (not isinstance(tokens, list) or not tokens or len(tokens) != row["input_tokens"]
+                or any(type(token) is not int or token < 0 for token in tokens)):
+            raise ValueError("manifest contains invalid token IDs or input count")
         modes = ["static"] if phase == "calibrate" else list(MODES)
         rotation = (row["bucket"] + row["sample"]) % len(modes)
         for mode in modes[rotation:] + modes[:rotation]:

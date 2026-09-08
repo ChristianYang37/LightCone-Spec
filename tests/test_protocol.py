@@ -1230,7 +1230,8 @@ def test_excluded_trajectory_logprobs_preserve_supported_paths():
     assert adaptation_payload(control, frozen["frozen_recipe"])["stride"] == 32769
 
 
-def test_context_benchmark_exact_inputs_and_disjoint_source_splits():
+@pytest.mark.parametrize("mapping_output", [False, True])
+def test_context_benchmark_exact_inputs_and_disjoint_source_splits(mapping_output):
     from lightcone_spec.preview_benchmark import DOMAINS, cases, construct_inputs, sample_sets
     pools = {name: [{"problem_id": str(i), "prompt": f"{name}/{i}:" + "x" * 20000}
                     for i in range(10)] for datasets in DOMAINS.values() for name in datasets}
@@ -1249,7 +1250,11 @@ def test_context_benchmark_exact_inputs_and_disjoint_source_splits():
 
         def apply_chat_template(self, messages, tokenize, **kwargs):
             text = "<user>" + messages[0]["content"] + "</user><assistant>"
-            return self.encode(text) if tokenize else text
+            if not tokenize:
+                return text
+            assert kwargs["return_dict"] is False
+            tokens = self.encode(text)
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)} if mapping_output else tokens
 
     inputs = construct_inputs(Tokenizer(), splits)
     assert len(inputs) == 240
@@ -1258,6 +1263,11 @@ def test_context_benchmark_exact_inputs_and_disjoint_source_splits():
     assert len(cases(manifest, "calibrate")) == 120
     assert len({c["id"] for c in cases(manifest, "run")}) == 360
     assert sum(c["output_tokens"] for p in ("calibrate", "run") for c in cases(manifest, p)) == 1966080
+    assert all(type(token) is int for row in inputs for token in row["input_ids"])
+    inputs[0]["input_ids"] = ["input_ids", "attention_mask"]
+    inputs[0]["input_tokens"] = 2
+    with pytest.raises(ValueError, match="invalid token IDs"):
+        cases(manifest, "calibrate")
 
 
 def test_context_gate_committed_boundary_reset_retraction_and_scope():

@@ -1460,7 +1460,8 @@ def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_p
     from lightcone_spec.preview_benchmark import digest, validate_report, write_report
     rows = context_benchmark_rows("calibration") + context_benchmark_rows()
     manifest = {"environment": {"gpu": "synthetic-test-not-GPU"},
-                "inputs": [{k: r[k] for k in ("split", "sample", "bucket", "domain", "input_tokens", "output_tokens")}
+                "inputs": [{**{k: r[k] for k in ("split", "sample", "bucket", "domain", "input_tokens", "output_tokens")},
+                            "input_ids": [1] * r["input_tokens"]}
                            for r in rows if r["mode"] == "static"]}
     provenance = {"commit": "candidate", "manifest": digest(manifest), "environment": manifest["environment"]}
     for row in rows:
