@@ -16,6 +16,20 @@ from lightcone_spec.server import ServerProcess, adaptation_payload, apply_runne
 from lightcone_spec.state import StateStore
 
 
+def update_qa_plan(case, *, reset_diagnostic=False, pressure_only=False):
+    if case not in ("s1-long", "ensemble"):
+        raise ValueError("unknown update QA case")
+    if pressure_only and (case != "s1-long" or reset_diagnostic):
+        raise ValueError("pressure-only is a separate S1 diagnostic, not a reset acceptance")
+    pressure = ("pressure", 32768, 0.)
+    if pressure_only:
+        return [pressure]
+    plan = [("reset-a", 512, 0.), ("reset-b", 512, 0.)]
+    if not reset_diagnostic:
+        plan.append(pressure if case == "s1-long" else ("sampled", 512, 1.))
+    return plan
+
+
 def captured_rank_info(directory, tp, not_before_ns, timeout=5.):
     """TP API returns one DP leader; excluded sidecars retain every TP rank."""
     deadline = time.monotonic() + timeout
@@ -104,6 +118,7 @@ def main():
     parser.add_argument("--gpu", required=True, type=int)
     parser.add_argument("--case", choices=("s1-long", "ensemble"))
     parser.add_argument("--tp", type=int, choices=(1, 2), default=1, help="Excluded topology QA, not group acceptance")
+    parser.add_argument("--pressure-only", action="store_true", help="Independent forced-32K S1 stress; not reset/correctness acceptance")
     parser.add_argument("--reset-diagnostic", type=Path, help="Excluded bounded trace; prior S1 QA directory required")
     parser.add_argument("--optimizer-only", type=Path, help="Subprocess-only GPU transaction config")
     args = parser.parse_args()
@@ -127,6 +142,7 @@ def main():
         raise ValueError("QA case is required")
     if args.reset_diagnostic and (args.case != "s1-long" or args.tp != 1):
         raise ValueError("reset fingerprint diagnosis requires TP1 S1 LoRA")
+    plan = update_qa_plan(args.case, reset_diagnostic=bool(args.reset_diagnostic), pressure_only=args.pressure_only)
     args.output.mkdir(parents=True, exist_ok=False)
     config = replace(original, results_root=args.output, run_name="excluded")
     config.run_dir.mkdir()
@@ -176,11 +192,6 @@ def main():
             (args.output / "inputs.json").write_text(json.dumps({"metadata": metadata, "token_ids": prompts}))
             # Short reset repetitions precede pressure: they cannot substitute
             # for the actual 32K S1 request, and their evidence is separate.
-            plan = [("reset-a", 512, 0.), ("reset-b", 512, 0.),
-                    ("pressure" if args.case == "s1-long" else "sampled", 32768 if args.case == "s1-long" else 512,
-                     0. if args.case == "s1-long" else 1.)]
-            if args.reset_diagnostic:
-                plan = plan[:2]
             reference = None
             def metrics():
                 timestamp = time.time_ns()
@@ -249,8 +260,9 @@ def main():
                     "commits_match_own_argmax": all(r["committed_matches_verify_argmax"] for r in traces),
                     "warning": "synchronization can change asynchronous publication timing; never performance evidence"}, indent=2))
                 return
-        (args.output / "result.json").write_text(json.dumps({"status": "passed_excluded_update_qa",
-            "formal_acceptance": False, "phases": phases}, indent=2))
+        (args.output / "result.json").write_text(json.dumps({
+            "status": "passed_excluded_pressure_only" if args.pressure_only else "passed_excluded_update_qa",
+            "formal_acceptance": False, "reset_test_executed": not args.pressure_only, "phases": phases}, indent=2))
     except BaseException as error:
         (args.output / "failure.json").write_text(json.dumps({"type": type(error).__name__,
             "error": str(error), "phases": phases}, indent=2))

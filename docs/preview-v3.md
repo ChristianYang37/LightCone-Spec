@@ -89,6 +89,11 @@ TP rank. An opt-in local trace records each scheduler's existing metrics before
 its IPC response is filtered; QA requires fresh rank0/rank1 records and checks
 both ranks' update/reset counters. This does not change production telemetry or
 claim unobserved rank-local numbers from the DP-leader API response.
+The explicit `--pressure-only` mode is an independent single forced-32K S1
+stress request (TP1 or TP2), not a rerun of the failed greedy reset-equivalence
+test. It preserves safety/count/publication checks and labels reset coverage
+false. The original cross-reset trajectory assertion is unchanged; passing this
+stress request never grants reset, sampling, common-group or formal acceptance.
 
 ## Metrics, memory and release
 

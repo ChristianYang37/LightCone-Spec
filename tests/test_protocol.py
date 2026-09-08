@@ -107,6 +107,13 @@ def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     assert len(VIDEO_METHODS) == 6 and all(method != "tts" for _, method, _ in VIDEO_METHODS)
     import runpy
     qa = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/validate_preview_updates.py"))
+    assert qa["update_qa_plan"]("s1-long", pressure_only=True) == [("pressure", 32768, 0.)]
+    assert len(qa["update_qa_plan"]("s1-long")) == 3
+    assert len(qa["update_qa_plan"]("s1-long", reset_diagnostic=True)) == 2
+    with pytest.raises(ValueError, match="separate S1"):
+        qa["update_qa_plan"]("ensemble", pressure_only=True)
+    with pytest.raises(ValueError, match="separate S1"):
+        qa["update_qa_plan"]("s1-long", pressure_only=True, reset_diagnostic=True)
     source = next(j for j in jobs if j.method == "lightcone" and j.backend == "DFLASH")
     before = json.dumps(source.to_dict(), sort_keys=True)
     s1, recipe = qa["update_qa_job"](source, "s1-long")
