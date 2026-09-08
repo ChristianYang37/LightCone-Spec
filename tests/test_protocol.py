@@ -160,7 +160,7 @@ def test_qwen38_preview_exact_24_native_mtp_and_common_tp():
         qwen38_jobs(manifest)
 
 
-def test_preview_v3_exact_96_isolates_recipes_and_all_baselines():
+def test_preview_v3_exact_96_isolates_recipes_and_all_baselines(monkeypatch):
     from collections import Counter
     from copy import deepcopy
 
@@ -200,9 +200,69 @@ def test_preview_v3_exact_96_isolates_recipes_and_all_baselines():
     assert all(len({j.gpu_count for j in unit}) == 1 for unit in units.values())
     assert all(len({json.dumps(j.parameters["preview_prompt_records"]) for j in unit}) == 1 for unit in units.values())
     assert jobs == preview_jobs(json.loads(json.dumps(manifest)))
+    import runpy
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    qa = runpy.run_path(str(scripts / "validate_preview_group.py"))
+    for tp in (1, 2):
+        for task in ("MATH-500", "LiveCodeBench"):
+            rows = [qa["full_condition_job"](manifest, task, case, tp) for case in qa["CASES"]]
+            assert len({row.job_id for row in rows}) == 5
+            for row in rows:
+                assert row.gpu_count == tp and row.block == 0 and row.load == "c1"
+                assert row.parameters["execution_request_count"] == 8
+                assert row.parameters["generation_tokens"] == 32768
+                assert row.parameters["respect_eos"] is True
+                assert row.parameters["excluded_from_analysis"] is True
+                assert row.parameters["preview_prompt_records"] == records[:8]
+                source = next(j for j in jobs if j.task == task and j.block == 0
+                              and j.parameters["preview_panel"] == "long_generation"
+                              and (j.backend, j.method) == (row.backend, row.method))
+                assert row.parameters["frozen_recipe"] == source.parameters["frozen_recipe"]
+                assert row.parameters["sampling_seed"] == source.parameters["sampling_seed"]
+    assert manifest == original
+    with pytest.raises(ValueError):
+        qa["full_condition_job"](manifest, "MATH-500", "tts", 2)
     legacy = replace(next(j for j in jobs if j.method == "lightcone"),
                      parameters={"stride": 1})
     assert adaptation_payload(legacy)["stride"] == 10
+
+
+def test_full_condition_qa_requires_complete_safe_rank_evidence(tmp_path, monkeypatch):
+    import gzip
+    import runpy
+    from types import SimpleNamespace
+
+    from lightcone_spec.metrics import SAFETY_COUNTERS
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    qa = runpy.run_path(str(scripts / "validate_preview_group.py"))
+    job = SimpleNamespace(job_id="excluded", method="onlinespec_ens", backend="DFLASH",
+                          task="MATH-500", gpu_count=2, parameters={"qa_source_job_id": "formal"})
+    state = SimpleNamespace(completed_attempt_dir=lambda _: tmp_path)
+    metrics = {"hard_feasible": True, "updates_published": 2,
+               "rank_local_after": [{key: 0 for key in SAFETY_COUNTERS} for _ in range(2)]}
+    with gzip.open(tmp_path / "requests.jsonl.gz", "wt") as stream:
+        for _ in range(8):
+            stream.write(json.dumps({"completion_tokens": 771}) + "\n")
+    (tmp_path / "metrics.json").write_text(json.dumps(metrics))
+    result = qa["full_condition_result"](state, job)
+    assert result["formal_acceptance"] is False and result["normal_eos"] is True
+    assert result["completion_tokens"] == [771] * 8
+    metrics["rank_local_after"][1]["fallbacks"] = 1
+    (tmp_path / "metrics.json").write_text(json.dumps(metrics))
+    with pytest.raises(RuntimeError, match="rank-local"):
+        qa["full_condition_result"](state, job)
+    metrics["rank_local_after"] = metrics["rank_local_after"][:1]
+    (tmp_path / "metrics.json").write_text(json.dumps(metrics))
+    with pytest.raises(RuntimeError, match="rank-local"):
+        qa["full_condition_result"](state, job)
+    metrics["rank_local_after"] *= 2
+    metrics["updates_published"] = 0
+    (tmp_path / "metrics.json").write_text(json.dumps(metrics))
+    with pytest.raises(RuntimeError, match="no updates"):
+        qa["full_condition_result"](state, job)
 
 
 def test_common_tp_requires_all_full_workload_cases_and_correctness():

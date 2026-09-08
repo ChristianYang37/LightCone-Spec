@@ -118,6 +118,18 @@ displayed together; no artificial typing. Video data is excluded from 96 cells.
 
 ## Resume contract
 
+`scripts/validate_preview_group.py` prepares excluded full-condition checks for
+the 8B long-generation comparison. Each invocation uses one block-0 method/task
+with all eight frozen requests, the original normal-EOS 32K limit, seed, cache,
+recipe and budget rules. Select the same TP for all five methods; both tasks
+must be covered before calling the complete group validated. The formal SQLite
+is read-only; attempts and copied selections live in a separate excluded SQLite.
+The normal cell executor supplies request/reset/safety/metrics semantics. TP2
+captures both actual rank metrics before DP-leader filtering; missing ranks or
+any rank's safety error fails the check. Passing one case writes no formal
+acceptance and does not replace the original trajectory diagnosis. No benchmark
+gain may be inferred from these excluded runs.
+
 Freeze `formal_preview_manifest_v3` with version=3 and original stimuli. Enable
 `formal_preview_v3` only after CI and matched GPU QA. Acceptance stores the exact
 manifest, `trajectory_diagnosis=reviewed` and per-node accepted status. Old v1/v2
