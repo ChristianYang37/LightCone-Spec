@@ -12,6 +12,23 @@ and actual allocation even when registered requests time out; never call that ro
 performance success. Native KV admission failures require the existing log evidence
 of pool capacity and a valid model context; connection/numerical errors do not qualify.
 
+The first excluded Code/S1/TP2 baseline (timing off) subsequently reproduced a
+reconstruction rejection at round 4091 / version 4090: RMS 0.022035593 exceeded
+0.01953125, while KL 0.001462524 remained below its unchanged limit. Bounded
+two-rank capture and fixed-state replay found unchanged proposal/boundary KV and
+bit-identical repeated replay logits. Native-module replay matched production
+bit-for-bit. Single-operator interventions isolated RoPE: native RoPE alone made
+hidden states and logits bit-identical (RMS/KL zero); attention, Q/K norm and MLP
+substitutions alone did not change the rejection. This is one retained-state
+diagnosis, not general runtime acceptance or a speedup measurement.
+
+CUDA replay now uses the same native RoPE primitive, retaining the mathematical
+rotary VJP and immutable captured inputs. CPU tests cover the VJP, long positions,
+partial rotary suffix, repeatability and non-aliasing. The new runtime still needs
+retained-candidate GPU/gradient checks and full-budget long-request regression;
+no threshold, stride or formal result is changed by this repair. Rejected metrics
+also preserve measured request/rank evidence rather than inventing zero completions.
+
 ## Measurement scope
 
 `scripts/audit_lightcone_timing.py` creates its own excluded SQLite and uses the

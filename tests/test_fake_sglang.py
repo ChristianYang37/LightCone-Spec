@@ -735,6 +735,53 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
     assert torch.equal(output, torch.tensor([[[-3.0, 2.0, 1.0, 4.0, 5.0, 6.0]]]))
 
 
+@pytest.mark.parametrize("rotary_dimension", [4, 8])
+def test_native_rope_vjp_long_positions_suffix_and_immutable_capture(monkeypatch, rotary_dimension):
+    # CPU oracle validates the actual native-forward wrapper and its VJP, not
+    # parity with the CUDA JIT kernel (covered by excluded retained-state replay).
+    _, tree = _patched_residual_rms()
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "_DFlashInferenceRoPE")
+    namespace = {"torch": torch}
+    exec(compile(ast.Module([cls], []), "rope-test", "exec"), namespace)
+    gen = torch.Generator().manual_seed(4091)
+    base = torch.randn(2, 3, 2, 16, dtype=torch.float64, generator=gen)
+    value = base[..., ::2].requires_grad_()
+    before = value.detach().clone()
+    positions = torch.tensor([[11005, 11006, 11007], [4, 5, 6]])
+    cache = torch.randn(11008, rotary_dimension, dtype=torch.float64, generator=gen)
+    saved_cache = cache.clone()
+    def equation(x, pos):
+        c, s = cache[pos].chunk(2, dim=-1)
+        left, right = x[..., :rotary_dimension].chunk(2, dim=-1)
+        rotated = torch.cat((left*c.unsqueeze(-2)-right*s.unsqueeze(-2),
+                             right*c.unsqueeze(-2)+left*s.unsqueeze(-2)), dim=-1)
+        return torch.cat((rotated, x[..., rotary_dimension:]), dim=-1)
+    calls = []
+    def kernel(*, positions, q, k, cos_sin_cache, is_neox, fused_args):
+        assert is_neox and fused_args is None and cos_sin_cache is cache
+        assert q.untyped_storage().data_ptr() != value.untyped_storage().data_ptr()
+        assert k.untyped_storage().data_ptr() != q.untyped_storage().data_ptr()
+        calls.append(positions.clone())
+        q.copy_(equation(q, positions))
+        k.copy_(equation(k, positions))
+    monkeypatch.setitem(sys.modules, "sglang.kernels.ops.attention.rope",
+        SimpleNamespace(apply_rope_with_cos_sin_cache_inplace=kernel))
+    run = namespace["_DFlashInferenceRoPE"].apply
+    actual, expected = run(value, positions, cache), equation(value, positions)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    upstream = torch.randn(value.shape, dtype=torch.float64, generator=gen)
+    got = torch.autograd.grad(actual, value, upstream)[0]
+    want = torch.autograd.grad(expected, value, upstream)[0]
+    torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+    assert torch.autograd.gradcheck(lambda x: run(x, positions, cache), (value,), fast_mode=True)
+    assert torch.equal(value.detach(), before) and torch.equal(cache, saved_cache)
+    assert torch.equal(run(value, positions, cache), actual)
+    assert not torch.equal(run(value+0.1, positions, cache), actual)
+    assert torch.equal(actual[..., rotary_dimension:], value[..., rotary_dimension:])
+    assert calls[0].tolist() == positions.reshape(-1).tolist()
+
+
 def _patched_logit_reconstruction_gate():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
     added = []

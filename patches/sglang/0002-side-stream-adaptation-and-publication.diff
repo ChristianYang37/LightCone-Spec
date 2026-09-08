@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1519 @@
+@@ -0,0 +1,1561 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -470,6 +470,45 @@ index 00000000..20e93274
 +    return value is None or (type(value) is int and value == -1)
 +
 +
++class _DFlashInferenceRoPE(torch.autograd.Function):
++    """Native inference forward, with the same rotary equation's linear VJP.
++
++    The eager multiply/subtract sequence can round differently from the JIT
++    kernel even with identical fp32 sin/cos caches. Never replace replay with
++    saved production activations. Clone inputs because the native op is in-place.
++    """
++
++    @staticmethod
++    def forward(ctx, value, positions, cos_sin_cache):
++        from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
++
++        ctx.save_for_backward(positions, cos_sin_cache)
++        rotary_dimension = cos_sin_cache.shape[-1]
++        output = value.contiguous().clone()
++        query = output.reshape(-1, value.shape[-2], value.shape[-1])[..., :rotary_dimension]
++        # The public inference primitive requires both Q and K. Its independent
++        # dummy K owns separate storage and never aliases the captured input.
++        key = query.contiguous().clone()
++        apply_rope_with_cos_sin_cache_inplace(
++            positions=positions.reshape(-1), q=query, k=key,
++            cos_sin_cache=cos_sin_cache, is_neox=True, fused_args=None,
++        )
++        return output
++
++    @staticmethod
++    def backward(ctx, gradient):
++        positions, cache = ctx.saved_tensors
++        rotary_dimension = cache.shape[-1]
++        dtype = torch.float64 if gradient.dtype == torch.float64 else torch.float32
++        cached = cache.index_select(0, positions.reshape(-1)).to(dtype)
++        cached = cached.reshape(*positions.shape, rotary_dimension)
++        cosine, sine = (x.unsqueeze(-2) for x in cached.chunk(2, dim=-1))
++        left, right = gradient[..., :rotary_dimension].to(dtype).chunk(2, dim=-1)
++        rotated = torch.cat((left * cosine + right * sine,
++                             right * cosine - left * sine), dim=-1).to(gradient.dtype)
++        return torch.cat((rotated, gradient[..., rotary_dimension:]), dim=-1), None, None
++
++
 +def _rope(
 +    value: torch.Tensor,
 +    positions: torch.Tensor,
@@ -481,8 +520,9 @@ index 00000000..20e93274
 +    Recomputing trigonometric values on GPU does not reproduce SGLang's
 +    initialization-time cache at long positions.  The discrepancy is small
 +    per element but becomes visible after five draft layers and the frozen LM
-+    head.  Reusing the immutable fp32 cache is both cheaper and bit-identical
-+    to the JIT RoPE kernel after the final activation cast.
++    head. Identical caches alone do not guarantee identical bf16 rounding;
++    CUDA replay uses the native inference primitive and a rotary-equation VJP.
++    The eager reference remains available for CPU semantic tests.
 +    """
 +    head_dimension, rotary_dimension = value.shape[-1], cos_sin_cache.shape[-1]
 +    if rotary_dimension % 2 or rotary_dimension > head_dimension: raise ValueError("RoPE head dimension must be even")
@@ -490,6 +530,8 @@ index 00000000..20e93274
 +        raise ValueError("RoPE positions do not match the token dimensions")
 +    if not rotary_dimension:
 +        raise ValueError("RoPE cache does not cover the requested head dimension")
++    if value.is_cuda:
++        return _DFlashInferenceRoPE.apply(value, positions, cos_sin_cache)
 +    cached = cos_sin_cache.index_select(0, positions.reshape(-1))
 +    cached = cached.reshape(*positions.shape, rotary_dimension)
 +    cosine, sine = cached.to(torch.float32).chunk(2, dim=-1)
