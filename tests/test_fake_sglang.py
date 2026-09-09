@@ -4238,6 +4238,42 @@ def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     torch.testing.assert_close(proposal.first_moments[0], torch.tensor([1 / 30]))
 
 
+def test_bounded_live_replay_records_real_proposal_without_committing(tmp_path, monkeypatch):
+    from collections.abc import Callable
+
+    from lightcone_spec.hotpath_equivalence import install
+
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(["git", "apply", f"--include={relative}", str(patch.resolve())],
+                       cwd=tmp_path, check=True, capture_output=True)
+    tree = ast.parse((tmp_path / relative).read_text())
+    wanted = {"_clip_fp32_gradients", "ParameterProposal", "ResidentOptimizer", "loss_and_grad"}
+    namespace = {"torch": torch, "math": math, "Sequence": Sequence,
+                 "Callable": Callable, "dataclass": dataclass}
+    exec(compile(ast.Module([n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+                            and n.name in wanted], []), "replay-test", "exec"), namespace)
+    optimizer_type = namespace["ResidentOptimizer"]
+    monkeypatch.setitem(sys.modules, "sglang.srt.speculative.online_adaptation_runtime",
+                        SimpleNamespace(ResidentOptimizer=optimizer_type))
+    source = tmp_path / "reference.py"
+    source.write_text("class _DFlashInferenceRMS:\n    @staticmethod\n    def backward(*args):\n        return None\n")
+    module = SimpleNamespace(_DFlashInferenceRMS=type("RMS", (), {"backward": staticmethod(lambda *a: None)}),
+                             loss_and_grad=namespace["loss_and_grad"])
+    install(module, source, tmp_path / "evidence")
+    config = SimpleNamespace(name="chronobelief", learning_rate=.001, beta1=.9, beta2=.99,
+                             epsilon=1e-8, weight_decay=0., grad_clip=1., schedule="constant")
+    optimizer = optimizer_type((torch.ones(2),), config)
+    for _ in range(100):
+        _, grad = module.loss_and_grad(optimizer.master, lambda p: p[0].square().mean())
+        optimizer.propose(grad, global_gradient_norm=torch.tensor(2.),
+                          feedback_source_version=0, safe_boundary_version=0)
+    record = json.loads(next((tmp_path / "evidence").glob("*.json")).read_text())
+    assert [r["event"] for r in record["rows"]] == [1, 100]
+    assert all(r["passed"] and r["state_unchanged"] for r in record["rows"])
+    assert torch.equal(optimizer.master[0], torch.ones(2)) and optimizer._step == 0
+
+
 @pytest.mark.parametrize(
     "tp,heads,dtype",
     [(1, 8, torch.bfloat16), (2, 8, torch.bfloat16), (2, 1, torch.bfloat16), (2, 8, torch.uint8)],

@@ -106,6 +106,10 @@ def _model_phase(self, args, kwargs):
 
 def _instrument(module):
     name = module.__name__
+    if name.endswith(".dflash_online_adaptation") and os.environ.get("LIGHTCONE_HOTPATH_EQUIVALENCE_SOURCE"):
+        from .hotpath_equivalence import install
+        install(module, os.environ["LIGHTCONE_HOTPATH_EQUIVALENCE_SOURCE"],
+                os.environ["LIGHTCONE_HOTPATH_EQUIVALENCE_OUTPUT"])
     if _settings.get("mode", "full") == "off" and not name.endswith(".scheduler"):
         return
     if name.endswith(".model_runner"):
