@@ -82,6 +82,28 @@ def test_context_static_and_adaptive_share_reserved_budget(monkeypatch):
     assert budget(SimpleNamespace())["headroom_bytes"] == 0
 
 
+@pytest.mark.parametrize("mode", ["static", "always_s10", "gated_s10"])
+def test_context_benchmark_full_last_bin_has_two_engine_guard_slots(tmp_path, mode):
+    from lightcone_spec.preview_benchmark_cli import benchmark_job
+    config = ExperimentConfig(
+        source=tmp_path/'config.yaml', run_name='test', sglang_root=tmp_path,
+        results_root=tmp_path, models={'Qwen/Qwen3-8B': tmp_path/'target'},
+        drafts={'Qwen/Qwen3-8B|DFLASH': tmp_path/'draft'}, datasets={}, gpu_ids=(0, 1),
+        server=ServerConfig(python=Path(sys.executable)), protocol=ProtocolConfig())
+    job = benchmark_job({'id': 'test', 'mode': mode, 'domain': 'Chat', 'output_tokens': 4096},
+                        {'environment': {'width': 16}}, {'threshold': 32768, 'max_context': 40960})
+    command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=None)
+    engine = int(command[command.index('--context-length')+1])
+    assert engine == 40962
+    # Replay both pinned native bounds. The historical 40960 cap yields 4094.
+    assert min(4096, (engine-1)-36864-1) == 4096
+    assert min(4096, (40960-1)-36864-1) == 4094
+    assert job.context == 40960 and job.parameters['generation_tokens'] == 4096
+    ordinary = replace(job, parameters={k:v for k,v in job.parameters.items() if k!='context_benchmark_v1'})
+    old = server_command(config, ordinary, port=30000, output_dir=tmp_path, adaptation=None)
+    assert old[old.index('--context-length')+1] == '40960'
+
+
 def test_context_gate_native_round_uses_committed_not_reserved_and_skips_capture():
     from lightcone_spec.context_gate import ContextGate
     _, tree = _patched_residual_rms()

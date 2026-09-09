@@ -25,6 +25,13 @@ always-on LightCone S10 and context-gated LightCone S10. Total: 480 calls,
 1,966,080 output tokens. Calibration and evaluation IDs remain separate.
 LightCone uses ChronoBelief, LoRA rank 8, last1, LR 1e-3, constant schedule.
 
+The logical maximum is 40960 tokens. Pinned SGLang internally subtracts one
+slot in `TpModelWorker.get_worker_info` and another in the scheduler's output
+cap, so this benchmark launches with **40962 engine context slots**. The two
+guard slots are not generated tokens: inputs/outputs and the context gate remain
+bounded at 40960. The engine capacity is recorded in the environment; old
+manifests lacking this field require explicit migration review, not silent reuse.
+
 All three paths use the same memory fraction and update-reserve budget, including
 an explicit benchmark-only Static reserve. Gated LightCone initializes its update
 state before serving; it does not claim Static's memory footprint. Record actual

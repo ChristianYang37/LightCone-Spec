@@ -74,6 +74,8 @@ def prepare(args):
         raise ValueError("benchmark is matched TP2/c1")
     environment.update(benchmark=VERSION, template=digest(tokenizer.chat_template),
                        tokenizer=digest(tokenizer.get_vocab()),
+                       logical_context_tokens=40960, engine_context_tokens=40962,
+                       engine_reserved_context_slots=2,
                        checkpoint_inventory=checkpoint_inventory(config),
                        sources={name: digest(list(pool)) for name, pool in pools.items()})
     manifest = {"version": VERSION, "environment": environment,
@@ -132,6 +134,9 @@ def execute(args):
     if manifest["version"] != VERSION:
         raise ValueError("wrong benchmark manifest")
     env = manifest["environment"]
+    if (env.get("logical_context_tokens"), env.get("engine_context_tokens"),
+            env.get("engine_reserved_context_slots")) != (40960, 40962, 2):
+        raise RuntimeError("benchmark lacks verified engine context headroom; preserve old evidence and review migration")
     if checkpoint_inventory(original) != env["checkpoint_inventory"]:
         raise RuntimeError("checkpoint files changed after preparation")
     budget = {"policy": "fixed_reserve_v1", "adaptation_reserve_mb": original.server.adaptation_reserve_mb,

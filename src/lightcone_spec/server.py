@@ -409,6 +409,15 @@ def server_command(
     if execution_backend == "DSPARK" or job.parameters.get("exactness_bootstrap"):
         memory_fraction = min(memory_fraction, 0.80)
     max_running = _server_capacity(job, adaptation)
+    engine_context = (job.context if job.parameters.get("regime") == "preview_constructed_chat"
+                      else max(40960, job.context or 0))
+    if job.parameters.get("context_benchmark_v1"):
+        # Pinned SGLang: worker max_req_len=context_len-1; scheduler then
+        # caps output at max_req_len-input_len-1. These are internal slots,
+        # not extra scientific input/output tokens or a looser context gate.
+        if execution_backend != "DFLASH" or engine_context != 40960:
+            raise ValueError("context benchmark requires DFlash with a 40960-token logical bound")
+        engine_context += 2
     argv = [
         str(config.server.python),
         "-m",
@@ -424,8 +433,7 @@ def server_command(
         "--dp-size",
         str(dp),
         "--context-length",
-        str(job.context if job.parameters.get("regime") == "preview_constructed_chat"
-            else max(40960, job.context or 0)),
+        str(engine_context),
         "--max-running-requests",
         str(max_running),
         "--mem-fraction-static",
