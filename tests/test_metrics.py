@@ -201,6 +201,35 @@ def test_target_verify_is_not_mislabeled_as_prefill():
     assert _model_phase(SimpleNamespace(is_draft_worker=True), (batch,), {}) == "draft_forward"
 
 
+def test_local_autograd_timing_preserves_static_forward_and_gradient(monkeypatch):
+    import torch
+
+    import lightcone_spec.timing_diagnostic as diagnostic
+
+    monkeypatch.setattr(diagnostic, "_recorder", None)
+    monkeypatch.setattr(diagnostic, "_installed", set())
+
+    class Operator(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.save_for_backward(x)
+            return x.square()
+
+        @staticmethod
+        def backward(ctx, g):
+            return 2 * ctx.saved_tensors[0] * g
+
+    x = torch.tensor([1.25, -2.0], requires_grad=True)
+    expected = Operator.apply(x)
+    gradient = torch.autograd.grad(expected.sum(), x)[0]
+    for method in ("forward", "backward"):
+        diagnostic._wrap_autograd(Operator, method, method)
+    actual = Operator.apply(x)
+    assert torch.equal(actual, expected)
+    assert torch.equal(torch.autograd.grad(actual.sum(), x)[0], gradient)
+    assert diagnostic._installed == {"Operator.forward", "Operator.backward"}
+
+
 def test_video_native_final_accounting_rejects_loss_duplicates_and_wrong_denominator():
     from copy import deepcopy
 

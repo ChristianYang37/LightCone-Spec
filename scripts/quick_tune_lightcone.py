@@ -70,7 +70,18 @@ def main():
     parser.add_argument("--stride", type=int, choices=ALL_STRIDES, default=10)
     parser.add_argument("--input-tokens", type=int, choices=(19968, 36864))
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--collector-comparison", action="store_true",
+                        help="Same runtime: old global rank trace versus local scheduler receipt")
+    parser.add_argument("--timeline", action="store_true",
+                        help="Excluded full timing baseline; never ranks candidates")
+    parser.add_argument("--context-threshold", type=int, choices=(20480,))
     args = parser.parse_args()
+    if args.timeline and (args.phase != "baseline" or args.collector_comparison):
+        raise ValueError("timeline is an isolated baseline, not a performance comparison")
+    if args.collector_comparison and args.phase != "compare":
+        raise ValueError("collector comparison requires paired compare mode")
+    if args.context_threshold is not None and args.input_tokens not in (19968, 36864):
+        raise ValueError("gate diagnostic requires a registered exact context")
     if (args.phase == "compare") != (args.candidate_config is not None):
         raise ValueError("compare requires exactly one separately verified candidate runtime config")
     original = ExperimentConfig.load(args.config)
@@ -83,6 +94,8 @@ def main():
             payload.pop("source")  # YAML file locations necessarily differ.
         if old != new:
             raise ValueError("A/B may differ only in verified runtime, not scientific configuration")
+        if args.collector_comparison and original.sglang_root != variants["new"].sglang_root:
+            raise ValueError("collector comparison requires an identical runtime")
     with sqlite3.connect(f"file:{original.run_dir / 'state.sqlite'}?mode=ro", uri=True) as db:
         if db.execute("pragma integrity_check").fetchone()[0] != "ok":
             raise RuntimeError("formal integrity failed")
@@ -125,6 +138,8 @@ def main():
         runtime = config.sglang_root
         configs[variant] = {"path": str(runtime), "marker": (runtime / ".lightcone-spec-patched").read_text().strip()}
     registration = {"version": 1, "phase": args.phase, "stride": args.stride,
+                    "collector_comparison": args.collector_comparison, "timeline_only": args.timeline,
+                    "context_threshold": args.context_threshold,
                     "code": revision, "runtimes": configs, "window_seconds": 30, "warmup_seconds": 10,
                     "tp": 2, "concurrency": 1, "formal_acceptance": False,
                     "fixed_input_tokens": args.input_tokens, "fixed_inputs": fixed_inputs,
@@ -132,7 +147,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     freeze(args.output / "registration.json", registration)
     freeze(args.output / "calibration-split.json", split)
-    print(json.dumps(registration), flush=True)
+    print(json.dumps({k: v for k, v in registration.items() if k != "fixed_inputs"}), flush=True)
     if args.plan_only:
         return
     stopping = threading.Event()
@@ -175,18 +190,32 @@ def main():
                         job = audit_job(template, split, phase="optimization", domain=domain, method=method,
                                         stride=stride, block=repeat, implementation=revision)
                         job = replace(job, job_id=identity, parameters={**job.parameters, "clean_server_per_cell": False})
+                        if args.context_threshold is not None and method == "lightcone":
+                            job = replace(job, parameters={**job.parameters, "context_gate_v1": {
+                                "threshold": args.context_threshold, "max_context": 40960}})
                         selection = _selection_for_job(state, job)
                         current = replace(variants[variant], results_root=args.output, run_name="excluded")
                         runtime = str(current.sglang_root)
+                        if args.collector_comparison:
+                            runtime += f":collector-{variant}"
                         if (process is None or runtime != active_runtime
                                 or process.session_key != server_session_key(job, selection)):
                             if process is not None:
                                 process.stop()
                             server_dir = directory / "server"
                             server_dir.mkdir()
-                            os.environ["LIGHTCONE_TIMING_AUDIT"] = json.dumps({"output_directory": str(server_dir.resolve()), "mode": "off"})
-                            os.environ.pop("LIGHTCONE_EXCLUDED_VERIFY_TRACE", None)
-                            os.environ["PYTHONPATH"] = str(repo / "scripts/timing_hooks") + ":" + str(repo / "src")
+                            if args.collector_comparison and variant == "old":
+                                os.environ.pop("LIGHTCONE_TIMING_AUDIT", None)
+                                os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
+                                    "output_directory": str(server_dir.resolve()), "rank_metrics": True,
+                                    "trace_verify": False})
+                                hook = "preview_verify_trace"
+                            else:
+                                os.environ["LIGHTCONE_TIMING_AUDIT"] = json.dumps({
+                                    "output_directory": str(server_dir.resolve()), "mode": "full" if args.timeline else "off"})
+                                os.environ.pop("LIGHTCONE_EXCLUDED_VERIFY_TRACE", None)
+                                hook = "timing_hooks"
+                            os.environ["PYTHONPATH"] = str(repo / "scripts" / hook) + ":" + str(repo / "src")
                             process = RankCompleteProcess(current, job, gpus=current.gpu_ids[:2],
                                 port=current.server.base_port + 60, output_dir=server_dir, selection=selection)
                             active_runtime = runtime
@@ -203,6 +232,9 @@ def main():
                         freeze(directory / "inputs.json", {"job": job.to_dict(), "prompts": prompts, "metadata": metadata})
 
                         def cleanup(deadline):
+                            if args.timeline and phase == "measure":
+                                from lightcone_spec.timing_diagnostic import checkpoint
+                                checkpoint("end", identity)
                             after = safe_metrics(client, adaptive=method == "lightcone")
                             audit = {"before": before, "after": after}
                             (directory / f"{phase}-cleanup.json").write_text(json.dumps(audit))
@@ -221,6 +253,10 @@ def main():
                         try:
                             for phase, seconds in (("warmup", 10), ("measure", 30)):
                                 before = safe_metrics(client, adaptive=method == "lightcone", reset=True)
+                                if args.timeline and phase == "measure":
+                                    from lightcone_spec.timing_diagnostic import checkpoint
+                                    checkpoint("begin", identity)
+                                    client.server_info()
                                 evidence = WindowEvidence(seconds)
                                 try:
                                     payload = run_window(client, prompts, seconds=seconds, seed=repeat,
@@ -232,6 +268,7 @@ def main():
                                 (directory / f"{phase}.json").write_text(json.dumps(payload))
                             result = {k: v for k, v in payload.items() if k != "events"}
                             result.update(domain=domain, repeat=repeat, variant=variant, method=method,
+                                timeline_only=args.timeline, collector_comparison=args.collector_comparison,
                                 stride=stride, job_id=identity, configure_seconds=load_seconds,
                                 input_prepare_seconds=input_seconds,
                                 runtime=configs[variant], execution_gpu_ids=current.gpu_ids[:2],

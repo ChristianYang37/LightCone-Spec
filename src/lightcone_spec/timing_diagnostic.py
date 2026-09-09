@@ -78,6 +78,19 @@ def _wrap_function(module, function, label, lane):
     _installed.add(f"{module.__name__}.{function}")
 
 
+def _wrap_autograd(cls, method, label):
+    """Keep Function forward/backward static; timing is excluded and opt-in."""
+    original = getattr(cls, method)
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        with _span(label, lane="side"):
+            return original(*args, **kwargs)
+
+    setattr(cls, method, staticmethod(wrapped))
+    _installed.add(f"{cls.__name__}.{method}")
+
+
 def _model_phase(self, args, kwargs):
     if self.is_draft_worker:
         return "draft_forward"
@@ -99,7 +112,7 @@ def _instrument(module):
         _wrap(module.ModelRunner, "forward", _model_phase)
         _wrap(module.ModelRunner, "sample", "target_sampling")
     elif name.endswith(".online_adaptation_runtime"):
-        for collective in ("all_reduce", "all_gather_into_tensor", "broadcast", "barrier"):
+        for collective in ("all_reduce", "all_gather", "all_gather_into_tensor", "broadcast", "barrier"):
             _wrap_function(module.dist, collective, f"tp_{collective}", "collective")
         cls = module.OnlineCohortRuntime
         original = cls.timing
@@ -123,8 +136,13 @@ def _instrument(module):
             _wrap(cls, method, label, gpu=gpu, lane=lane)
     elif name.endswith(".dflash_online_adaptation"):
         _wrap_function(module, "_logit_reconstruction_gate", "reconstruction_check", "side")
+        for operator, label in (("Attention", "attention"), ("RMS", "rms"), ("RoPE", "rope")):
+            for method in ("forward", "backward"):
+                _wrap_autograd(getattr(module, f"_DFlashInference{operator}"), method,
+                               f"training_{label}_{method}")
         cls = module.DFlashDrafterAdapter
         for method, label, lane in (
+            ("begin_round", "context_gate_and_round_setup", "main"),
             ("maybe_launch", "update_schedule_and_prepare", "inclusive"),
             ("_gather_history", "history_kv_gather", "side"),
             ("_surrogate_hidden", "training_replay", "side"),
