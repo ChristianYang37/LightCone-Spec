@@ -75,6 +75,10 @@ def main():
     parser.add_argument("--timeline", action="store_true",
                         help="Excluded full timing baseline; never ranks candidates")
     parser.add_argument("--context-threshold", type=int, choices=(20480,))
+    parser.add_argument("--confirmation-prompts", action="store_true",
+                        help="Use the already frozen independent confirmation split")
+    parser.add_argument("--final-combination", action="store_true",
+                        help="Independent confirmation: old collector/runtime versus retained combination")
     args = parser.parse_args()
     if args.timeline and (args.phase != "baseline" or args.collector_comparison):
         raise ValueError("timeline is an isolated baseline, not a performance comparison")
@@ -82,6 +86,9 @@ def main():
         raise ValueError("collector comparison requires paired compare mode")
     if args.context_threshold is not None and args.input_tokens not in (19968, 36864):
         raise ValueError("gate diagnostic requires a registered exact context")
+    if args.final_combination and (args.phase != "compare" or not args.confirmation_prompts
+                                  or args.collector_comparison or args.timeline):
+        raise ValueError("final combination requires independent paired confirmation only")
     if (args.phase == "compare") != (args.candidate_config is not None):
         raise ValueError("compare requires exactly one separately verified candidate runtime config")
     original = ExperimentConfig.load(args.config)
@@ -130,7 +137,8 @@ def main():
                         background.append(row)
                         seen.add(text)
             fixed_inputs[domain] = exact_hotpath_inputs(
-                tokenizer, split[domain]["search"], background, args.input_tokens)
+                tokenizer, split[domain]["confirmation" if args.confirmation_prompts else "search"],
+                background, args.input_tokens)
     repo = Path(__file__).resolve().parents[1]
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     configs = {}
@@ -141,6 +149,8 @@ def main():
                     "collector_comparison": args.collector_comparison, "timeline_only": args.timeline,
                     "context_threshold": args.context_threshold,
                     "timeline_scope": "one Code LightCone window" if args.timeline else None,
+                    "confirmation_prompts": args.confirmation_prompts,
+                    "final_combination": args.final_combination,
                     "code": revision, "runtimes": configs, "window_seconds": 30, "warmup_seconds": 10,
                     "tp": 2, "concurrency": 1, "formal_acceptance": False,
                     "fixed_input_tokens": args.input_tokens, "fixed_inputs": fixed_inputs,
@@ -192,7 +202,7 @@ def main():
                         logical.mkdir(exist_ok=True)
                         directory = logical / f"attempt-{len(list(logical.glob('attempt-*'))) + 1:02d}"
                         directory.mkdir()
-                        job = audit_job(template, split, phase="optimization", domain=domain, method=method,
+                        job = audit_job(template, split, phase="confirmation" if args.confirmation_prompts else "optimization", domain=domain, method=method,
                                         stride=stride, block=repeat, implementation=revision)
                         job = replace(job, job_id=identity, parameters={**job.parameters, "clean_server_per_cell": False})
                         if args.context_threshold is not None and method == "lightcone":
@@ -201,7 +211,7 @@ def main():
                         selection = _selection_for_job(state, job)
                         current = replace(variants[variant], results_root=args.output, run_name="excluded")
                         runtime = str(current.sglang_root)
-                        if args.collector_comparison:
+                        if args.collector_comparison or args.final_combination:
                             runtime += f":collector-{variant}"
                         if (process is None or runtime != active_runtime
                                 or process.session_key != server_session_key(job, selection)):
@@ -209,7 +219,7 @@ def main():
                                 process.stop()
                             server_dir = directory / "server"
                             server_dir.mkdir()
-                            if args.collector_comparison and variant == "old":
+                            if (args.collector_comparison or args.final_combination) and variant == "old":
                                 os.environ.pop("LIGHTCONE_TIMING_AUDIT", None)
                                 os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
                                     "output_directory": str(server_dir.resolve()), "rank_metrics": True,
