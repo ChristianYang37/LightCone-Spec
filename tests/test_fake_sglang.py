@@ -4224,6 +4224,47 @@ def test_failed_dflash_capture_is_opt_in_and_retains_rejected_candidate(tmp_path
     assert capture.payload is None
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+def test_packed_update_trace_preserves_values_flags_and_owned_rows(tmp_path, dtype):
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(["git", "apply", f"--include={relative}", str(patch.resolve())],
+                       cwd=tmp_path, check=True, capture_output=True)
+    tree = ast.parse((tmp_path / relative).read_text())
+    runtime = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "OnlineCohortRuntime")
+    submit = next(n for n in runtime.body if isinstance(n, ast.FunctionDef) and n.name == "submit")
+    start = next(i for i, n in enumerate(submit.body) if isinstance(n, ast.Assign)
+                 and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "metric_row")
+    block = ast.Module(submit.body[start:start + 2], [])
+    names = ("loss", "finite", "reconstruction_ok", "reconstruction_max_abs",
+             "online_hint_error", "online_ensemble_entropy", "online_effective_experts",
+             "reconstruction_relative_rms", "reconstruction_top1_match",
+             "reconstruction_mean_kl", "supervision_nonempty", "gradient_norm")
+    for flags in ((True, True, True, True), (False, False, False, False)):
+        inputs = [torch.tensor(v, dtype=dtype) for v in
+                  (1.2, 0, 0, 0.1, float("nan"), float("nan"), float("nan"),
+                   0.001, 1., 0.0003, 0, 0.98, 0.001, 0)]
+        for index, value in zip((1, 2, 10, 13), flags, strict=True):
+            inputs[index] = torch.tensor(value)
+        original = [t.clone() for t in inputs]
+        trace = torch.full((3, 14), -71., dtype=torch.float32)
+        expected = torch.empty(14, dtype=torch.float32)
+        for index, value in enumerate(inputs):
+            expected[index].copy_(value.detach().reshape(()).to(torch.float32))
+        env = dict(zip(names, inputs[:12], strict=True))
+        env.update(torch=torch, self=SimpleNamespace(trace_metrics=trace), trace_index=1,
+                   proposal=SimpleNamespace(effective_learning_rate=inputs[12],
+                                            schedule_valid=inputs[13]))
+        pointer = trace.data_ptr()
+        exec(compile(block, "packed-trace-test", "exec"), env)
+        torch.testing.assert_close(trace[1], expected, rtol=0, atol=0, equal_nan=True)
+        assert trace.data_ptr() == pointer and (trace[[0, 2]] == -71).all()
+        for actual, old in zip(inputs, original, strict=True):
+            torch.testing.assert_close(actual, old, rtol=0, atol=0, equal_nan=True)
+        assert not trace.requires_grad
+
+
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
     for patch in sorted(Path("patches/sglang").glob("*.diff")):
