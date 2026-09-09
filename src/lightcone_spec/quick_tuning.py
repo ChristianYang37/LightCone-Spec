@@ -214,6 +214,20 @@ def paired_decision(rows):
         gain = math.sqrt(math.prod(1 + g for g in gains.values())) - 1
         decision = "candidate_for_long_validation" if min(gains.values()) > 0 and gain >= .01 else "keep_old"
     return {"decision": decision, "domain_gains": gains, "repeats": len(repeats), "formal_acceptance": False}
+def native_hotpath_prompt(tokenizer, prompt):
+    """Normalize native tokenizer wrappers before sending a diagnostic request."""
+    from collections.abc import Mapping
+
+    tokens = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=True, return_dict=False,
+        add_generation_prompt=True, enable_thinking=False)
+    if isinstance(tokens, Mapping):
+        tokens = tokens["input_ids"]
+    if not isinstance(tokens, (list, tuple)) or not tokens or any(type(t) is not int or t < 0 for t in tokens):
+        raise ValueError("native diagnostic input must be flat nonnegative token IDs")
+    return list(tokens)
+
+
 def exact_hotpath_inputs(tokenizer, records, background, length):
     """Non-repeated prompt-only context with the task inside its native template."""
     filler = tokenizer.encode("\n\n".join(r["prompt"] for r in background), add_special_tokens=False)

@@ -178,6 +178,17 @@ def test_request_reset_preserves_local_arrays_without_recursive_receipts():
     assert runtime.active_request_id is None
 
 
+@pytest.mark.parametrize("payload", [[10, 20], {"input_ids": [10, 20], "attention_mask": [1, 1]}])
+def test_hotpath_native_short_prompt_normalizes_tokenizer_mapping(payload):
+    from lightcone_spec.quick_tuning import native_hotpath_prompt
+
+    tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **k: payload)
+    assert native_hotpath_prompt(tokenizer, "task") == [10, 20]
+    tokenizer.apply_chat_template = lambda *a, **k: ["input_ids"]
+    with pytest.raises(ValueError, match="token IDs"):
+        native_hotpath_prompt(tokenizer, "task")
+
+
 def test_hotpath_exact_input_retains_task_and_fails_on_short_background():
     from lightcone_spec.quick_tuning import exact_hotpath_inputs
     tokenizer = SimpleNamespace(encode=lambda text, **kw: list(text.encode()),
