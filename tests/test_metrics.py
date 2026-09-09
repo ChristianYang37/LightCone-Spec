@@ -1497,3 +1497,41 @@ def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_p
     report["rows"][0]["duration_seconds"] *= 2
     with pytest.raises(ValueError, match="raw counts|recovery receipt"):
         validate_report(report, manifest, candidate_commit="candidate", environment=manifest["environment"])
+
+
+def test_fixed20k_report_480_four_modes_and_s5_pairing(tmp_path):
+    from lightcone_spec.preview_benchmark import (
+        FIXED_GATE,
+        FIXED_VERSION,
+        digest,
+        validate_report,
+        write_report,
+    )
+    rows = context_benchmark_rows()
+    rows += [{**r, 'mode': 'gated_s5', 'id': r['id'].replace('gated_s10', 'gated_s5'),
+              'throughput': r['throughput']*1.1} for r in rows if r['mode'] == 'gated_s10']
+    for row in rows:
+        row['id'] = row['id'].replace('preview-context-v1', FIXED_VERSION)
+        row['resolved_stride'] = None if row['mode'] == 'static' else (5 if row['mode'] == 'gated_s5' else 10)
+        row['context_threshold'] = 20480 if row['mode'].startswith('gated_') else None
+    manifest = {'version': FIXED_VERSION, 'fixed_gate': FIXED_GATE, 'environment': {'gpu': 'synthetic'},
+                'inputs': [{**{k:r[k] for k in ('split','sample','bucket','domain','input_tokens','output_tokens')},
+                            'input_ids': [1]*r['input_tokens']} for r in rows if r['mode'] == 'static']}
+    provenance = {'commit': 'candidate', 'manifest': digest(manifest), 'environment': manifest['environment'],
+                  'benchmark_version': FIXED_VERSION, 'fixed_gate': FIXED_GATE}
+    for row in rows:
+        row.update(provenance=provenance, duration_seconds=4096/row['throughput'], delivered_verify_tokens=4095,
+                   prefill_generated_tokens=1, target_calls=4095/row['al'], native_first_token_ns=1,
+                   native_last_token_ns=1+4095*1e9/row['decode_speed'])
+    report = write_report(tmp_path, rows, provenance, complete=True)
+    assert len(report['tables']) == 120 and report['calibration_tables'] == []
+    assert report['paired_effects']['gated_s5_vs_gated_s10']['ratio'] == pytest.approx(1.1)
+    assert report['paired_effects']['gated_s5_vs_static']['independent_samples'] == 12
+    receipt = validate_report(report, manifest, candidate_commit='candidate', environment=manifest['environment'])
+    assert receipt['calibration_calls'] == 0 and receipt['evaluation_calls'] == 480
+    assert '<option>gated_s5</option>' in (tmp_path/'index.html').read_text()
+    with pytest.raises(ValueError, match='missing'):
+        write_report(tmp_path/'partial', rows[:-1], provenance, complete=True)
+    report['rows'][-1]['resolved_stride'] = 10
+    with pytest.raises(ValueError, match='stride/threshold'):
+        validate_report(report, manifest, candidate_commit='candidate', environment=manifest['environment'])

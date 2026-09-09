@@ -14,7 +14,10 @@ from pathlib import Path
 
 from .preview_benchmark import (
     DOMAINS,
+    FIXED_GATE,
+    FIXED_VERSION,
     VERSION,
+    benchmark_spec,
     cached_gate,
     calibrate,
     cases,
@@ -74,34 +77,46 @@ def prepare(args):
         raise ValueError("missing model/runtime/hardware provenance")
     if environment["tp"] != 2 or environment["concurrency"] != 1:
         raise ValueError("benchmark is matched TP2/c1")
-    environment.update(benchmark=VERSION, template=digest(tokenizer.chat_template),
+    fixed = getattr(args, "fixed_threshold", None) is not None
+    version = FIXED_VERSION if fixed else VERSION
+    environment.update(benchmark=version, template=digest(tokenizer.chat_template),
                        tokenizer=digest(tokenizer.get_vocab()),
                        logical_context_tokens=40960, engine_context_tokens=40962,
                        engine_reserved_context_slots=2,
                        checkpoint_inventory=checkpoint_inventory(config),
                        sources={name: digest(list(pool)) for name, pool in pools.items()})
-    manifest = {"version": VERSION, "environment": environment,
+    manifest = {"version": version, "environment": environment,
                 "inputs": construct_inputs(tokenizer, splits), "splits": splits,
                 "exclusion_digest": digest(exclusions), "generation_tokens": 4096,
                 "ignore_eos": True, "temperature": 1, "non_thinking": True}
-    cases(manifest, "calibrate")
+    if fixed:
+        manifest["fixed_gate"] = dict(FIXED_GATE)
+    else:
+        cases(manifest, "calibrate")
     cases(manifest, "run")
     freeze(args.output / "manifest.json", manifest)
-    print(json.dumps({"status": "prepared", "calibration_calls": 120, "evaluation_calls": 360,
+    print(json.dumps({"status": "prepared", "calibration_calls": 0 if fixed else 120,
+                      "evaluation_calls": 480 if fixed else 360,
                       "manifest": digest(manifest)}), flush=True)
 
 
 def benchmark_job(case, manifest, gate):
     from .protocol import Job
+    version, modes = benchmark_spec(manifest)
+    if case["mode"] not in modes:
+        raise ValueError("method not registered for this benchmark version")
+    stride = 5 if case["mode"] == "gated_s5" else 10
     recipe = {"optimizer": "chronobelief", "parameterization": "lora", "rank": 8,
-              "scope": "last1", "learning_rate": .001, "schedule": "constant", "stride": 10}
+              "scope": "last1", "learning_rate": .001, "schedule": "constant", "stride": stride}
     params = {"context_benchmark_v1": True, "excluded_from_analysis": True,
               "topology": "tp2_dp1", "generation_tokens": case["output_tokens"],
-              "execution_request_count": 1, "stride": 10, "prefix_reuse": False,
+              "execution_request_count": 1, "stride": stride, "prefix_reuse": False,
               "memory_budget_policy": "fixed_reserve_v1", "temperature": 1.0,
               "clean_server_per_cell": False, **recipe}
-    if case["mode"] == "gated_s10":
+    if case["mode"].startswith("gated_"):
         params["context_gate_v1"] = gate
+    if version == FIXED_VERSION:
+        params.update(context_benchmark_variant="fixed20k_v1", benchmark_mode=case["mode"])
     return Job(case["id"], "preview-context-benchmark-v1", 0,
                "static" if case["mode"] == "static" else "lightcone", "Qwen/Qwen3-8B", "DFLASH",
                case["domain"], context=40960, width=manifest["environment"]["width"], load="c1",
@@ -133,8 +148,9 @@ def execute(args):
 
     original = ExperimentConfig.load(args.config)
     manifest = json.loads((args.output / "manifest.json").read_text())
-    if manifest["version"] != VERSION:
-        raise ValueError("wrong benchmark manifest")
+    version, modes = benchmark_spec(manifest)
+    if version == FIXED_VERSION and args.command == "calibrate":
+        raise ValueError("fixed20k benchmark must not repeat calibration")
     env = manifest["environment"]
     if (env.get("logical_context_tokens"), env.get("engine_context_tokens"),
             env.get("engine_reserved_context_slots")) != (40960, 40962, 2):
@@ -155,27 +171,33 @@ def execute(args):
     calibration_path = args.output / "calibration.json"
     calibration = json.loads(calibration_path.read_text()) if calibration_path.exists() else None
     gate, cache_status = cached_gate(calibration, env)
+    if version == FIXED_VERSION:
+        gate, cache_status = {"threshold": FIXED_GATE["threshold"], "max_context": 40960}, "user_specified"
     if args.command == "run" and cache_status == "uncalibrated":
         raise RuntimeError("run requires completed independent calibration")
     pending = cases(manifest, "calibrate" if args.command == "calibrate" else "run")
     if args.command == "qa":
-        # Six excluded requests. Threshold 4096 tests crossing vs initially active.
-        source = next(r for r in manifest["inputs"] if r["split"] == "calibration" and r["bucket"] == 2)
+        # Cross the gate and start above it, with a separate full-budget boundary QA.
+        qa_lengths = (20464, 24576) if version == FIXED_VERSION else (4080, 8192)
+        source = next(r for r in manifest["inputs"] if r["split"] == "calibration"
+                      and r["bucket"] == (8 if version == FIXED_VERSION else 2))
         pending = [{**source, "id": f"qa-{mode}-{length}", "mode": mode, "input_ids": source["input_ids"][-length:],
                     "input_tokens": length, "output_tokens": 256, "split": "qa"}
-                   for mode in ("static", "always_s10", "gated_s10") for length in (4080, 8192)]
-        gate = {"threshold": 4096, "max_context": 40960}
+                   for mode in modes for length in qa_lengths]
+        gate = {"threshold": 20480 if version == FIXED_VERSION else 4096, "max_context": 40960}
         # Short QA cannot detect the native context-boundary output clipping.
         boundary = next(r for r in manifest["inputs"] if r["split"] == "calibration" and r["bucket"] == 9)
         pending.append({**boundary, "id": "qa-static-full-40k-boundary", "mode": "static",
                         "output_tokens": 4096, "split": "qa"})
     # Group mode within each length window to reuse loaded servers; rotate mode order by window.
-    pending.sort(key=lambda c: (c["bucket"], (("static", "always_s10", "gated_s10").index(c["mode"])-c["bucket"]) % 3, c["sample"]))
+    pending.sort(key=lambda c: (c["bucket"], (modes.index(c["mode"])-c["bucket"]) % len(modes), c["sample"]))
     stopping = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stopping.set())
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     provenance = {"commit": commit, "manifest": digest(manifest), "environment": env}
+    if version == FIXED_VERSION:
+        provenance.update(benchmark_version=version, fixed_gate=dict(FIXED_GATE))
     recovery_path = args.output / "engine-context-recovery.json"
     if recovery_path.exists():
         recovery = json.loads(recovery_path.read_text())
@@ -253,9 +275,9 @@ def execute(args):
                     updates = after.get("updates_published", 0) - before.get("updates_published", 0)
                     if case["mode"] == "always_s10" and updates <= 0:
                         raise RuntimeError("always-on LightCone produced no update")
-                    if case["mode"] == "gated_s10" and gate["threshold"] is None and updates != 0:
+                    if case["mode"].startswith("gated_") and gate["threshold"] is None and updates != 0:
                         raise RuntimeError("no-trigger gate unexpectedly updated")
-                    if case["mode"] == "gated_s10":
+                    if case["mode"].startswith("gated_"):
                         activations = [rank.get("context_gate_activations") for rank in ranks]
                         contexts = [rank.get("context_gate_activation_context") for rank in ranks]
                         if len(set(activations)) != 1 or len(set(contexts)) != 1:
@@ -280,6 +302,9 @@ def execute(args):
                             "context_gate_activation_context", "context_gate_blocked_rounds")} for rank in ranks],
                         rank_memory=[{k: rank.get(k) for k in ("peak_hbm_bytes", "peak_hbm_reserved_bytes", "kv_token_capacity", "resident_bytes", "peak_bytes")} for rank in ranks],
                         **recording_nvml_peaks(directory / "gpu.csv", config.gpu_ids[:2]))
+                    if version == FIXED_VERSION:
+                        result.update(resolved_stride=job.parameters["stride"] if job.method != "static" else None,
+                                      context_threshold=gate["threshold"] if case["mode"].startswith("gated_") else None)
                     freeze(directory / "result.json", result)
                     print(json.dumps({k: result[k] for k in ("id", "throughput", "al", "updates_published")}), flush=True)
                     if args.command != "qa":
@@ -305,6 +330,8 @@ def main():
         if name != "report":
             child.add_argument("--config", type=Path, required=True)
         if name == "prepare":
+            child.add_argument("--fixed-threshold", type=int, choices=(20480,),
+                               help="Evaluation-only four-mode benchmark; user-specified context gate")
             child.add_argument("--environment", type=Path, required=True)
             child.add_argument("--exclusions", nargs="+", type=Path, required=True)
     args = parser.parse_args()

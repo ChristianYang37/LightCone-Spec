@@ -7,8 +7,9 @@ const {execFileSync} = require('node:child_process');
 const assert = require('node:assert/strict');
 const output = mkdtempSync(join(tmpdir(), 'context-benchmark-synthetic-'));
 execFileSync(process.env.PYTHON || 'python', ['-c', `
-from lightcone_spec.preview_benchmark import write_report
+from lightcone_spec.preview_benchmark import write_report, FIXED_VERSION, FIXED_GATE
 write_report(${JSON.stringify(output)}, [], {'scope':'SYNTHETIC UI test; not measured'})
+write_report(${JSON.stringify(join(output,'fixed'))}, [], {'benchmark_version':FIXED_VERSION,'fixed_gate':FIXED_GATE})
 `]);
 (async()=>{
  const browser = await chromium.launch({headless:true});
@@ -19,6 +20,12 @@ write_report(${JSON.stringify(output)}, [], {'scope':'SYNTHETIC UI test; not mea
   assert.equal(await page.locator('#table tbody td').count(),30);
   assert.equal(await page.locator('#delta tbody td').count(),30);
   await page.selectOption('#mode','gated_s10');await page.selectOption('#metric','al');
+  assert.match(await page.locator('#score').innerText(),/UNMEASURED/);
+  assert.deepEqual(errors,[]);
+  await page.goto('file://' + join(output,'fixed','index.html'));
+  assert.equal(await page.locator('#mode option').count(),4);
+  await page.selectOption('#mode','gated_s5');
+  assert.equal(await page.locator('#table tbody td').count(),30);
   assert.match(await page.locator('#score').innerText(),/UNMEASURED/);
   assert.deepEqual(errors,[]);
   console.log('PASS: synthetic 3x10 tables, method/metric switches, no fabricated scores');

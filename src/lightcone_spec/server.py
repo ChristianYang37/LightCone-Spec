@@ -266,6 +266,14 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     if uses_formal_adaptation_stride(job):
         chosen["stride"] = FORMAL_ADAPTATION_STRIDE
     stride = int(chosen.get("stride", FORMAL_ADAPTATION_STRIDE))
+    if job.parameters.get("context_benchmark_variant") == "fixed20k_v1":
+        mode = job.parameters.get("benchmark_mode")
+        if (mode not in {"always_s10", "gated_s10", "gated_s5"}
+                or stride != (5 if mode == "gated_s5" else 10)):
+            raise ValueError("fixed20k benchmark stride differs from registered mode")
+        gate = chosen.get("context_gate_v1")
+        if mode.startswith("gated_") and (not gate or gate.get("threshold") != 20480):
+            raise ValueError("fixed20k benchmark requires threshold 20480")
     if job.parameters.get("stride_audit_v1"):
         from .stride_audit import ALL_STRIDES
         if (not job.parameters.get("excluded_from_analysis") or stride not in ALL_STRIDES
@@ -622,6 +630,8 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
             else "normal-device"
         ),
         *adaptation_layout,
+        *(("fixed20k_v1", job.parameters.get("benchmark_mode"))
+          if job.parameters.get("context_benchmark_variant") == "fixed20k_v1" else ()),
     )
 
 
@@ -823,6 +833,8 @@ class ServerProcess:
         if self.job.parameters.get("context_benchmark_v1"):
             environment["LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB"] = str(
                 self.config.server.adaptation_reserve_mb)
+            # Two native guard slots, not a larger scientific request budget.
+            environment["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         environment.pop("LIGHTCONE_MEMORY_BUDGET_QA", None)
         environment.pop("LIGHTCONE_QA_ALLOCATOR_TRACE_DIR", None)
         if (self.job.parameters.get("excluded_from_analysis") is True

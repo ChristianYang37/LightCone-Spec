@@ -1285,3 +1285,25 @@ def test_context_gate_committed_boundary_reset_retraction_and_scope():
     with pytest.raises(ValueError):
         validate_gate({"threshold": 4096, "max_context": 40960}, algorithm="DFLASH",
                       method="l0", max_in_flight=2, reset_scope="request", dp_size=1)
+
+
+def test_fixed20k_benchmark_480_evaluation_identities_no_recalibration():
+    from lightcone_spec.preview_benchmark import FIXED_GATE, FIXED_MODES, FIXED_VERSION, cases
+    inputs = [{"split": split, "sample": i, "bucket": j, "domain": ("Chat", "Code", "Math")[i//4],
+               "seed": i, "input_tokens": 10, "input_ids": [1]*10, "output_tokens": 4096}
+              for split in ("calibration", "evaluation") for i in range(12) for j in range(10)]
+    old = {"inputs": inputs}
+    manifest = {**old, "version": FIXED_VERSION, "fixed_gate": FIXED_GATE}
+    rows = cases(manifest, "run")
+    assert len(rows) == len({r["id"] for r in rows}) == 480
+    assert {r["mode"] for r in rows} == set(FIXED_MODES)
+    assert all(sum(r["mode"] == m for r in rows) == 120 for m in FIXED_MODES)
+    assert {r["split"] for r in rows} == {"evaluation"}
+    assert not {r["id"] for r in rows} & {r["id"] for r in cases(old, "run")}
+    assert sum(r["output_tokens"] for r in rows) == 1966080
+    for i in range(12):
+        assert {r["seed"] for r in rows if r["sample"] == i} == {i}
+    with pytest.raises(ValueError, match="do not repeat"):
+        cases(manifest, "calibrate")
+    with pytest.raises(ValueError, match="20480"):
+        cases({**manifest, "fixed_gate": {**FIXED_GATE, "threshold": 20000}}, "run")

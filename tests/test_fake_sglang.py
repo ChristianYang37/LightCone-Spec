@@ -82,8 +82,9 @@ def test_context_static_and_adaptive_share_reserved_budget(monkeypatch):
     assert budget(SimpleNamespace())["headroom_bytes"] == 0
 
 
-@pytest.mark.parametrize("mode", ["static", "always_s10", "gated_s10"])
+@pytest.mark.parametrize("mode", ["static", "always_s10", "gated_s10", "gated_s5"])
 def test_context_benchmark_full_last_bin_has_two_engine_guard_slots(tmp_path, mode):
+    from lightcone_spec.preview_benchmark import FIXED_GATE, FIXED_VERSION
     from lightcone_spec.preview_benchmark_cli import benchmark_job
     config = ExperimentConfig(
         source=tmp_path/'config.yaml', run_name='test', sglang_root=tmp_path,
@@ -91,7 +92,8 @@ def test_context_benchmark_full_last_bin_has_two_engine_guard_slots(tmp_path, mo
         drafts={'Qwen/Qwen3-8B|DFLASH': tmp_path/'draft'}, datasets={}, gpu_ids=(0, 1),
         server=ServerConfig(python=Path(sys.executable)), protocol=ProtocolConfig())
     job = benchmark_job({'id': 'test', 'mode': mode, 'domain': 'Chat', 'output_tokens': 4096},
-                        {'environment': {'width': 16}}, {'threshold': 32768, 'max_context': 40960})
+                        {'environment': {'width': 16}, 'version': FIXED_VERSION, 'fixed_gate': FIXED_GATE},
+                        {'threshold': 20480, 'max_context': 40960})
     command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=None)
     engine = int(command[command.index('--context-length')+1])
     assert engine == 40962
@@ -102,6 +104,29 @@ def test_context_benchmark_full_last_bin_has_two_engine_guard_slots(tmp_path, mo
     ordinary = replace(job, parameters={k:v for k,v in job.parameters.items() if k!='context_benchmark_v1'})
     old = server_command(config, ordinary, port=30000, output_dir=tmp_path, adaptation=None)
     assert old[old.index('--context-length')+1] == '40960'
+
+
+def test_fixed20k_s5_actual_adaptation_payload_and_session_isolation():
+    from lightcone_spec.preview_benchmark import FIXED_GATE, FIXED_VERSION
+    from lightcone_spec.preview_benchmark_cli import benchmark_job
+    from lightcone_spec.protocol import uses_formal_adaptation_stride
+    from lightcone_spec.server import adaptation_payload, server_session_key
+    manifest = {'environment': {'width': 16}, 'version': FIXED_VERSION, 'fixed_gate': FIXED_GATE}
+    gate = {'threshold': 20480, 'max_context': 40960}
+    jobs = [benchmark_job({'id': mode, 'mode': mode, 'domain': 'Chat', 'output_tokens': 4096}, manifest, gate)
+            for mode in ('always_s10', 'gated_s10', 'gated_s5')]
+    for job, stride in zip(jobs, (10, 10, 5), strict=True):
+        payload = adaptation_payload(job, job.parameters)
+        assert payload['stride'] == stride
+        assert not uses_formal_adaptation_stride(job)
+    assert server_session_key(jobs[1], jobs[1].parameters) != server_session_key(jobs[2], jobs[2].parameters)
+    ordinary = replace(jobs[2], node='E2-r0', parameters={'stride': 5})
+    assert uses_formal_adaptation_stride(ordinary)
+    assert adaptation_payload(ordinary, ordinary.parameters)['stride'] == 10
+    with pytest.raises(ValueError, match='stride'):
+        adaptation_payload(replace(jobs[2], parameters={**jobs[2].parameters, 'stride': 10}), None)
+    with pytest.raises(ValueError, match='threshold'):
+        adaptation_payload(replace(jobs[2], parameters={**jobs[2].parameters, 'context_gate_v1': {'threshold': 20000}}), None)
 
 
 def test_context_gate_native_round_uses_committed_not_reserved_and_skips_capture():

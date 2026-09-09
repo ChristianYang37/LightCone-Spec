@@ -19,7 +19,22 @@ DOMAINS = {
     "Math": {"GSM8K": 1, "MATH-500": 2, "AIME-2025": 1},
 }
 MODES = ("static", "always_s10", "gated_s10")
+FIXED_VERSION = "preview-context-fixed20k-v1"
+FIXED_MODES = (*MODES, "gated_s5")
+FIXED_GATE = {"threshold": 20480, "source": "user_specified"}
 OUTPUT_TOKENS = 4096
+
+
+def benchmark_spec(value):
+    """Versioned fixed-threshold evaluation never consumes old calibration rows."""
+    version = value.get("benchmark_version", value.get("version", VERSION))
+    if version == FIXED_VERSION:
+        if value.get("fixed_gate") != FIXED_GATE:
+            raise ValueError("fixed20k benchmark requires the user-specified 20480 threshold")
+        return version, FIXED_MODES
+    if version != VERSION or "fixed_gate" in value:
+        raise ValueError("unknown benchmark version or gate policy")
+    return version, MODES
 
 
 def digest(value):
@@ -147,6 +162,9 @@ def construct_inputs(tokenizer, splits):
 
 
 def cases(manifest, phase):
+    version, evaluation_modes = benchmark_spec(manifest)
+    if version == FIXED_VERSION and phase == "calibrate":
+        raise ValueError("fixed20k is evaluation-only; do not repeat calibration")
     split = "calibration" if phase == "calibrate" else "evaluation"
     result = []
     for row in sorted(manifest["inputs"], key=lambda r: (r["bucket"], r["sample"])):
@@ -156,13 +174,13 @@ def cases(manifest, phase):
         if (not isinstance(tokens, list) or not tokens or len(tokens) != row["input_tokens"]
                 or any(type(token) is not int or token < 0 for token in tokens)):
             raise ValueError("manifest contains invalid token IDs or input count")
-        modes = ["static"] if phase == "calibrate" else list(MODES)
+        modes = ["static"] if phase == "calibrate" else list(evaluation_modes)
         rotation = (row["bucket"] + row["sample"]) % len(modes)
         for mode in modes[rotation:] + modes[:rotation]:
             result.append({**row, "mode": mode,
-                "id": f"{VERSION}-{split}-{row['sample']:02d}-{row['bucket']:02d}-{mode}"})
-    if len(result) != (120 if phase == "calibrate" else 360):
-        raise ValueError("benchmark must contain exactly 120/360 calls")
+                "id": f"{version}-{split}-{row['sample']:02d}-{row['bucket']:02d}-{mode}"})
+    if len(result) != (120 if phase == "calibrate" else 120 * len(evaluation_modes)):
+        raise ValueError("benchmark call count differs from registered modes")
     return result
 
 
@@ -223,15 +241,15 @@ def cached_gate(calibration, environment):
     return {"threshold": calibration["threshold"], "max_context": 40960}, calibration["status"]
 
 
-def summarize(rows, *, complete=False, split="evaluation"):
+def summarize(rows, *, complete=False, split="evaluation", modes=MODES, version=VERSION):
     if complete:
-        checked_rows(rows, "evaluation", MODES)
+        checked_rows(rows, "evaluation", modes)
     groups = defaultdict(list)
     for row in rows:
         if row.get("status") == "completed" and row["split"] == split:
             groups[row["mode"], row["domain"], row["bucket"]].append(row)
     tables, scores = [], {}
-    for mode in MODES:
+    for mode in modes:
         for domain in DOMAINS:
             for bucket in range(10):
                 data = groups[mode, domain, bucket]
@@ -248,17 +266,20 @@ def summarize(rows, *, complete=False, split="evaluation"):
                        for k in ("throughput", "al")}
     effects = {}
     if complete:
-        found = checked_rows(rows, "evaluation", MODES)
-        for base in ("static", "always_s10"):
-            ratios = [np.mean([math.log(found["gated_s10", i, j]["throughput"] /
-                                       found[base, i, j]["throughput"]) for j in range(10)]) for i in range(12)]
-            mean, se = float(np.mean(ratios)), float(np.std(ratios, ddof=1) / math.sqrt(12))
-            half = float(t.ppf(.975, 11)) * se
-            effects[base] = {"ratio": math.exp(mean), "ci95": [math.exp(mean-half), math.exp(mean+half)],
-                             "paired_log_ratios": list(map(float, ratios)), "independent_samples": 12}
+        found = checked_rows(rows, "evaluation", modes)
+        for candidate in (m for m in modes if m.startswith("gated_")):
+            bases = ("static", "always_s10", "gated_s10") if candidate == "gated_s5" else ("static", "always_s10")
+            for base in bases:
+                ratios = [np.mean([math.log(found[candidate, i, j]["throughput"] /
+                                           found[base, i, j]["throughput"]) for j in range(10)]) for i in range(12)]
+                mean, se = float(np.mean(ratios)), float(np.std(ratios, ddof=1) / math.sqrt(12))
+                half = float(t.ppf(.975, 11)) * se
+                key = base if candidate == "gated_s10" else f"{candidate}_vs_{base}"
+                effects[key] = {"ratio": math.exp(mean), "ci95": [math.exp(mean-half), math.exp(mean+half)],
+                                "paired_log_ratios": list(map(float, ratios)), "independent_samples": 12}
     comparisons = []
     indexed = {(r["mode"], r["domain"], r["bucket"]): r for r in tables}
-    for mode in MODES[1:]:
+    for mode in modes[1:]:
         for metric in ("throughput", "al"):
             ratios = []
             for domain in DOMAINS:
@@ -274,7 +295,7 @@ def summarize(rows, *, complete=False, split="evaluation"):
             comparisons.append({"mode": mode, "metric": metric, "domain": "all",
                 "ratio": math.exp(np.mean(np.log([r["ratio"] for r in ratios]))) if len(ratios) == 30 else None,
                 "worst_cell": min(ratios, key=lambda r: r["ratio"]) if len(ratios) == 30 else None})
-    return {"version": VERSION, "status": "completed" if complete else "partial",
+    return {"version": version, "status": "completed" if complete else "partial",
             "tables": tables, "scores": scores, "paired_effects": effects,
             "comparisons_to_static": comparisons,
             "scope": "synthetic ignore-EOS, sample-level variation, not independent-run replication"}
@@ -282,13 +303,17 @@ def summarize(rows, *, complete=False, split="evaluation"):
 
 def write_report(directory, rows, provenance, *, complete=False):
     import csv
+    version, modes = benchmark_spec(provenance)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    report = {**summarize(rows, complete=complete), "provenance": provenance, "rows": rows}
-    report["calibration_tables"] = [r for r in summarize(rows, split="calibration")["tables"] if r["mode"] == "static"]
+    report = {**summarize(rows, complete=complete, modes=modes, version=version), "provenance": provenance, "rows": rows}
+    report["calibration_tables"] = ([] if version == FIXED_VERSION else
+        [r for r in summarize(rows, split="calibration")["tables"] if r["mode"] == "static"])
     (directory / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False))
     lines = ["# Synthetic context benchmark", "", report["scope"], ""]
-    for mode in (*MODES, "calibration_static"):
+    if version == FIXED_VERSION:
+        lines += ["User-specified gate: 20480 committed context tokens. Not inferred from calibration.", ""]
+    for mode in (*modes, *(("calibration_static",) if version == VERSION else ())):
         for metric in ("throughput", "al"):
             lines.extend([f"## {mode}: {metric}", "", "|Domain|Short→+4K|" + "|".join(f"{j*4}–{(j+1)*4}K" for j in range(1, 10)) + "|",
                           "|---|" + "---|" * 10])
@@ -304,9 +329,9 @@ def write_report(directory, rows, provenance, *, complete=False):
 <title>Preview context benchmark</title><style>body{font:16px system-ui;margin:32px;color:#172534}
 table{border-collapse:collapse;margin:20px 0;width:100%}td,th{padding:10px;border:1px solid #ccd}
 small{color:#456}select{padding:8px}pre{white-space:pre-wrap}</style>
-<h1>Qwen3-8B · context benchmark</h1><p>Synthetic ignore-EOS · TP2 · c1 · S10</p>
+<h1>Qwen3-8B · context benchmark</h1><p>Synthetic ignore-EOS · TP2 · c1</p>
 <label>Metric <select id="metric"><option>throughput</option><option>al</option></select></label>
-<label>Method <select id="mode"><option>static</option><option>always_s10</option><option>gated_s10</option></select></label>
+<label>Method <select id="mode">''' + ''.join(f'<option>{m}</option>' for m in modes) + '''</select></label>
 <p id="score"></p><div id="table"></div><h2>Ratio to matched Static</h2><div id="delta"></div>
 <small>Each cell: four source samples, not four independent runs. Hover to see sample variance.
 Short means original input + 4096 output; remaining columns mean exact prefill + 4096 output.</small>
@@ -336,15 +361,19 @@ metric.onchange=mode.onchange=render;render();</script>''')
 def validate_report(report, manifest, *, candidate_commit, environment):
     """Structural/score verifier. Trust of the GPU producer is a separate maintainer gate."""
     provenance = report.get("provenance", {})
-    if (report.get("version") != VERSION or report.get("status") != "completed"
+    version, modes = benchmark_spec(manifest)
+    if (benchmark_spec(provenance) != (version, modes)
+            or report.get("version") != version or report.get("status") != "completed"
             or provenance.get("commit") != candidate_commit or provenance.get("manifest") != digest(manifest)
             or provenance.get("environment") != environment or manifest.get("environment") != environment):
         raise ValueError("report candidate/manifest/environment mismatch")
     if "engine_context_recovery_v1" in provenance:
         validate_engine_recovery(manifest, provenance["engine_context_recovery_v1"])
-    checked_rows(report["rows"], "calibration", ("static",))
-    checked_rows(report["rows"], "evaluation", MODES)
-    expected_cases = {c["id"]: c for phase in ("calibrate", "run") for c in cases(manifest, phase)}
+    if version == VERSION:
+        checked_rows(report["rows"], "calibration", ("static",))
+    checked_rows(report["rows"], "evaluation", modes)
+    phases = ("run",) if version == FIXED_VERSION else ("calibrate", "run")
+    expected_cases = {c["id"]: c for phase in phases for c in cases(manifest, phase)}
     if {r["id"] for r in report["rows"]} != set(expected_cases) or len(report["rows"]) != 480:
         raise ValueError("report call identities differ from manifest")
     for row in report["rows"]:
@@ -352,6 +381,11 @@ def validate_report(report, manifest, *, candidate_commit, environment):
         if any(row[k] != case[k] for k in ("sample", "bucket", "split", "mode", "domain", "input_tokens", "output_tokens")):
             raise ValueError("call configuration differs from manifest")
         validate_call_provenance(row, provenance)
+        if version == FIXED_VERSION:
+            expected_stride = None if row["mode"] == "static" else (5 if row["mode"] == "gated_s5" else 10)
+            expected_gate = 20480 if row["mode"].startswith("gated_") else None
+            if row.get("resolved_stride") != expected_stride or row.get("context_threshold") != expected_gate:
+                raise ValueError("fixed20k row stride/threshold differs from registered mode")
         derived = {"throughput": row["output_tokens"] / row["duration_seconds"],
                    "al": row["delivered_verify_tokens"] / row["target_calls"],
                    "decode_speed": (row["output_tokens"] - 1) * 1e9 /
@@ -359,8 +393,9 @@ def validate_report(report, manifest, *, candidate_commit, environment):
         if (row["prefill_generated_tokens"] != 1 or row["delivered_verify_tokens"] != 4095
                 or any(not math.isclose(row[k], v, rel_tol=1e-12) for k, v in derived.items())):
             raise ValueError("call metrics cannot be reproduced from raw counts/timing")
-    expected = summarize(report["rows"], complete=True)
+    expected = summarize(report["rows"], complete=True, modes=modes, version=version)
     if any(report.get(key) != expected[key] for key in ("tables", "scores", "paired_effects", "comparisons_to_static")):
         raise ValueError("report scores cannot be reproduced")
-    return {"status": "verified", "candidate_commit": candidate_commit, "calibration_calls": 120,
-            "evaluation_calls": 360, "trust": "requires maintainer review of GPU origin"}
+    return {"status": "verified", "candidate_commit": candidate_commit,
+            "calibration_calls": 0 if version == FIXED_VERSION else 120,
+            "evaluation_calls": 120 * len(modes), "trust": "requires maintainer review of GPU origin"}
