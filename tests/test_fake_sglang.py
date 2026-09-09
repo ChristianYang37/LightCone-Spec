@@ -4269,7 +4269,7 @@ def test_update_trace_preserves_values_flags_and_owned_rows(tmp_path, dtype):
 
 @pytest.mark.parametrize("schedule", ["constant", "inverse_sqrt_published_update", "cosine_published_update"])
 @pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
-def test_device_local_optimizer_scalars_preserve_complete_proposals(tmp_path, schedule, default_dtype):
+def test_optimizer_scalar_proposals_preserve_rejection_and_reset(tmp_path, schedule, default_dtype):
     import copy
 
     relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
