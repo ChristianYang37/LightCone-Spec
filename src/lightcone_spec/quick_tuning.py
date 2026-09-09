@@ -214,3 +214,22 @@ def paired_decision(rows):
         gain = math.sqrt(math.prod(1 + g for g in gains.values())) - 1
         decision = "candidate_for_long_validation" if min(gains.values()) > 0 and gain >= .01 else "keep_old"
     return {"decision": decision, "domain_gains": gains, "repeats": len(repeats), "formal_acceptance": False}
+def exact_hotpath_inputs(tokenizer, records, background, length):
+    """Non-repeated prompt-only context with the task inside its native template."""
+    filler = tokenizer.encode("\n\n".join(r["prompt"] for r in background), add_special_tokens=False)
+    output = []
+    for row in records:
+        marker = "LIGHTCONE_HOTPATH_BACKGROUND_51"
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": marker + "\n\nTask:\n" + row["prompt"]}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        if rendered.count(marker) != 1:
+            raise ValueError("hotpath template must preserve background marker exactly once")
+        before, after = rendered.split(marker)
+        prefix = tokenizer.encode(before, add_special_tokens=False)
+        suffix = tokenizer.encode(after, add_special_tokens=False)
+        needed = length - len(prefix) - len(suffix)
+        if not 0 <= needed <= len(filler):
+            raise ValueError("insufficient independent background for hotpath input")
+        output.append(tuple(prefix + filler[:needed] + suffix))
+    return tuple(output)

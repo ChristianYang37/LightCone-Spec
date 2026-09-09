@@ -129,6 +129,44 @@ def test_fixed20k_s5_actual_adaptation_payload_and_session_isolation():
         adaptation_payload(replace(jobs[2], parameters={**jobs[2].parameters, 'context_gate_v1': {'threshold': 20000}}), None)
 
 
+def test_request_reset_preserves_local_arrays_without_recursive_receipts():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff").read_text()
+    body = patch.split("+++ b/python/sglang/srt/speculative/online_adaptation_runtime.py", 1)[1].split("diff --git", 1)[0]
+    tree = ast.parse("\n".join(line[1:] for line in body.splitlines()
+                              if line.startswith("+") and not line.startswith("+++")))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "OnlineCohortRuntime")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_reset_request_scope")
+    namespace = {}
+    exec(compile(ast.Module([method], []), "retain-request-traces", "exec"), namespace)
+    receipt = {"updates": [{"loss": 1.2}], "rounds": [{"round": 10}],
+               "completed_request_traces": [{"request_id": "prior"}]}
+    runtime = SimpleNamespace(config=SimpleNamespace(reset_scope="request"),
+        active_request_id="r", _request_scope_owner=lambda r: r,
+        _request_scope_session_complete=lambda r: True,
+        side_stream=SimpleNamespace(synchronize=lambda: None), diagnostics=lambda: receipt,
+        completed_request_traces=[], epoch=4, slot_generation=1, context_gate=None,
+        quota_shadow=SimpleNamespace(reset=lambda: None))
+    for key in ("requests", "device_commits", "latest_device_lengths", "pending_timings",
+                "update_traces", "round_traces", "active_round_rows"):
+        setattr(runtime, key, [])
+    assert namespace["_reset_request_scope"](runtime, "r")
+    assert runtime.completed_request_traces == [{"request_id": "r", "epoch": 4,
+        "updates": receipt["updates"], "rounds": receipt["rounds"]}]
+    assert runtime.active_request_id is None
+
+
+def test_hotpath_exact_input_retains_task_and_fails_on_short_background():
+    from lightcone_spec.quick_tuning import exact_hotpath_inputs
+    tokenizer = SimpleNamespace(encode=lambda text, **kw: list(text.encode()),
+        apply_chat_template=lambda rows, **kw: "<user>" + rows[0]["content"] + "</user><assistant>")
+    rows = [{"prompt": "solve this"}]
+    tokens = exact_hotpath_inputs(tokenizer, rows, [{"prompt": "x" * 1000}], 128)[0]
+    assert len(tokens) == 128
+    assert bytes(tokens).endswith(b"Task:\nsolve this</user><assistant>")
+    with pytest.raises(ValueError, match="insufficient"):
+        exact_hotpath_inputs(tokenizer, rows, [], 128)
+
+
 def test_context_gate_native_round_uses_committed_not_reserved_and_skips_capture():
     from lightcone_spec.context_gate import ContextGate
     _, tree = _patched_residual_rms()

@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1650 @@
+@@ -0,0 +1,1655 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -353,24 +353,29 @@ index 00000000..20e93274
 +    def backward(ctx, output_gradient, residual_gradient):
 +        saved = ctx.saved_tensors
 +        dtype = torch.float64 if saved[0].dtype == torch.float64 else torch.float32
-+        with torch.enable_grad():
-+            leaves = tuple(x.detach().to(dtype).requires_grad_() for x in saved)
-+            hidden, weight = leaves[:2]
-+            summed = hidden + leaves[2] if ctx.has_residual else hidden
++        hidden, weight = (x.to(dtype) for x in saved[:2])
++        summed = hidden + saved[2].to(dtype) if ctx.has_residual else hidden
++        need_hidden, need_weight, _, need_residual = ctx.needs_input_grad
++        dx = dw = None
++        if output_gradient is not None:
 +            inverse = torch.rsqrt(summed.square().mean(-1, keepdim=True) + ctx.epsilon)
-+            normalized = (summed * inverse * weight).to(saved[0].dtype)
-+            outputs, gradients = [], []
-+            if output_gradient is not None:
-+                outputs.append(normalized)
-+                gradients.append(output_gradient)
-+            if ctx.has_residual and residual_gradient is not None:
-+                outputs.append(summed.to(saved[2].dtype))
-+                gradients.append(residual_gradient)
-+            vjp = torch.autograd.grad(outputs, leaves, gradients, allow_unused=True)
-+        needed = ctx.needs_input_grad[:2] + (ctx.needs_input_grad[3:4] if ctx.has_residual else ())
-+        converted = tuple(None if g is None or not required else g.to(x.dtype)
-+            for g, x, required in zip(vjp, saved, needed, strict=True))
-+        return converted[0], converted[1], None, converted[2] if ctx.has_residual else None
++            grad = output_gradient.to(dtype)
++            if need_hidden or need_residual:
++                weighted = grad * weight
++                inverse_grad = (weighted * summed).sum(-1, keepdim=True)
++                variance_grad = inverse_grad * (-0.5 * inverse.pow(3))
++                dx = weighted * inverse
++                if ctx.has_residual and residual_gradient is not None:
++                    dx = dx + residual_gradient.to(dtype)
++                dx = dx + (variance_grad / summed.shape[-1]) * (2 * summed)
++            if need_weight:
++                dw = (grad * (summed * inverse)).sum_to_size(weight.shape).to(saved[1].dtype)
++        if output_gradient is None and ctx.has_residual and residual_gradient is not None and (need_hidden or need_residual):
++            residual_vjp = residual_gradient.to(dtype)
++            dx = residual_vjp if dx is None else dx + residual_vjp
++        return (dx.to(saved[0].dtype) if need_hidden and dx is not None else None,
++                dw, None,
++                dx.to(saved[2].dtype) if need_residual and dx is not None else None)
 +
 +
 +def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -2080,7 +2085,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2666 @@
+@@ -0,0 +1,2675 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -3356,6 +3361,7 @@ index 00000000..7b2cb5db
 +        )
 +        self.epoch = 0
 +        self.active_request_id: str | None = None
++        self.completed_request_traces: list[dict] = []
 +        self.active_version = 0
 +        self.slot_generation = 0
 +        self.round = 0
@@ -4232,7 +4238,13 @@ index 00000000..7b2cb5db
 +        if not force and not self._request_scope_session_complete(request_id):
 +            return False
 +        self.side_stream.synchronize()
-+        self.diagnostics()
++        receipt = self.diagnostics()
++        # Retain only request-local arrays, never recursively embed prior receipts.
++        # End-of-request is already fenced; collection adds no per-round sync/I/O.
++        self.completed_request_traces.append({
++            "request_id": request_id, "epoch": self.epoch,
++            "updates": receipt["updates"], "rounds": receipt["rounds"],
++        })
 +        self.epoch += 1
 +        self.active_version = 0
 +        self.slot_generation += 1
@@ -4259,6 +4271,7 @@ index 00000000..7b2cb5db
 +        self.epoch += 1
 +        self.active_request_id = None
 +        self.active_version = 0
++        self.completed_request_traces.clear()
 +        self.slot_generation += 1
 +        self.round = 0
 +        self.pending = None
@@ -4559,6 +4572,7 @@ index 00000000..7b2cb5db
 +        payload = {
 +            "schema_version": 2,
 +            "optimizer_schedule": self.config.optimizer.schedule,
++            "completed_request_traces": list(self.completed_request_traces),
 +            "schedule_total_published_updates": (
 +                self.config.optimizer.schedule_total_published_updates
 +            ),

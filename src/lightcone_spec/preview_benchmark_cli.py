@@ -241,9 +241,10 @@ def execute(args):
                             process.stop()
                         server_dir = directory / "server"
                         server_dir.mkdir()
-                        os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
-                            "output_directory": str(server_dir), "rank_metrics": True, "trace_verify": False})
-                        os.environ["PYTHONPATH"] = str(repo / "scripts/preview_verify_trace") + ":" + str(repo / "src")
+                        os.environ.pop("LIGHTCONE_EXCLUDED_VERIFY_TRACE", None)
+                        os.environ["LIGHTCONE_TIMING_AUDIT"] = json.dumps({
+                            "output_directory": str(server_dir.resolve()), "mode": "off"})
+                        os.environ["PYTHONPATH"] = str(repo / "scripts/timing_hooks") + ":" + str(repo / "src")
                         process = RankCompleteProcess(config, job, gpus=config.gpu_ids[:2],
                             port=config.server.base_port + 80, output_dir=server_dir, selection=selection)
                     client = process.configure(job, selection)

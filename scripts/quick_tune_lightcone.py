@@ -23,13 +23,19 @@ from lightcone_spec.preview_continuation import continuation_lock
 from lightcone_spec.quick_tuning import (
     WindowEvidence,
     WindowInterrupted,
+    exact_hotpath_inputs,
     paired_decision,
     run_window,
 )
-from lightcone_spec.runner import _cell_inputs, _selection_for_job, _speed_metrics
+from lightcone_spec.runner import (
+    _cell_inputs,
+    _native_tokenizer,
+    _selection_for_job,
+    _speed_metrics,
+)
 from lightcone_spec.server import apply_runner_affinity, server_session_key
 from lightcone_spec.state import StateStore
-from lightcone_spec.stride_audit import ALL_STRIDES, audit_job, calibration_split
+from lightcone_spec.stride_audit import ALL_STRIDES, SOURCES, audit_job, calibration_split
 
 
 def safe_metrics(client, *, adaptive, reset=False):
@@ -61,7 +67,8 @@ def main():
     parser.add_argument("--candidate-config", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--phase", choices=("baseline", "compare", "stride"), default="baseline")
-    parser.add_argument("--stride", type=int, choices=ALL_STRIDES, default=1)
+    parser.add_argument("--stride", type=int, choices=ALL_STRIDES, default=10)
+    parser.add_argument("--input-tokens", type=int, choices=(19968, 36864))
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     if (args.phase == "compare") != (args.candidate_config is not None):
@@ -83,8 +90,19 @@ def main():
     manifest, _ = qa_manifest(selections)
     template = next(j for j in preview_jobs(manifest) if j.backend == "DFLASH" and j.method == "lightcone"
                     and j.model == "Qwen/Qwen3-8B" and j.block == 0)
-    split = calibration_split(load_prompt_pool(original.datasets["CalibrationMix"]),
+    pool = load_prompt_pool(original.datasets["CalibrationMix"])
+    split = calibration_split(pool,
                               [r for rows in manifest["prompts"].values() for r in rows])
+    excluded = {str(r["problem_id"]) for rows in manifest["prompts"].values() for r in rows}
+    excluded.update(str(r["problem_id"]) for domain in split.values() for rows in domain.values() for r in rows)
+    fixed_inputs = {}
+    if args.input_tokens:
+        tokenizer = _native_tokenizer(original.model_path(template.model))
+        for domain in split:
+            background = [r for r in sorted(pool, key=lambda r: str(r["problem_id"]))
+                          if r.get("source") == SOURCES[domain] and str(r["problem_id"]) not in excluded]
+            fixed_inputs[domain] = exact_hotpath_inputs(
+                tokenizer, split[domain]["search"], background, args.input_tokens)
     repo = Path(__file__).resolve().parents[1]
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     configs = {}
@@ -94,6 +112,7 @@ def main():
     registration = {"version": 1, "phase": args.phase, "stride": args.stride,
                     "code": revision, "runtimes": configs, "window_seconds": 30, "warmup_seconds": 10,
                     "tp": 2, "concurrency": 1, "formal_acceptance": False,
+                    "fixed_input_tokens": args.input_tokens, "fixed_inputs": fixed_inputs,
                     "local_diff": subprocess.check_output(["git", "diff", "HEAD"], cwd=repo, text=True)}
     args.output.mkdir(parents=True, exist_ok=True)
     freeze(args.output / "registration.json", registration)
@@ -119,7 +138,7 @@ def main():
                 cases = ([(v, "lightcone", args.stride) for v in (("old", "new") if repeat % 2 == 0 else ("new", "old"))]
                          if args.phase == "compare" else
                          [("old", "static", 1)] + [("old", "lightcone", s) for s in
-                         ((1, 10) if args.phase == "baseline" else ALL_STRIDES)])
+                         ((args.stride,) if args.phase == "baseline" else ALL_STRIDES)])
                 for variant, method, stride in cases:
                     for domain in split:
                         identity = f"quick-v1__{args.phase}__{domain}__{method}__s{stride}__r{repeat}__{variant}"
@@ -161,6 +180,10 @@ def main():
                         load_seconds = time.perf_counter() - started
                         prepared = time.perf_counter()
                         prompts, budget, metadata = _cell_inputs(current, state, client, job)
+                        if fixed_inputs:
+                            prompts, budget = fixed_inputs[domain], 4096
+                            metadata.update(hotpath_exact_input_tokens=args.input_tokens,
+                                            hotpath_output_limit=budget)
                         input_seconds = time.perf_counter() - prepared
                         freeze(directory / "inputs.json", {"job": job.to_dict(), "prompts": prompts, "metadata": metadata})
 
