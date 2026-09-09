@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1628 @@
+@@ -0,0 +1,1650 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -285,20 +285,42 @@ index 00000000..20e93274
 +
 +    @staticmethod
 +    def backward(ctx, gradient):
-+        from torch.nn.attention import SDPBackend, sdpa_kernel
-+
 +        query, key, value, mask = ctx.saved_tensors
 +        dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
-+        with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
-+            leaves = tuple(x.detach().to(dtype).requires_grad_() for x in (query, key, value))
-+            output = F.scaled_dot_product_attention(
-+                *leaves, attn_mask=mask, dropout_p=0.0, is_causal=False,
-+                scale=ctx.scale, enable_gqa=query.shape[1] != key.shape[1],
-+            )
-+            gradients = torch.autograd.grad(output, leaves, gradient.to(dtype))
-+        return (*(g.to(x.dtype) if needed else None for g, x, needed in zip(
-+            gradients, (query, key, value), ctx.needs_input_grad[:3], strict=True
-+        )), None, None)
++        # Explicit VJP of the same softmax equation. Forward stays FlashInfer;
++        # no nested autograd graph or saved production activation is substituted.
++        q, k, v = (x.to(dtype) for x in (query, key, value))
++        groups = query.shape[1] // key.shape[1]
++        if groups != 1:
++            k = k.repeat_interleave(groups, dim=1)
++            v = v.repeat_interleave(groups, dim=1)
++        scores = (q @ k.transpose(-2, -1)) * ctx.scale
++        scores = scores.masked_fill(~mask, float("-inf"))
++        # SDPA returns zero for an all-masked row, including zero VJPs.
++        visible = mask.any(dim=-1, keepdim=True)
++        scores = torch.where(visible, scores, torch.zeros_like(scores))
++        probability = torch.softmax(scores, dim=-1).masked_fill(~mask, 0.0)
++        grad = gradient.to(dtype)
++        dq = dk = dv = None
++        need_q, need_k, need_v = ctx.needs_input_grad[:3]
++        if need_v:
++            dv = probability.transpose(-2, -1) @ grad
++        if need_q or need_k:
++            dp = grad @ v.transpose(-2, -1)
++            ds = probability * (dp - (dp * probability).sum(-1, keepdim=True))
++            if need_q:
++                dq = (ds @ k) * ctx.scale
++            if need_k:
++                dk = (ds.transpose(-2, -1) @ q) * ctx.scale
++        def reduce_kv(result, original):
++            if result is None:
++                return None
++            if groups != 1:
++                result = result.reshape(result.shape[0], original.shape[1], groups,
++                                        *result.shape[2:]).sum(2)
++            return result.to(original.dtype)
++        return (None if dq is None else dq.to(query.dtype),
++                reduce_kv(dk, key), reduce_kv(dv, value), None, None)
 +
 +
 +class _DFlashInferenceRMS(torch.autograd.Function):

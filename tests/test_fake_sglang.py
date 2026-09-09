@@ -932,6 +932,36 @@ def test_dflash_inference_attention_vjp_masks_gqa_and_reset(monkeypatch, kv_head
     assert len(cls.body[1].args.args) == 6
 
 
+@pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.parametrize("needs", [(True, True, True), (True, False, False),
+                                   (False, True, False), (False, False, True)])
+def test_attention_explicit_vjp_partial_gradients_and_empty_mask(kv_heads, needs):
+    _, tree = _patched_residual_rms()
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "_DFlashInferenceAttention")
+    namespace = {"torch": torch, "F": torch.nn.functional}
+    exec(compile(ast.Module([cls], []), "attention-vjp", "exec"), namespace)
+    gen = torch.Generator().manual_seed(109)
+    shapes = [(2, 2, 3, 4), (2, kv_heads, 7, 4), (2, kv_heads, 7, 4)]
+    q, k, v = [torch.randn(s, generator=gen, dtype=torch.float64).requires_grad_(need)
+               for s, need in zip(shapes, needs, strict=True)]
+    mask = torch.ones(2, 1, 3, 7, dtype=torch.bool)
+    mask[0, :, 0] = False
+    mask[..., -2:] = False
+    grad = torch.randn(q.shape, generator=gen, dtype=q.dtype)
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=.37, enable_gqa=kv_heads != 2)
+    expected = iter(torch.autograd.grad(ref, [x for x in (q, k, v) if x.requires_grad], grad))
+    ctx = SimpleNamespace(saved_tensors=(q, k, v, mask), scale=.37,
+                          needs_input_grad=(*needs, False, False))
+    actual = namespace["_DFlashInferenceAttention"].backward(ctx, grad)
+    for value, need in zip(actual[:3], needs, strict=True):
+        if need:
+            torch.testing.assert_close(value, next(expected), rtol=1e-10, atol=1e-10)
+        else:
+            assert value is None
+
+
 def _patched_residual_rms():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
     added = []
