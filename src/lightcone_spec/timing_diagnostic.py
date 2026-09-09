@@ -140,6 +140,7 @@ def _instrument(module):
             _wrap(cls, method, label, gpu=gpu, lane=lane)
     elif name.endswith(".dflash_online_adaptation"):
         _wrap_function(module, "_logit_reconstruction_gate", "reconstruction_check", "side")
+        _wrap_function(module, "loss_and_grad", "differentiable_objective_and_backward", "side")
         for operator, label in (("Attention", "attention"), ("RMS", "rms"), ("RoPE", "rope")):
             for method in ("forward", "backward"):
                 _wrap_autograd(getattr(module, f"_DFlashInference{operator}"), method,
@@ -150,6 +151,8 @@ def _instrument(module):
             ("maybe_launch", "update_schedule_and_prepare", "inclusive"),
             ("_gather_history", "history_kv_gather", "side"),
             ("_surrogate_hidden", "training_replay", "side"),
+            ("_effective_parameters", "dense_lora_materialization", "side"),
+            ("_frozen_replay_prefix", "frozen_prefix_replay", "side"),
             ("_distillation_loss", "distillation_loss", "side"),
             ("_full_vocab_logits", "vocabulary_gather", "side"),
         ):
