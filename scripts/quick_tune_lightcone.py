@@ -140,6 +140,7 @@ def main():
     registration = {"version": 1, "phase": args.phase, "stride": args.stride,
                     "collector_comparison": args.collector_comparison, "timeline_only": args.timeline,
                     "context_threshold": args.context_threshold,
+                    "timeline_scope": "one Code LightCone window" if args.timeline else None,
                     "code": revision, "runtimes": configs, "window_seconds": 30, "warmup_seconds": 10,
                     "tp": 2, "concurrency": 1, "formal_acceptance": False,
                     "fixed_input_tokens": args.input_tokens, "fixed_inputs": fixed_inputs,
@@ -169,8 +170,12 @@ def main():
                          if args.phase == "compare" else
                          [("old", "static", 1)] + [("old", "lightcone", s) for s in
                          ((args.stride,) if args.phase == "baseline" else ALL_STRIDES)])
+                if args.timeline:
+                    cases = [("old", "lightcone", args.stride)]
                 for variant, method, stride in cases:
                     for domain in split:
+                        if args.timeline and domain != "Code":
+                            continue
                         identity = f"quick-v1__{args.phase}__{domain}__{method}__s{stride}__r{repeat}__{variant}"
                         logical = args.output / identity
                         if (logical / "result.json").exists():
