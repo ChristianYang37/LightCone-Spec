@@ -101,6 +101,21 @@ def main():
         for domain in split:
             background = [r for r in sorted(pool, key=lambda r: str(r["problem_id"]))
                           if r.get("source") == SOURCES[domain] and str(r["problem_id"]) not in excluded]
+            # CalibrationMix can contain only the twelve reserved task samples.
+            # Use additional local prompt-only domain pools, never repeat a task
+            # or silently download data to fill a 36K background.
+            keys = ("LiveCodeBench", "HumanEval", "MBPP") if domain == "Code" else ("MATH-500", "GSM8K")
+            seen = {str(r["prompt"]).strip() for rows in manifest["prompts"].values() for r in rows}
+            seen.update(str(r["prompt"]).strip() for part in split.values() for rows in part.values() for r in rows)
+            seen.update(str(r["prompt"]).strip() for r in background)
+            for key in keys:
+                if key not in original.datasets:
+                    continue
+                for row in sorted(load_prompt_pool(original.datasets[key]), key=lambda r: str(r["problem_id"])):
+                    text = str(row["prompt"]).strip()
+                    if str(row["problem_id"]) not in excluded and text not in seen:
+                        background.append(row)
+                        seen.add(text)
             fixed_inputs[domain] = exact_hotpath_inputs(
                 tokenizer, split[domain]["search"], background, args.input_tokens)
     repo = Path(__file__).resolve().parents[1]
