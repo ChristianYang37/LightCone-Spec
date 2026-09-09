@@ -1456,7 +1456,8 @@ def test_context_report_uses_four_sample_mean_and_twelve_paired_units(tmp_path):
         write_report(tmp_path, rows + rows[:1], {}, complete=True)
 
 
-def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_path):
+@pytest.mark.parametrize("recovery_enabled", [False, True])
+def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_path, recovery_enabled):
     from lightcone_spec.preview_benchmark import digest, validate_report, write_report
     rows = context_benchmark_rows("calibration") + context_benchmark_rows()
     manifest = {"environment": {"gpu": "synthetic-test-not-GPU"},
@@ -1468,10 +1469,31 @@ def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_p
         row.update(provenance=provenance, duration_seconds=4096 / row["throughput"],
                    delivered_verify_tokens=4095, prefill_generated_tokens=1, target_calls=4095 / row["al"],
                    native_first_token_ns=1, native_last_token_ns=1 + 4095 * 1e9 / row["decode_speed"])
+    if recovery_enabled:
+        from lightcone_spec.preview_benchmark import validate_engine_recovery
+        source = provenance
+        manifest = {**manifest, "environment": {**manifest["environment"], "logical_context_tokens": 40960,
+                    "engine_context_tokens": 40962, "engine_reserved_context_slots": 2}}
+        old_rows = [r for r in rows if r["split"] == "calibration" and r["bucket"] < 9]
+        receipt = {"reason": "native_two_slot_boundary_v1", "review": "unit-test fixture, not GPU evidence",
+                   "source_provenance": source, "row_digests": {r["id"]: digest(r) for r in old_rows}}
+        validate_engine_recovery(manifest, receipt)
+        for key, value in (("gpu", "changed GPU"), ("engine_context_tokens", 41000)):
+            with pytest.raises(ValueError):
+                validate_engine_recovery({**manifest, "environment": {**manifest["environment"], key: value}}, receipt)
+        with pytest.raises(ValueError, match="exactly"):
+            validate_engine_recovery(manifest, {**receipt, "row_digests": {}})
+        with pytest.raises(ValueError, match="review"):
+            validate_engine_recovery({**manifest, "temperature": 0}, receipt)
+        provenance = {"commit": "candidate", "manifest": digest(manifest), "environment": manifest["environment"],
+                      "engine_context_recovery_v1": receipt}
+        for row in rows:
+            if row["id"] not in receipt["row_digests"]:
+                row["provenance"] = provenance
     report = write_report(tmp_path, rows, provenance, complete=True)
     assert validate_report(report, manifest, candidate_commit="candidate", environment=manifest["environment"])["status"] == "verified"
     with pytest.raises(ValueError, match="mismatch"):
         validate_report(report, manifest, candidate_commit="different", environment=manifest["environment"])
     report["rows"][0]["duration_seconds"] *= 2
-    with pytest.raises(ValueError, match="raw counts"):
+    with pytest.raises(ValueError, match="raw counts|recovery receipt"):
         validate_report(report, manifest, candidate_commit="candidate", environment=manifest["environment"])

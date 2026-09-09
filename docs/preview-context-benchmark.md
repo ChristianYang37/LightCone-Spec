@@ -112,3 +112,18 @@ does **not authenticate an arbitrary JSON producer**: maintainers must inspect
 the trusted GPU run/log origin before merging. Review performance manually;
 there is no automatic regression cutoff. Documentation-only PRs can mark N/A.
 Repository branch protection is not asserted by this local implementation.
+# Two-slot boundary recovery evidence
+
+An explicit `engine-context-recovery.json` receipt may retain the 108 completed
+Static calibration calls in bins 0–8 from the pre-fix engine. It is **not** a
+general permission to mix commits or machines: every input, seed, checkpoint,
+GPU UUID/driver, runtime and memory budget must match; only the recorded engine
+guard slots may differ. The maintainer must review the code-equivalence evidence
+and the unclipped raw calls before preparing this receipt.
+
+Imported `result.json` files keep their original commit/environment and remain
+byte-for-byte source evidence. The new aggregate provenance contains their
+digests and source provenance; resume and report verification reject missing,
+changed or out-of-scope imports. New measurements retain the candidate commit.
+The failed final-bin attempt remains separately archived. A changed GPU or
+driver does not authorize reusing this calibration or silently repeating it.

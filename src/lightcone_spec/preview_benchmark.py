@@ -37,6 +37,43 @@ def freeze(path, value):
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
 
 
+def validate_engine_recovery(manifest, recovery):
+    """Narrow two-slot incident receipt, not general cross-environment reuse.
+
+    The maintainer still reviews code equivalence and raw GPU evidence. This
+    checks the receipt's scope without relabelling the source measurements.
+    """
+    source = recovery["source_provenance"]
+    env = dict(manifest["environment"])
+    expected = {"logical_context_tokens": 40960, "engine_context_tokens": 40962,
+                "engine_reserved_context_slots": 2}
+    if any(env.pop(k, None) != v for k, v in expected.items()):
+        raise ValueError("recovery requires exactly two engine guard slots")
+    if (recovery.get("reason") != "native_two_slot_boundary_v1"
+            or not recovery.get("review") or not source.get("commit")
+            or set(source) != {"commit", "manifest", "environment"}
+            or env != source["environment"]
+            or digest({**manifest, "environment": env}) != source["manifest"]):
+        raise ValueError("recovery source inputs/environment/review mismatch")
+    expected_ids = {c["id"] for c in cases(manifest, "calibrate") if c["bucket"] < 9}
+    receipts = recovery.get("row_digests", {})
+    if len(expected_ids) != 108 or set(receipts) != expected_ids or any(
+            not isinstance(v, str) or len(v) != 64 for v in receipts.values()):
+        raise ValueError("recovery must cover exactly the 108 unclipped calibration calls")
+
+
+def validate_call_provenance(row, provenance):
+    if row.get("provenance") == provenance:
+        return
+    recovery = provenance.get("engine_context_recovery_v1", {})
+    if (row.get("provenance") != recovery.get("source_provenance")
+            or digest(row) != recovery.get("row_digests", {}).get(row.get("id"))
+            or row.get("status") != "completed" or row.get("split") != "calibration"
+            or row.get("mode") != "static" or not 0 <= row.get("bucket", -1) < 9
+            or row.get("output_tokens") != 4096):
+        raise ValueError("call has mismatched provenance or recovery receipt")
+
+
 def sample_sets(pools, exclusions):
     """Dataset IDs and prompt text both prevent calibration/evaluation leakage."""
     used_ids = {(r.get("dataset", "*"), str(r["problem_id"])) for r in exclusions if r.get("problem_id") is not None}
@@ -303,6 +340,8 @@ def validate_report(report, manifest, *, candidate_commit, environment):
             or provenance.get("commit") != candidate_commit or provenance.get("manifest") != digest(manifest)
             or provenance.get("environment") != environment or manifest.get("environment") != environment):
         raise ValueError("report candidate/manifest/environment mismatch")
+    if "engine_context_recovery_v1" in provenance:
+        validate_engine_recovery(manifest, provenance["engine_context_recovery_v1"])
     checked_rows(report["rows"], "calibration", ("static",))
     checked_rows(report["rows"], "evaluation", MODES)
     expected_cases = {c["id"]: c for phase in ("calibrate", "run") for c in cases(manifest, phase)}
@@ -312,8 +351,7 @@ def validate_report(report, manifest, *, candidate_commit, environment):
         case = expected_cases[row["id"]]
         if any(row[k] != case[k] for k in ("sample", "bucket", "split", "mode", "domain", "input_tokens", "output_tokens")):
             raise ValueError("call configuration differs from manifest")
-        if row.get("provenance") != provenance:
-            raise ValueError("call has mismatched provenance")
+        validate_call_provenance(row, provenance)
         derived = {"throughput": row["output_tokens"] / row["duration_seconds"],
                    "al": row["delivered_verify_tokens"] / row["target_calls"],
                    "decode_speed": (row["output_tokens"] - 1) * 1e9 /

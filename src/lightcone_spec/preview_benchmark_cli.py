@@ -22,6 +22,8 @@ from .preview_benchmark import (
     digest,
     freeze,
     sample_sets,
+    validate_call_provenance,
+    validate_engine_recovery,
     write_report,
 )
 
@@ -163,6 +165,10 @@ def execute(args):
                     "input_tokens": length, "output_tokens": 256, "split": "qa"}
                    for mode in ("static", "always_s10", "gated_s10") for length in (4080, 8192)]
         gate = {"threshold": 4096, "max_context": 40960}
+        # Short QA cannot detect the native context-boundary output clipping.
+        boundary = next(r for r in manifest["inputs"] if r["split"] == "calibration" and r["bucket"] == 9)
+        pending.append({**boundary, "id": "qa-static-full-40k-boundary", "mode": "static",
+                        "output_tokens": 4096, "split": "qa"})
     # Group mode within each length window to reuse loaded servers; rotate mode order by window.
     pending.sort(key=lambda c: (c["bucket"], (("static", "always_s10", "gated_s10").index(c["mode"])-c["bucket"]) % 3, c["sample"]))
     stopping = threading.Event()
@@ -170,6 +176,16 @@ def execute(args):
         signal.signal(sig, lambda *_: stopping.set())
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     provenance = {"commit": commit, "manifest": digest(manifest), "environment": env}
+    recovery_path = args.output / "engine-context-recovery.json"
+    if recovery_path.exists():
+        recovery = json.loads(recovery_path.read_text())
+        validate_engine_recovery(manifest, recovery)
+        provenance["engine_context_recovery_v1"] = recovery
+        recovered = {r["id"]: r for r in read_results(args.output)}
+        for identity in recovery["row_digests"]:
+            if identity not in recovered:
+                raise RuntimeError("recovery source call missing; do not repeat valid evidence")
+            validate_call_provenance(recovered[identity], provenance)
     freeze(args.output / "provenance.json", provenance)
     with continuation_lock(original.run_dir / "preview-continuation.lock"):
         if subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True).strip():
@@ -185,8 +201,9 @@ def execute(args):
                 directory = args.output / ("qa" if args.command == "qa" else "calls") / case["id"]
                 if (directory / "result.json").exists():
                     prior = json.loads((directory / "result.json").read_text())
-                    if prior.get("status") != "completed" or prior.get("provenance") != provenance:
+                    if prior.get("status") != "completed":
                         raise RuntimeError("existing call failed or has different provenance; explicit review required")
+                    validate_call_provenance(prior, provenance)
                     continue
                 if directory.exists():
                     raise RuntimeError("incomplete attempt retained; explicit review required")
