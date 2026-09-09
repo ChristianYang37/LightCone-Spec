@@ -2308,11 +2308,11 @@ index 00000000..7b2cb5db
 +            if base_learning_rate is None
 +            else base_learning_rate
 +        )
-+        floating_step = step.to(torch.float32)
 +        if self.config.schedule == "constant":
-+            scale = torch.ones_like(floating_step)
-+            valid = step >= 1
-+        elif self.config.schedule == "inverse_sqrt_published_update":
++            # A device fill avoids uploading a new CPU scalar every update.
++            return torch.full_like(step, base, dtype=torch.float32), step >= 1
++        floating_step = step.to(torch.float32)
++        if self.config.schedule == "inverse_sqrt_published_update":
 +            scale = torch.rsqrt(floating_step.clamp_min(1))
 +            valid = step >= 1
 +        else:
@@ -2437,10 +2437,10 @@ index 00000000..7b2cb5db
 +        del squared
 +        floating_step = step.to(torch.float32)
 +        correction1 = 1 - torch.pow(
-+            torch.as_tensor(beta1, device=step.device), floating_step
++            torch.full_like(floating_step, beta1, dtype=torch.get_default_dtype()), floating_step
 +        )
 +        correction2 = 1 - torch.pow(
-+            torch.as_tensor(beta2, device=step.device), floating_step
++            torch.full_like(floating_step, beta2, dtype=torch.get_default_dtype()), floating_step
 +        )
 +        directions = torch._foreach_div(first, correction1)
 +        denominators = torch._foreach_div(second, correction2)

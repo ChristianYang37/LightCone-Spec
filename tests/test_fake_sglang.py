@@ -4265,6 +4265,73 @@ def test_packed_update_trace_preserves_values_flags_and_owned_rows(tmp_path, dty
         assert not trace.requires_grad
 
 
+@pytest.mark.parametrize("schedule", ["constant", "inverse_sqrt_published_update", "cosine_published_update"])
+@pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+def test_device_local_optimizer_scalars_preserve_complete_proposals(tmp_path, schedule, default_dtype):
+    import copy
+
+    relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
+    for patch in sorted(Path("patches/sglang").glob("*.diff")):
+        subprocess.run(["git", "apply", f"--include={relative}", str(patch.resolve())],
+                       cwd=tmp_path, check=True, capture_output=True)
+    tree = ast.parse((tmp_path / relative).read_text())
+    names = {"_clip_fp32_gradients", "ParameterProposal", "ResidentOptimizer"}
+    definitions = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in names]
+
+    class HostScalarOracle(ast.NodeTransformer):
+        def visit_Call(self, node):
+            node = self.generic_visit(node)
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "full_like"
+                    and isinstance(node.args[1], ast.Name)):
+                name = node.args[1].id
+                if name in {"beta1", "beta2"}:
+                    return ast.parse(f"torch.as_tensor({name}, device=step.device)", mode="eval").body
+                if name == "base":
+                    return ast.parse("step.to(torch.float32).new_tensor(base) * "
+                                     "torch.ones_like(step.to(torch.float32))", mode="eval").body
+            return node
+
+    def load(nodes):
+        namespace = {"torch": torch, "math": math, "Sequence": Sequence, "dataclass": dataclass}
+        exec(compile(ast.fix_missing_locations(ast.Module(nodes, [])), "scalar-optimizer", "exec"), namespace)
+        return namespace["ResidentOptimizer"]
+
+    new_type = load(copy.deepcopy(definitions))
+    old_type = load(HostScalarOracle().visit(ast.Module(copy.deepcopy(definitions), [])).body)
+    config = SimpleNamespace(name="chronobelief", learning_rate=0.001, beta1=0.9, beta2=0.99,
+                             epsilon=1e-8, weight_decay=0., grad_clip=1., schedule=schedule,
+                             schedule_total_published_updates=8192)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        initial = (torch.ones((8, 16), dtype=torch.float32), torch.zeros((16, 8), dtype=torch.float32))
+        old, new = old_type(initial, config), new_type(initial, config)
+        gradients = tuple(torch.linspace(-0.2, 0.3, p.numel(), dtype=torch.float32).view_as(p) for p in initial)
+        for step in (0, 1, 2, 100, 4090, 8191, 8192):
+            for optimizer in (old, new):
+                optimizer._step.fill_(step)
+            before = tuple(t.clone() for t in new.state_tensors)
+            proposals = [o.propose(gradients, feedback_source_version=step,
+                                   safe_boundary_version=step + 2) for o in (old, new)]
+            for field in proposals[0].__dataclass_fields__:
+                left, right = getattr(proposals[0], field), getattr(proposals[1], field)
+                for a, b in zip(left if isinstance(left, tuple) else (left,),
+                                right if isinstance(right, tuple) else (right,), strict=True):
+                    torch.testing.assert_close(a, b, rtol=0, atol=0, equal_nan=True)
+            for optimizer, proposal in zip((old, new), proposals, strict=True):
+                optimizer.commit(proposal, valid=torch.tensor(False))
+            for a, b in zip(before, new.state_tensors, strict=True):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+            for optimizer, proposal in zip((old, new), proposals, strict=True):
+                optimizer.commit(proposal, valid=torch.tensor(True))
+        for optimizer in (old, new):
+            optimizer.reset(initial)
+        for a, b in zip(old.state_tensors, new.state_tensors, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
 def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
     for patch in sorted(Path("patches/sglang").glob("*.diff")):
@@ -4313,7 +4380,8 @@ def test_cumulative_runtime_optimizer_uses_global_clip_norm(tmp_path):
     torch.testing.assert_close(proposal.first_moments[0], torch.tensor([1 / 30]))
 
 
-def test_bounded_live_replay_records_real_proposal_without_committing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("optimizer_reference", [False, True])
+def test_bounded_live_replay_records_real_proposal_without_committing(tmp_path, monkeypatch, optimizer_reference):
     from collections.abc import Callable
 
     from lightcone_spec.hotpath_equivalence import install
@@ -4330,7 +4398,12 @@ def test_bounded_live_replay_records_real_proposal_without_committing(tmp_path, 
                             and n.name in wanted], []), "replay-test", "exec"), namespace)
     optimizer_type = namespace["ResidentOptimizer"]
     monkeypatch.setitem(sys.modules, "sglang.srt.speculative.online_adaptation_runtime",
-                        SimpleNamespace(ResidentOptimizer=optimizer_type))
+                        SimpleNamespace(**namespace))
+    if optimizer_reference:
+        monkeypatch.setenv("LIGHTCONE_HOTPATH_OPTIMIZER_REFERENCE", str(tmp_path / relative))
+    else:
+        monkeypatch.delenv("LIGHTCONE_HOTPATH_OPTIMIZER_REFERENCE", raising=False)
+    schedule = optimizer_type._scheduled_learning_rate
     source = tmp_path / "reference.py"
     source.write_text("class _DFlashInferenceRMS:\n    @staticmethod\n    def backward(*args):\n        return None\n")
     module = SimpleNamespace(_DFlashInferenceRMS=type("RMS", (), {"backward": staticmethod(lambda *a: None)}),
@@ -4346,6 +4419,8 @@ def test_bounded_live_replay_records_real_proposal_without_committing(tmp_path, 
     record = json.loads(next((tmp_path / "evidence").glob("*.json")).read_text())
     assert [r["event"] for r in record["rows"]] == [1, 100]
     assert all(r["passed"] and r["state_unchanged"] for r in record["rows"])
+    assert all(("optimizer_reference" in r) == optimizer_reference for r in record["rows"])
+    assert optimizer_type._scheduled_learning_rate is schedule
     assert torch.equal(optimizer.master[0], torch.ones(2)) and optimizer._step == 0
 
 

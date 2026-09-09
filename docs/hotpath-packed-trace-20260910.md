@@ -21,3 +21,11 @@ removed in this candidate.
 
 GPU outcome: UNMEASURED. No push, paper change, full DAG, video or model download.
 Collect evidence and shut down the exact instance without releasing it at end.
+
+Second isolated candidate: replace per-update host-created constant LR/beta
+CUDA scalars with device fills. Constant schedule retains the next-publication
+validity test; beta tensors retain the current default dtype. Tensor arithmetic,
+clipping, bias correction, age scaling and rejected-proposal transactions are
+unchanged. Test complete proposals at long-run steps and reset, then check real
+GPU proposals and host-transfer activity before end-to-end comparison. Its A/B
+baseline is the packed-trace runtime, so the two changes are measured separately.

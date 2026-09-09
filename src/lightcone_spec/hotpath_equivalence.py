@@ -20,8 +20,18 @@ def install(module, source, output):
     reference = namespace["_DFlashInferenceRMS"].backward
     candidate = module._DFlashInferenceRMS.backward
     feedback = module.loss_and_grad
-    optimizer_type = importlib.import_module("sglang.srt.speculative.online_adaptation_runtime").ResidentOptimizer
+    optimizer_module = importlib.import_module("sglang.srt.speculative.online_adaptation_runtime")
+    optimizer_type = optimizer_module.ResidentOptimizer
     propose = optimizer_type.propose
+    optimizer_reference = None
+    optimizer_source = os.environ.get("LIGHTCONE_HOTPATH_OPTIMIZER_REFERENCE")
+    if optimizer_source:
+        optimizer_tree = ast.parse(Path(optimizer_source).read_text())
+        optimizer_cls = next(n for n in optimizer_tree.body
+                             if isinstance(n, ast.ClassDef) and n.name == "ResidentOptimizer")
+        optimizer_namespace = dict(vars(optimizer_module))
+        exec(compile(ast.Module([optimizer_cls], []), optimizer_source, "exec"), optimizer_namespace)
+        optimizer_reference = optimizer_namespace["ResidentOptimizer"]
     seen, pending, rows = 0, None, []
 
     def compare(a, b):
@@ -36,7 +46,7 @@ def install(module, source, output):
             "scope": "excluded_live_KL_gradient_proposal_replay; not timing",
             "rows": rows}, indent=2))
         if not row["passed"]:
-            raise RuntimeError("fixed-state RMS KL/gradient/proposal mismatch; evidence preserved")
+            raise RuntimeError("fixed-state KL/gradient/proposal mismatch; evidence preserved")
 
     def loss_and_grad(parameters, objective):
         nonlocal seen, pending
@@ -64,7 +74,18 @@ def install(module, source, output):
         old_grad, record = pending
         pending = None
         state = tuple(x.clone() for x in (*self.master, *self.first, *self.second, self._step))
-        old = propose(self, old_grad, **kwargs)
+        if optimizer_reference is None:
+            old = propose(self, old_grad, **kwargs)
+        else:
+            # Excluded c1 replay only. Restore even if the reference raises;
+            # the live optimizer tensors are never committed by either call.
+            candidate_schedule = optimizer_type._scheduled_learning_rate
+            try:
+                optimizer_type._scheduled_learning_rate = optimizer_reference._scheduled_learning_rate
+                old = optimizer_reference.propose(self, old_grad, **kwargs)
+            finally:
+                optimizer_type._scheduled_learning_rate = candidate_schedule
+            record["optimizer_reference"] = optimizer_source
         new = propose(self, gradients, **kwargs)
         def tensors(p):
             return (*p.parameters, *p.first_moments, *p.second_moments,
