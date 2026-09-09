@@ -206,7 +206,7 @@ def main():
                                         stride=stride, block=repeat, implementation=revision)
                         job = replace(job, job_id=identity, parameters={**job.parameters, "clean_server_per_cell": False})
                         if args.context_threshold is not None and method == "lightcone":
-                            job = replace(job, parameters={**job.parameters, "context_gate_v1": {
+                            job = replace(job, parameters={**job.parameters, "hotpath_request_scope_v1": True, "context_gate_v1": {
                                 "threshold": args.context_threshold, "max_context": 40960}})
                         selection = _selection_for_job(state, job)
                         current = replace(variants[variant], results_root=args.output, run_name="excluded")

@@ -129,6 +129,29 @@ def test_fixed20k_s5_actual_adaptation_payload_and_session_isolation():
         adaptation_payload(replace(jobs[2], parameters={**jobs[2].parameters, 'context_gate_v1': {'threshold': 20000}}), None)
 
 
+def test_hotpath_gate_uses_excluded_request_scope_without_changing_budget(tmp_path):
+    from lightcone_spec.server import adaptation_payload, memory_budget_policy
+
+    job = Job("excluded-gate", "Stride-audit-v1", 0, "lightcone", "Qwen/Qwen3-8B", "DFLASH",
+              "Code", context=40960, width=16, load="c1", gpu_count=2,
+              parameters={"excluded_from_analysis": True, "hotpath_request_scope_v1": True,
+                          "topology": "tp2_dp1", "stride": 10, "parameterization": "lora", "scope": "last1",
+                          "context_gate_v1": {"threshold": 20480, "max_context": 40960}})
+    payload = adaptation_payload(job)
+    assert payload["reset_scope"] == "request" and payload["stride"] == 10
+    assert payload["context_gate_v1"]["threshold"] == 20480
+    assert memory_budget_policy(job) == "fixed_reserve_v1"
+    config = ExperimentConfig(
+        source=tmp_path/'config.yaml', run_name='test', sglang_root=tmp_path,
+        results_root=tmp_path, models={'Qwen/Qwen3-8B': tmp_path/'target'},
+        drafts={'Qwen/Qwen3-8B|DFLASH': tmp_path/'draft'}, datasets={}, gpu_ids=(0, 1),
+        server=ServerConfig(python=Path(sys.executable)), protocol=ProtocolConfig())
+    command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=payload)
+    assert command[command.index('--context-length')+1] == '40962'
+    with pytest.raises(ValueError, match="excluded"):
+        adaptation_payload(replace(job, parameters={**job.parameters, "excluded_from_analysis": False}))
+
+
 def test_request_reset_preserves_local_arrays_without_recursive_receipts():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff").read_text()
     body = patch.split("+++ b/python/sglang/srt/speculative/online_adaptation_runtime.py", 1)[1].split("diff --git", 1)[0]

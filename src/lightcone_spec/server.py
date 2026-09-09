@@ -222,6 +222,10 @@ def _execution_backend(job: Job) -> str:
 
 
 def _request_scoped_adaptation(job: Job) -> bool:
+    if job.parameters.get("hotpath_request_scope_v1"):
+        if job.parameters.get("excluded_from_analysis") is not True:
+            raise ValueError("hotpath request reset is an excluded diagnostic only")
+        return True
     return job.method in {"tts", "l0_naive"} or bool(job.parameters.get("context_benchmark_v1"))
 
 
@@ -419,7 +423,9 @@ def server_command(
     max_running = _server_capacity(job, adaptation)
     engine_context = (job.context if job.parameters.get("regime") == "preview_constructed_chat"
                       else max(40960, job.context or 0))
-    if job.parameters.get("context_benchmark_v1"):
+    if job.parameters.get("context_benchmark_v1") or job.parameters.get("hotpath_request_scope_v1"):
+        if job.parameters.get("hotpath_request_scope_v1"):
+            _request_scoped_adaptation(job)  # validates excluded-only diagnostic scope
         # Pinned SGLang: worker max_req_len=context_len-1; scheduler then
         # caps output at max_req_len-input_len-1. These are internal slots,
         # not extra scientific input/output tokens or a looser context gate.
@@ -833,6 +839,7 @@ class ServerProcess:
         if self.job.parameters.get("context_benchmark_v1"):
             environment["LIGHTCONE_CONTEXT_BENCHMARK_RESERVE_MB"] = str(
                 self.config.server.adaptation_reserve_mb)
+        if self.job.parameters.get("context_benchmark_v1") or self.job.parameters.get("hotpath_request_scope_v1"):
             # Two native guard slots, not a larger scientific request budget.
             environment["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         environment.pop("LIGHTCONE_MEMORY_BUDGET_QA", None)
