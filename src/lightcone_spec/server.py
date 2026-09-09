@@ -270,14 +270,18 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     if uses_formal_adaptation_stride(job):
         chosen["stride"] = FORMAL_ADAPTATION_STRIDE
     stride = int(chosen.get("stride", FORMAL_ADAPTATION_STRIDE))
-    if job.parameters.get("context_benchmark_variant") == "fixed20k_v1":
+    if job.parameters.get("context_benchmark_variant") in {"fixed20k_v1", "fixed20k_adaptive_v2"}:
         mode = job.parameters.get("benchmark_mode")
-        if (mode not in {"always_s10", "gated_s10", "gated_s5"}
-                or stride != (5 if mode == "gated_s5" else 10)):
+        registered = {"always_s10": 10, "gated_s10": 10, "gated_s5": 5}
+        if job.parameters.get("context_benchmark_variant") == "fixed20k_adaptive_v2":
+            registered["always_s64"] = 64
+        if mode not in registered or stride != registered[mode]:
             raise ValueError("fixed20k benchmark stride differs from registered mode")
         gate = chosen.get("context_gate_v1")
         if mode.startswith("gated_") and (not gate or gate.get("threshold") != 20480):
             raise ValueError("fixed20k benchmark requires threshold 20480")
+        if mode.startswith("always_") and gate is not None:
+            raise ValueError("always-on benchmark must not have a context threshold")
     if job.parameters.get("stride_audit_v1"):
         from .stride_audit import ALL_STRIDES
         if (not job.parameters.get("excluded_from_analysis") or stride not in ALL_STRIDES
@@ -636,8 +640,8 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
             else "normal-device"
         ),
         *adaptation_layout,
-        *(("fixed20k_v1", job.parameters.get("benchmark_mode"))
-          if job.parameters.get("context_benchmark_variant") == "fixed20k_v1" else ()),
+        *((job.parameters["context_benchmark_variant"], job.parameters.get("benchmark_mode"))
+          if job.parameters.get("context_benchmark_variant") in {"fixed20k_v1", "fixed20k_adaptive_v2"} else ()),
     )
 
 

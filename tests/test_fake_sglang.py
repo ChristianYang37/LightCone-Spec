@@ -106,12 +106,15 @@ def test_context_benchmark_full_last_bin_has_two_engine_guard_slots(tmp_path, mo
     assert old[old.index('--context-length')+1] == '40960'
 
 
-def test_fixed20k_s5_actual_adaptation_payload_and_session_isolation():
-    from lightcone_spec.preview_benchmark import FIXED_GATE, FIXED_VERSION
+@pytest.mark.parametrize("adaptive_only", [False, True])
+def test_fixed20k_s5_actual_adaptation_payload_and_session_isolation(adaptive_only):
+    from lightcone_spec.preview_benchmark import ADAPTIVE_VERSION, FIXED_GATE, FIXED_VERSION
     from lightcone_spec.preview_benchmark_cli import benchmark_job
     from lightcone_spec.protocol import uses_formal_adaptation_stride
     from lightcone_spec.server import adaptation_payload, server_session_key
     manifest = {'environment': {'width': 16}, 'version': FIXED_VERSION, 'fixed_gate': FIXED_GATE}
+    if adaptive_only:
+        manifest['version'] = ADAPTIVE_VERSION
     gate = {'threshold': 20480, 'max_context': 40960}
     jobs = [benchmark_job({'id': mode, 'mode': mode, 'domain': 'Chat', 'output_tokens': 4096}, manifest, gate)
             for mode in ('always_s10', 'gated_s10', 'gated_s5')]
@@ -127,6 +130,15 @@ def test_fixed20k_s5_actual_adaptation_payload_and_session_isolation():
         adaptation_payload(replace(jobs[2], parameters={**jobs[2].parameters, 'stride': 10}), None)
     with pytest.raises(ValueError, match='threshold'):
         adaptation_payload(replace(jobs[2], parameters={**jobs[2].parameters, 'context_gate_v1': {'threshold': 20000}}), None)
+    if adaptive_only:
+        job = benchmark_job({'id': 's64', 'mode': 'always_s64', 'domain': 'Chat', 'output_tokens': 4096}, manifest, gate)
+        assert adaptation_payload(job, job.parameters)['stride'] == 64
+        assert not uses_formal_adaptation_stride(job)
+        assert server_session_key(job, job.parameters) != server_session_key(jobs[0], jobs[0].parameters)
+        with pytest.raises(ValueError, match='stride'):
+            adaptation_payload(replace(job, parameters={**job.parameters, 'stride': 10}), None)
+        with pytest.raises(ValueError, match='threshold'):
+            adaptation_payload(replace(job, parameters={**job.parameters, 'context_gate_v1': gate}), None)
 
 
 def test_hotpath_gate_uses_excluded_request_scope_without_changing_budget(tmp_path):

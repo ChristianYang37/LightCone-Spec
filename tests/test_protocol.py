@@ -1307,3 +1307,25 @@ def test_fixed20k_benchmark_480_evaluation_identities_no_recalibration():
         cases(manifest, "calibrate")
     with pytest.raises(ValueError, match="20480"):
         cases({**manifest, "fixed_gate": {**FIXED_GATE, "threshold": 20000}}, "run")
+
+
+def test_adaptive_context_v2_preserves_inputs_excludes_static_and_old_identities():
+    from lightcone_spec.preview_benchmark import (
+        ADAPTIVE_MODES,
+        ADAPTIVE_VERSION,
+        FIXED_GATE,
+        FIXED_VERSION,
+        cases,
+    )
+    inputs = [{"split": "evaluation", "sample": i, "bucket": j, "domain": ("Chat", "Code", "Math")[i//4],
+               "seed": i, "input_tokens": 10, "input_ids": [1]*10, "output_tokens": 4096}
+              for i in range(12) for j in range(10)]
+    old = {"version": FIXED_VERSION, "fixed_gate": FIXED_GATE, "inputs": inputs}
+    manifest = {**old, "version": ADAPTIVE_VERSION}
+    rows = cases(manifest, "run")
+    assert len(rows) == len({r["id"] for r in rows}) == 480
+    assert {m: sum(r["mode"] == m for r in rows) for m in ADAPTIVE_MODES} == dict.fromkeys(ADAPTIVE_MODES, 120)
+    assert not {r["id"] for r in rows} & {r["id"] for r in cases(old, "run")}
+    assert all(r["mode"] != "static" and r["input_ids"] == [1]*10 and r["seed"] == r["sample"] for r in rows)
+    with pytest.raises(ValueError, match="do not repeat"):
+        cases(manifest, "calibrate")

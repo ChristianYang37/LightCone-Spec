@@ -1564,8 +1564,10 @@ def test_context_gpu_report_matches_commit_and_recomputes_raw_denominators(tmp_p
         validate_report(report, manifest, candidate_commit="candidate", environment=manifest["environment"])
 
 
-def test_fixed20k_report_480_four_modes_and_s5_pairing(tmp_path):
+@pytest.mark.parametrize("adaptive_only", [False, True])
+def test_fixed20k_report_480_four_modes_and_s5_pairing(tmp_path, adaptive_only):
     from lightcone_spec.preview_benchmark import (
+        ADAPTIVE_VERSION,
         FIXED_GATE,
         FIXED_VERSION,
         digest,
@@ -1575,13 +1577,17 @@ def test_fixed20k_report_480_four_modes_and_s5_pairing(tmp_path):
     rows = context_benchmark_rows()
     rows += [{**r, 'mode': 'gated_s5', 'id': r['id'].replace('gated_s10', 'gated_s5'),
               'throughput': r['throughput']*1.1} for r in rows if r['mode'] == 'gated_s10']
+    if adaptive_only:
+        FIXED_VERSION = ADAPTIVE_VERSION
+        rows = [{**r, 'mode': 'always_s64', 'id': r['id'].replace('static', 'always_s64')}
+                if r['mode'] == 'static' else r for r in rows]
     for row in rows:
         row['id'] = row['id'].replace('preview-context-v1', FIXED_VERSION)
-        row['resolved_stride'] = None if row['mode'] == 'static' else (5 if row['mode'] == 'gated_s5' else 10)
+        row['resolved_stride'] = None if row['mode'] == 'static' else int(row['mode'].rsplit('s', 1)[1])
         row['context_threshold'] = 20480 if row['mode'].startswith('gated_') else None
     manifest = {'version': FIXED_VERSION, 'fixed_gate': FIXED_GATE, 'environment': {'gpu': 'synthetic'},
                 'inputs': [{**{k:r[k] for k in ('split','sample','bucket','domain','input_tokens','output_tokens')},
-                            'input_ids': [1]*r['input_tokens']} for r in rows if r['mode'] == 'static']}
+                            'input_ids': [1]*r['input_tokens']} for r in rows if r['mode'] == ('always_s64' if adaptive_only else 'static')]}
     provenance = {'commit': 'candidate', 'manifest': digest(manifest), 'environment': manifest['environment'],
                   'benchmark_version': FIXED_VERSION, 'fixed_gate': FIXED_GATE}
     for row in rows:
@@ -1591,7 +1597,12 @@ def test_fixed20k_report_480_four_modes_and_s5_pairing(tmp_path):
     report = write_report(tmp_path, rows, provenance, complete=True)
     assert len(report['tables']) == 120 and report['calibration_tables'] == []
     assert report['paired_effects']['gated_s5_vs_gated_s10']['ratio'] == pytest.approx(1.1)
-    assert report['paired_effects']['gated_s5_vs_static']['independent_samples'] == 12
+    assert report['paired_effects']['gated_s5_vs_always_s10']['independent_samples'] == 12
+    if adaptive_only:
+        assert report['comparisons_to_static'] == []
+        assert report['comparison_baseline'] == 'always_s10'
+        assert report['paired_effects']['always_s64_vs_always_s10']['ratio'] == 1
+        assert '<option>static</option>' not in (tmp_path/'index.html').read_text()
     receipt = validate_report(report, manifest, candidate_commit='candidate', environment=manifest['environment'])
     assert receipt['calibration_calls'] == 0 and receipt['evaluation_calls'] == 480
     assert '<option>gated_s5</option>' in (tmp_path/'index.html').read_text()

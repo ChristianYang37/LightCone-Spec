@@ -300,7 +300,7 @@ def uses_formal_adaptation_stride(job: Job) -> bool:
         and not (job.node == "preview-context-benchmark-v1"
                  and job.parameters.get("context_benchmark_v1")
                  and job.parameters.get("excluded_from_analysis")
-                 and job.parameters.get("context_benchmark_variant") == "fixed20k_v1")
+                 and job.parameters.get("context_benchmark_variant") in {"fixed20k_v1", "fixed20k_adaptive_v2"})
     )
 
 
