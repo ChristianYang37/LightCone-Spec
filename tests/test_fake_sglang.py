@@ -4225,7 +4225,7 @@ def test_failed_dflash_capture_is_opt_in_and_retains_rejected_candidate(tmp_path
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
-def test_packed_update_trace_preserves_values_flags_and_owned_rows(tmp_path, dtype):
+def test_update_trace_preserves_values_flags_and_owned_rows(tmp_path, dtype):
     relative = "python/sglang/srt/speculative/online_adaptation_runtime.py"
     for patch in sorted(Path("patches/sglang").glob("*.diff")):
         subprocess.run(["git", "apply", f"--include={relative}", str(patch.resolve())],
@@ -4236,7 +4236,9 @@ def test_packed_update_trace_preserves_values_flags_and_owned_rows(tmp_path, dty
     submit = next(n for n in runtime.body if isinstance(n, ast.FunctionDef) and n.name == "submit")
     start = next(i for i, n in enumerate(submit.body) if isinstance(n, ast.Assign)
                  and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "metric_row")
-    block = ast.Module(submit.body[start:start + 2], [])
+    end = next(i for i, n in enumerate(submit.body) if isinstance(n, ast.Assign)
+               and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "optimizer_step_row")
+    block = ast.Module(submit.body[start:end], [])
     names = ("loss", "finite", "reconstruction_ok", "reconstruction_max_abs",
              "online_hint_error", "online_ensemble_entropy", "online_effective_experts",
              "reconstruction_relative_rms", "reconstruction_top1_match",

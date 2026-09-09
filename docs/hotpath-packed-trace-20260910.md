@@ -19,7 +19,10 @@ BF16 reconstruction versus FP32-master gradients are not duplicate computations.
 Removing either requires a separate dependency/equivalence proof. They are not
 removed in this candidate.
 
-GPU outcome: UNMEASURED. No push, paper change, full DAG, video or model download.
+Packed trace outcome: rejected after twelve end-to-end windows (three pairs per
+domain). Code -0.405%, Math -1.100%; the roughly 39% scalar-write microbenchmark
+reduction did not translate to throughput. Restore the original trace writes;
+preserve candidate a3de2924 and raw results. No push, paper change, full DAG, video or model download.
 Collect evidence and shut down the exact instance without releasing it at end.
 
 Second isolated candidate: replace per-update host-created constant LR/beta
@@ -28,4 +31,5 @@ validity test; beta tensors retain the current default dtype. Tensor arithmetic,
 clipping, bias correction, age scaling and rejected-proposal transactions are
 unchanged. Test complete proposals at long-run steps and reset, then check real
 GPU proposals and host-transfer activity before end-to-end comparison. Its A/B
-baseline is the packed-trace runtime, so the two changes are measured separately.
+baseline is the retained v72 runtime after reverting the unsuccessful trace
+packing. Only scalar construction differs in the second end-to-end A/B.
