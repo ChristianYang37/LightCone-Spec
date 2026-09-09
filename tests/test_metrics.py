@@ -230,6 +230,42 @@ def test_local_autograd_timing_preserves_static_forward_and_gradient(monkeypatch
     assert diagnostic._installed == {"Operator.forward", "Operator.backward"}
 
 
+def test_global_and_local_rank_collectors_preserve_same_response(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace as NS
+
+    import lightcone_spec.timing_diagnostic as local
+    from lightcone_spec.verification_diagnostic import install
+
+    namespace = {}
+    exec(compile("def get_internal_state(self, response):\n    return response\n",
+                 "/excluded/managers/scheduler.py", "exec"), namespace)
+    cls = type("Scheduler", (), {"get_internal_state": namespace["get_internal_state"],
+                                 "ps": NS(tp_rank=1, tp_size=2)})
+    response = NS(internal_state={"speed_study_metrics": {"fallbacks": 0},
+        "speculative_adaptation_info_record": {"online_adaptation": {"updates": [{"loss": 1.5}]}},
+        "irrelevant_private_field": "must not be included"})
+    monkeypatch.setenv("LIGHTCONE_EXCLUDED_VERIFY_TRACE", json.dumps({
+        "output_directory": str(tmp_path), "rank_metrics": True, "trace_verify": False}))
+    previous = sys.gettrace()
+    try:
+        install()
+        assert cls().get_internal_state(response) is response
+    finally:
+        sys.settrace(previous)
+    monkeypatch.setattr(local, "_settings", {"mode": "off", "output_directory": str(tmp_path)})
+    monkeypatch.setattr(local, "_recorder", None)
+    monkeypatch.setattr(local, "_installed", set())
+    local._instrument(NS(__name__="sglang.srt.managers.scheduler", Scheduler=cls))
+    assert cls().get_internal_state(response) is response
+    rows = [json.loads(line) for line in (tmp_path/"rank-1-metrics.jsonl").read_text().splitlines()]
+    assert len(rows) == 2
+    for row in rows:
+        row.pop("captured_ns")
+    assert rows[0] == rows[1]
+    assert set(rows[0]["state"]) == {"speed_study_metrics", "speculative_adaptation_info_record"}
+
+
 def test_video_native_final_accounting_rejects_loss_duplicates_and_wrong_denominator():
     from copy import deepcopy
 
