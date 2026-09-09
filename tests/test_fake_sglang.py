@@ -972,6 +972,54 @@ def _patched_logit_reconstruction_gate():
     return namespace["_logit_reconstruction_gate"]
 
 
+@pytest.mark.parametrize("candidate", ["kv_index_select", "single_mask_index", "paired_logits_gather", "logical_prefix_write"])
+def test_excluded_hotpath_candidates_pinned_compile_and_equivalence(candidate):
+    from lightcone_spec.hotpath_candidates import ADAPTER, RUNTIME, transform
+    target = RUNTIME if candidate == "logical_prefix_write" else ADAPTER
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff").read_text()
+    body = patch.split("+++ b/" + target, 1)[1].split("diff --git", 1)[0]
+    source = "\n".join(line[1:] for line in body.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    changed = transform(source, candidate)
+    assert source != changed
+    with pytest.raises(ValueError, match="source block"):
+        transform(changed, candidate)
+    if candidate == "single_mask_index":
+        def function(text, name):
+            node = next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and n.name == name)
+            namespace = {"torch": torch}
+            exec(compile(ast.Module([node], []), name, "exec"), namespace)
+            return namespace[name]
+        old, new = (function(s, "_logit_reconstruction_gate") for s in (source, changed))
+        x = torch.randn(2, 5, 32)
+        for count in (0, 1, 4, 5):
+            mask = torch.arange(5)[None, :].expand(2, -1) < count
+            y = x.clone()
+            y[~mask] = float("nan")
+            for a, b in zip(old(x, y, valid_mask=mask), new(x, y, valid_mask=mask), strict=True):
+                torch.testing.assert_close(a, b, rtol=0, atol=0, equal_nan=True)
+    elif candidate == "kv_index_select":
+        buffer = torch.randn(20, 3, 8)
+        indices = torch.tensor([[1, 2, 2, 0], [19, 4, 5, 19]])
+        assert torch.equal(buffer[indices], buffer.index_select(0, indices.reshape(-1)).reshape(2, 4, 3, 8))
+    elif candidate == "paired_logits_gather":
+        shards = [(torch.randn(2, 5, 7), torch.randn(2, 5, 7)) for _ in range(2)]
+        old = tuple(torch.cat([r[i] for r in shards], dim=-1) for i in range(2))
+        new = torch.cat([torch.stack(r) for r in shards], dim=-1).unbind(0)
+        assert all(torch.equal(a, b) for a, b in zip(old, new, strict=True))
+    else:
+        physical = torch.tensor([100, 200, 300], dtype=torch.int32)
+        for logical in ((None, None, None), (torch.tensor(90), None, torch.tensor(280)),
+                        (torch.tensor(0), torch.tensor(180), torch.tensor(270))):
+            outputs = []
+            for src in (source, changed):
+                fragment = src.split("        row.fill_(-1)\n", 1)[1].split("        trace = RoundTrace(", 1)[0]
+                row = torch.full((3, 5), -1, dtype=torch.int64)
+                exec(textwrap.dedent(fragment), {"torch": torch, "row": row,
+                     "prefix_lens": physical, "committed_prefixes": logical})
+                outputs.append(row)
+            assert torch.equal(*outputs)
+
+
 @pytest.mark.parametrize("kv_heads", [1, 2])
 def test_dflash_inference_attention_vjp_masks_gqa_and_reset(monkeypatch, kv_heads):
     # CPU oracle exercises the actual custom Function and mask/layout plumbing;
