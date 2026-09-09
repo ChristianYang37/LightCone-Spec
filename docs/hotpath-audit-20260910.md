@@ -57,12 +57,30 @@ the final excluded requests.
   all old evidence was missing: the pre-existing diagnostics method already
   writes a telemetry file when configured.
 
-## Pending acceptance at ledger creation
+## Final excluded acceptance
 
 Independent confirmation uses the pre-frozen confirmation prompts, not the
 search prompts. Final full-output QA covers short input, a 20K crossing and
 36K input, with complete reset and both-rank safety accounting. Bounded live
 KL/gradient/optimizer-proposal replay deliberately duplicates work and
 synchronizes only at the selected diagnostic updates; its request latency is
-not a performance result. No formal acceleration claim is accepted by this
-ledger alone. Final disposition and power state belong in the delivered report.
+not a performance result.
+
+All 12 independent confirmation windows passed: combined old-to-new window
+goodput gains were Code +16.316% and Math +9.756%. Six 4096-output-token requests
+(old/new at short, 20K crossing, and 36K inputs) passed. Within each input pair,
+all output token IDs, publication counts and gate activation contexts matched.
+Both ranks' real KL, gradients, ChronoBelief proposals and uncommitted optimizer
+state matched exactly at updates 1 and 100 for all three inputs. No request
+reached update 300; do not describe that event as tested.
+
+Retain RMS-only v72 and the local collector; attention remains original.
+This is excluded correctness/short-window acceptance, not a formal 480-request
+performance rerun or proof of beating Static. The formal SQLite logical hashes
+and row counts remained unchanged, integrity=ok.
+
+Harness-only failures were preserved and repaired: request-reset eligibility,
+tokenizer BatchEncoding normalization, and an invalid duplicate flush method
+call after the first successful full request. That successful request was
+reused; no completed performance window was rerun. Final CPU suite: 399 passed.
+Power state and complete local evidence links belong in the delivered report.
