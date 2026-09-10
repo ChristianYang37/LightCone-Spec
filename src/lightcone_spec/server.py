@@ -222,6 +222,11 @@ def _execution_backend(job: Job) -> str:
 
 
 def _request_scoped_adaptation(job: Job) -> bool:
+    if job.parameters.get("preview_revision") == 4:
+        scope = job.parameters.get("preview_state_scope")
+        if scope not in {"request", "cohort"}:
+            raise ValueError("preview v4 requires explicit adaptation state scope")
+        return scope == "request"
     if job.parameters.get("hotpath_request_scope_v1"):
         if job.parameters.get("excluded_from_analysis") is not True:
             raise ValueError("hotpath request reset is an excluded diagnostic only")
@@ -287,11 +292,13 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         if (not job.parameters.get("excluded_from_analysis") or stride not in ALL_STRIDES
                 or stride != job.parameters.get("stride")):
             raise ValueError("stride audit requires excluded registered configuration")
-    if job.parameters.get("preview_revision") == 3:
+    if job.parameters.get("preview_revision") in {3, 4}:
         from .preview_revision import preview_lightcone_stride
         expected_stride = preview_lightcone_stride(job.parameters) if job.method == "lightcone" else 10
         if stride != expected_stride:
             raise ValueError("preview-v3 stride differs from frozen method recipe")
+        if job.parameters.get("preview_revision") == 4 and (stride != 10 or chosen.get("context_gate_v1") is not None):
+            raise ValueError("preview v4 requires S10 without a context scheduler")
     if uses_formal_adaptation_stride(job) and stride != FORMAL_ADAPTATION_STRIDE:
         raise ValueError("formal adaptive jobs must resolve to stride S=10")
     coalescing = int(chosen.get("coalescing", 1))
@@ -404,7 +411,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
             "hint_momentum": chosen.get("hint_momentum", 0.9),
         }
         if chosen.get("ensemble_optimizer") is not None:
-            if job.parameters.get("preview_revision") != 3:
+            if job.parameters.get("preview_revision") not in {3, 4}:
                 raise ValueError("Adam ensemble transfer is preview-v3 only")
             payload["online_spec"]["ensemble_optimizer"] = chosen["ensemble_optimizer"]
     return payload
@@ -519,7 +526,7 @@ def server_command(
     # registered canvas for both native EAGLE3 and the NEXTN alias.
     if job.backend in {"EAGLE3", "NEXTN"}:
         argv.extend(["--speculative-eagle-topk", "1"])
-    if job.parameters.get("preview_revision") == 3 and execution_backend == "EAGLE3":
+    if job.parameters.get("preview_revision") in {3, 4} and execution_backend == "EAGLE3":
         # FlashInfer's multi-step draft backend accepts one kv_indptr wrapper,
         # but the registered draft sliding window needs two. Triton's draft
         # backend supports that window; retain target attention and all budgets.
@@ -619,6 +626,8 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
         job.model,
         job.backend,
         job.parameters.get("preview_revision"),
+        job.parameters.get("preview_state_scope"),
+        tuple(job.parameters.get("static_confidence_temperatures", ())),
         json.dumps(job.parameters.get("context_gate_v1"), sort_keys=True),
         memory_budget_policy(job),
         _execution_backend(job),
@@ -781,10 +790,21 @@ class ServerProcess:
 
     @property
     def client(self) -> SGLangClient:
-        return SGLangClient(
+        client = SGLangClient(
             f"http://{self.config.server.host}:{self.port}",
             self.config.server.request_timeout_seconds,
         )
+        if self.job.parameters.get("preview_revision") == 4:
+            from .rank_receipts import read_rank_receipts
+            original = client.server_info
+
+            def info():
+                started = time.time_ns()
+                original()
+                return read_rank_receipts(self.output_dir, len(self.gpus), started)
+
+            client.server_info = info
+        return client
 
     def start(self) -> SGLangClient:
         startup_started = time.perf_counter()
@@ -834,6 +854,14 @@ class ServerProcess:
             json.dumps(argv, indent=2) + "\n", encoding="utf-8"
         )
         environment = dict(os.environ)
+        environment.pop("LIGHTCONE_STATIC_DSPARK_STS", None)
+        if self.job.parameters.get("static_confidence_temperatures") is not None:
+            temperatures = self.job.parameters["static_confidence_temperatures"]
+            if (self.job.parameters.get("preview_revision") != 4 or self.job.method != "static"
+                    or self.job.backend != "DSPARK" or len(temperatures) != 7
+                    or not all(isinstance(t, (int, float)) and math.isfinite(t) and t > 0 for t in temperatures)):
+                raise ValueError("invalid static preview DSpark STS")
+            environment["LIGHTCONE_STATIC_DSPARK_STS"] = json.dumps(temperatures)
         _qa_retraction_environment(self.job, environment)
         _qa_reconstruction_environment(self.job, environment)
         # Always override inherited values: old experiments must retain their
@@ -867,6 +895,22 @@ class ServerProcess:
         roots = [str(self.config.sglang_root / "python"), str(Path(__file__).parents[1])]
         if environment.get("PYTHONPATH"):
             roots.append(environment["PYTHONPATH"])
+        if self.job.parameters.get("preview_revision") == 4:
+            if environment.get("LIGHTCONE_TIMING_AUDIT") or environment.get("LIGHTCONE_EXCLUDED_VERIFY_TRACE"):
+                raise ValueError("v4 requires local rank receipts, not inherited timing/global tracing")
+            environment["LIGHTCONE_RANK_RECEIPTS"] = str(self.output_dir.resolve())
+            environment["LIGHTCONE_PREVIEW_V4_STATS"] = "1"
+            if self.job.parameters.get("preview_reset_qa") is True:
+                if self.job.parameters.get("excluded_from_analysis") is not True:
+                    raise ValueError("tensor reset checks are excluded QA only")
+                environment["LIGHTCONE_PREVIEW_RESET_QA"] = str(self.output_dir.resolve())
+            else:
+                environment.pop("LIGHTCONE_PREVIEW_RESET_QA", None)
+            roots.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/timing_hooks"))
+        else:
+            environment.pop("LIGHTCONE_RANK_RECEIPTS", None)
+            environment.pop("LIGHTCONE_PREVIEW_V4_STATS", None)
+            environment.pop("LIGHTCONE_PREVIEW_RESET_QA", None)
         environment["PYTHONPATH"] = os.pathsep.join(roots)
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpus))
         environment["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = "false"

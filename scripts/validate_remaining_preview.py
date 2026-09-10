@@ -20,6 +20,12 @@ from lightcone_spec.state import StateStore
 
 
 def remaining_cases(manifest, node):
+    if manifest.get("version") == 4:
+        from lightcone_spec.preview_v4 import NODES
+        if node not in NODES:
+            raise ValueError("unknown v4 QA group")
+        return tuple(j for j in preview_jobs(manifest) if j.node == node and j.block == 0
+                     and (node != NODES[0] or j.parameters["flow_order"] == "domain8"))
     if node not in ("E5-preview-v3", "Qwen38-preview-v3"):
         raise ValueError("remaining QA cannot rerun the first forty cells")
     return tuple(j for j in preview_jobs(manifest) if j.node == node and j.block == 0)
@@ -60,7 +66,7 @@ def review_case(metrics, requests, job):
         raise RuntimeError("full-condition QA not hard feasible")
     if not requests or len({r["request_id"] for r in requests}) != len(requests):
         raise RuntimeError("missing or duplicate QA requests")
-    if job.node == "Qwen38-preview-v3" and len(requests) != 8:
+    if job.node in {"Qwen38-preview-v3", "Qwen38-preview-v4"} and len(requests) != 8:
         raise RuntimeError("27B QA did not complete the frozen eight requests")
     for row in requests:
         count = row["completion_tokens"]
@@ -68,7 +74,7 @@ def review_case(metrics, requests, job):
                 or len(row.get("native_token_timestamps_ns", [])) != count):
             raise RuntimeError("QA native trajectory/stop accounting mismatch")
     if job.method in ("lightcone", "onlinespec_ens"):
-        stride = 1 if job.method == "lightcone" else 10
+        stride = job.parameters.get("stride", 1 if job.method == "lightcone" else 10)
         if metrics.get("resolved_stride") != stride or metrics.get("updates_published", 0) < 1:
             raise RuntimeError("QA frozen stride/publication mismatch")
     return "passed"
@@ -78,7 +84,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--node", required=True, choices=("E5-preview-v3", "Qwen38-preview-v3"))
+    from lightcone_spec.preview_v4 import NODES
+    parser.add_argument("--node", required=True, choices=("E5-preview-v3", "Qwen38-preview-v3", *NODES))
     parser.add_argument("--case", type=int, required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--anchor", choices=("static", "target_only"))
@@ -98,9 +105,11 @@ def main():
         source = replace(source, job_id=f"supplement-tp2-anchor-{args.anchor}-{source.load}",
                          method=args.anchor, backend="NONE" if args.anchor == "target_only" else source.backend,
                          width=None if args.anchor == "target_only" else source.width, gpu_count=2,
-                         parameters={**source.parameters, "topology": "tp2_dp1", "frozen_recipe": None})
+                         parameters={**source.parameters, "topology": "tp2_dp1", "frozen_recipe": None,
+                                     "static_confidence_temperatures": None if args.anchor == "target_only" else source.parameters.get("static_confidence_temperatures")})
     job = replace(source, job_id="excluded-remaining__" + source.job_id,
                   parameters={**source.parameters, "excluded_from_analysis": True,
+                              "preview_reset_qa": manifest.get("version") == 4,
                               "qa_source_job_id": source.job_id})
     args.output.mkdir(parents=True, exist_ok=False)
     config = replace(original, results_root=args.output, run_name="excluded")
@@ -113,10 +122,11 @@ def main():
     server_dir.mkdir()
     (args.output / "qa-job.json").write_text(json.dumps(source.to_dict(), indent=2))
     gpus = config.gpu_ids[:source.gpu_count]
-    os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
-        "output_directory": str(server_dir.resolve()), "rank_metrics": True, "trace_verify": False})
-    os.environ["PYTHONPATH"] = os.pathsep.join((
-        str(Path(__file__).resolve().parent / "preview_verify_trace"), os.environ.get("PYTHONPATH", "")))
+    if manifest.get("version") != 4:
+        os.environ["LIGHTCONE_EXCLUDED_VERIFY_TRACE"] = json.dumps({
+            "output_directory": str(server_dir.resolve()), "rank_metrics": True, "trace_verify": False})
+        os.environ["PYTHONPATH"] = os.pathsep.join((
+            str(Path(__file__).resolve().parent / "preview_verify_trace"), os.environ.get("PYTHONPATH", "")))
     apply_runner_affinity(config.gpu_ids, config.run_dir / "numa-affinity.json")
     runtime = _runtime_job(config, state, job)
     selection = _selection_for_job(state, runtime)
@@ -135,6 +145,12 @@ def main():
         with gzip.open(directory / "requests.jsonl.gz", "rt") as stream:
             requests = [json.loads(line) for line in stream if line.strip()]
         status = review_case(metrics, requests, source)
+        lifecycle = None
+        if manifest.get("version") == 4 and status == "passed":
+            from lightcone_spec.preview_v4_qa import read_rows, review_lifecycle
+            costs = directory / "preview_request_costs.jsonl.gz"
+            lifecycle = review_lifecycle(source, read_rows(costs) if costs.exists() else [], metrics,
+                [r for path in server_dir.glob("rank-*-reset-qa.jsonl") for r in read_rows(path)])
         binding = json.loads((server_dir / "observed-binding.json").read_text())
         if binding["execution_gpu_ids"] != list(gpus):
             raise RuntimeError("QA GPU binding mismatch")
@@ -143,6 +159,8 @@ def main():
                   "correct": status == "passed", "full_workload": True, "reset_verified": True,
                   "gpu_binding_verified": True, "tp": source.gpu_count,
                   "case": f"{source.backend}:{source.method}:{source.load}"}
+        if lifecycle is not None:
+            result["lifecycle"] = lifecycle
         (args.output / "result.json").write_text(json.dumps(result, indent=2))
     except BaseException as error:
         (args.output / "failure.json").write_text(json.dumps({

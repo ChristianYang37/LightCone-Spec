@@ -2,11 +2,13 @@
 
 ## First preview (registered; results UNMEASURED)
 
-The [96-cell preview v3](docs/preview-v3.md) compares Target-only, distinct
+The [180-cell preview v4](docs/preview-v4.md) compares Target-only, distinct
 static drafters, OnlineSPEC-Ensemble transfer, and LightCone without changing
 the full experiment. Four independent blocks, all outcomes, and reviewed
 output correctness are required before publishing effect claims. Preview
-LightCone uses the specified S=1 configuration, not a measured optimum.
+LightCone uses fixed S10 without a context gate or new tuning. Request-local
+adaptation and persistent cohort service are separate comparisons. Selected
+videos disclose their complete scene ranking; they are not average performance.
 TTS is excluded from new preview schedules and videos; historical raw evidence
 and the formal experiment remain unchanged.
 

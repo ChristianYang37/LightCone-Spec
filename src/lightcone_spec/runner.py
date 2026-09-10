@@ -829,6 +829,9 @@ def _cell_concurrency(job: Job) -> int:
 
 
 def _uses_request_scope(job: Job) -> bool:
+    if job.parameters.get("preview_revision") == 4:
+        from .server import _request_scoped_adaptation
+        return job.method not in {"static", "target_only"} and _request_scoped_adaptation(job)
     return job.method in {"tts", "l0_naive"}
 
 
@@ -1578,20 +1581,47 @@ def _run_request_scoped(
     request_prefix: str = "request-scoped",
     temperature: float = 0.0,
     respect_eos: bool = False,
+    request_seeds=None,
+    request_audit=None,
+    wait_for_release: bool = False,
+    state_snapshot=None,
 ):
+    if request_seeds is not None and len(request_seeds) != len(prompts):
+        raise ValueError("frozen request seeds must match the complete prompt sequence")
     started = time.perf_counter()
     results = []
     for index, prompt in enumerate(prompts):
+        request_started = time.perf_counter()
+        state_before = state_snapshot() if state_snapshot is not None else None
         rows, _ = client.run_batch(
             (prompt,),
             max_new_tokens=max_new_tokens,
-            seed=seed if same_seed else seed + index,
+            seed=request_seeds[index] if request_seeds is not None else seed if same_seed else seed + index,
             temperature=temperature,
             request_ids=(f"{request_prefix}-{index:05d}",),
             **({"ignore_eos": False} if respect_eos else {}),
         )
+        if len(rows) != 1:
+            raise RuntimeError("sequential request returned a different request count")
+        if wait_for_release:
+            _wait_request_scope_release(client)
+        state_after = state_snapshot() if state_snapshot is not None else None
+        if request_audit is not None:
+            request_audit.append({"request_id": rows[0].request_id,
+                                  "sequence_index": index,
+                                  "wall_seconds": time.perf_counter() - request_started,
+                                  "request_scope_release_checked": wait_for_release,
+                                  "state_before": state_before, "state_after": state_after})
         results.append(rows[0])
     return tuple(results), time.perf_counter() - started
+
+
+def _preview_state_snapshot(client, topology):
+    """Request-boundary evidence only; included in measured flow wall time."""
+    fields = ("cohort_epoch", "active_version", "active_request_id", "round",
+              "updates_published", "fallbacks", "version_mismatches", "context_gate_v1")
+    return [{key: row.get(key) for key in fields}
+            for row in _speed_metrics(client.server_info(), topology)["rank_local"]]
 
 
 def _execute_cell(
@@ -1659,6 +1689,7 @@ def _execute_cell(
             (output_dir / "server.pid").write_text(f"{server.process.pid}\n", encoding="utf-8")
         offered = 0
         metrics: dict[str, Any] | None = None
+        cell_started = time.perf_counter()
         try:
             runtime_job = _runtime_job(config, state, job)
             declared_concurrency = _cell_concurrency(runtime_job)
@@ -1848,6 +1879,9 @@ def _execute_cell(
                     max(max_new_tokens) if isinstance(max_new_tokens, tuple) else max_new_tokens,
                 )
             topology = str(runtime_job.parameters.get("topology", "tp1_dp1"))
+            if runtime_job.parameters.get("preview_revision") == 4:
+                # A cold measurement even if warmup() implementation changes.
+                client.reset()
             profiler = runtime_job.parameters.get("profiler")
             if profiler in {"nvtx", "nsys", "ncu", "activity_proxy"}:
                 client.start_profile(
@@ -1861,6 +1895,7 @@ def _execute_cell(
                     raise RuntimeError("unvalidated full timing is restricted to excluded cells")
                 checkpoint("begin", job.job_id)
             before = _speed_metrics(client.server_info(), topology)
+            setup_done = time.perf_counter()
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
             scheduled: ScheduledRun | None = None
             request_scoped = _uses_request_scope(runtime_job)
@@ -1945,6 +1980,7 @@ def _execute_cell(
                 elif request_scoped or runtime_job.parameters.get("respect_eos"):
                     if runtime_job.parameters.get("respect_eos") and dispatcher_concurrency != 1:
                         raise ValueError("native source/diagnostic execution requires matched c1")
+                    preview_request_audit = [] if runtime_job.parameters.get("preview_revision") == 4 else None
                     results, elapsed = _run_request_scoped(
                         client,
                         prompts,
@@ -1954,7 +1990,17 @@ def _execute_cell(
                         request_prefix=f"{job.job_id}-measure",
                         temperature=temperature,
                         respect_eos=bool(runtime_job.parameters.get("respect_eos")),
+                        request_seeds=runtime_job.parameters.get("preview_request_seeds"),
+                        request_audit=preview_request_audit,
+                        wait_for_release=(runtime_job.parameters.get("preview_revision") == 4
+                                          and request_scoped),
+                        state_snapshot=(lambda: _preview_state_snapshot(client, topology))
+                        if runtime_job.parameters.get("preview_revision") == 4 else None,
                     )
+                    if preview_request_audit is not None:
+                        for item, source in zip(preview_request_audit, runtime_job.parameters["preview_prompt_records"], strict=True):
+                            item.update(source=source["source"], problem_id=str(source["problem_id"]))
+                        _write_jsonl(output_dir / "preview_request_costs.jsonl.gz", preview_request_audit)
                 else:
                     scheduled = client.run_bounded(
                         prompts,
@@ -1987,6 +2033,7 @@ def _execute_cell(
                 results, elapsed = scheduled.results, scheduled.elapsed_seconds
             if profiler in {"nvtx", "nsys", "ncu", "activity_proxy"}:
                 client.stop_profile()
+            measurement_done = time.perf_counter()
             if request_scoped:
                 _wait_request_scope_release(client)
             if os.environ.get("LIGHTCONE_TIMING_AUDIT"):
@@ -2004,7 +2051,7 @@ def _execute_cell(
                     {"policy": "target_only", **result.to_dict()} for result in controlled
                 ]
             request_rows = [_request_metrics(result) for result in results]
-            if runtime_job.parameters.get("preview_revision") == 3 or runtime_job.parameters.get("stride_audit_v1"):
+            if runtime_job.parameters.get("preview_revision") in {3, 4} or runtime_job.parameters.get("stride_audit_v1"):
                 for row, result in zip(request_rows, results, strict=True):
                     row["output_ids"] = list(result.output_ids)
             measured_user_speed = per_user_generation_speed(request_rows)
@@ -2402,6 +2449,15 @@ def _execute_cell(
                 metrics.get("recovery_health_passed") and metrics.get("expected_action_passed")
             ):
                 raise ScientificFailure("fault diagnostic did not complete its expected action")
+            if runtime_job.parameters.get("preview_revision") == 4:
+                metrics.update(cell_setup_seconds=setup_done - cell_started,
+                               cell_tail_seconds=time.perf_counter() - measurement_done,
+                               cell_wall_seconds=time.perf_counter() - cell_started,
+                               setup_accounting="observed configure/input/warmup/reset; session_startup separately reported; no double summation")
+                for key in ("delivered_draft_tokens", "delivered_bonus_tokens", "delivered_verification_calls"):
+                    if key not in after or key not in before:
+                        raise RuntimeError(f"v4 missing delivered-token evidence: {key}")
+                    metrics[key] = int(after[key]) - int(before[key])
             _write_json(output_dir / "metrics.json", metrics)
             state.complete(job.job_id, attempt)
             return
@@ -4088,7 +4144,7 @@ def _run_pending_jobs(
             process_job = _exactness_bootstrap(runtime_job)
             key = (job.block, probe, *server_session_key(process_job, selection))
             grouped.setdefault(key, []).append((job, runtime_job, selection))
-        if node in PREVIEW_NODES:
+        if node in PREVIEW_NODES or any(j.parameters.get("preview_revision") == 4 for j in jobs):
             # Each preview pairing unit has its own frozen method order; global
             # session reuse order must not borrow it from another same-seed unit.
             keys = sorted(grouped, key=lambda key: min(row[0].ordinal for row in grouped[key]))
@@ -4229,6 +4285,7 @@ def _run_pending_jobs(
             legacy_keys.setdefault(_job_gpus(config, job), []).append(session)
         legacy_keys.update({
             devices: (list(dict.fromkeys(keys)) if node in {SOURCE_COVERAGE_NODE, MECHANISM_NODE, *PREVIEW_NODES}
+                      or any(j.parameters.get("preview_revision") == 4 for j in pending)
                       else _session_order(config, node, devices, keys))
             for devices, keys in legacy_keys.items()
         })
@@ -4289,7 +4346,7 @@ def _run_pending_jobs(
                         if cache.get("process") is not None:
                             cache.pop("process").stop()
                         unit_pool.release(gpu)
-                    if node in PREVIEW_NODES:
+                    if node in PREVIEW_NODES or any(j.parameters.get("preview_revision") == 4 for j in rows):
                         _write_preview_status(config, state)
                     with unit_pool.condition:
                         _write_json(trace_path, {"events": unit_pool.events,
@@ -7566,18 +7623,73 @@ def _run_priority_paper_node(
 
 def _write_preview_status(config: ExperimentConfig, state: StateStore) -> None:
     from .preview_revision import PREVIEW_V3_NODES
-    manifest = state.selection("formal_preview_manifest_v3", None) or state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
+    from .preview_v4 import NODES as PREVIEW_V4_NODES
+    manifest = state.selection("formal_preview_manifest_v4", None) if state.selection("formal_preview_v4", {}).get("enabled") else None
+    manifest = manifest or state.selection("formal_preview_manifest_v3", None) or state.selection("formal_preview_manifest_v2", None) or state.selection("formal_preview_manifest_v1", None)
     if manifest is None:
         return
     jobs = preview_jobs(manifest)
-    nodes = PREVIEW_V3_NODES if manifest.get("version") == 3 else PREVIEW_NODES
+    nodes = PREVIEW_V4_NODES if manifest.get("version") == 4 else PREVIEW_V3_NODES if manifest.get("version") == 3 else PREVIEW_NODES
     evidence = [row for node in nodes for row in _metric_rows(state, node)]
     remaining = tuple(job for job in jobs if state.job_status(job.job_id) != "completed")
     # Worker-local reports avoid concurrent writes of the same JSON file.
-    version = "preview-v3" if manifest.get("version") == 3 else "preview-v1"
+    version = f"preview-v{manifest['version']}" if manifest.get("version") in {3, 4} else "preview-v1"
     output = config.run_dir / "stages" / version / f"worker-{threading.get_ident()}"
     preview_summary(evidence, jobs, output)
-    state.set_selection("formal_preview_eta_v3" if manifest.get("version") == 3 else "formal_preview_eta_v1", preview_eta(evidence, remaining))
+    state.set_selection(f"formal_preview_eta_v{manifest.get('version', 1)}", preview_eta(evidence, remaining))
+
+
+def _run_preview_v4(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> bool:
+    """V4 is an exclusive preview window, including after completion. Never DAG."""
+    from .preview_v4 import NODES, group_accepted, group_digest
+    enabled = state.selection("formal_preview_v4", {})
+    if not enabled.get("enabled"):
+        return False
+    manifest = state.selection("formal_preview_manifest_v4", {})
+    if manifest.get("version") != 4:
+        raise RuntimeError("v4 requires its own immutable manifest")
+    jobs = preview_jobs(manifest)
+    for node in NODES:
+        accepted = state.selection("formal_preview_acceptance_v4", {})
+        receipt = accepted.get("groups", {}).get(node, {})
+        if receipt:
+            import subprocess
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip()
+            marker = (config.sglang_root / ".lightcone-spec-patched").read_text().strip()
+            if receipt.get("runtime_commit") != commit or receipt.get("marker") != marker:
+                raise RuntimeError("v4 acceptance does not match deployed code/runtime")
+        if (receipt.get("status") == "capacity_infeasible"
+                and receipt.get("group_sha256") == group_digest(manifest, node)
+                and receipt.get("qa_paths")):
+            rows = tuple(j for j in jobs if j.node == node)
+            state.add_internal_jobs(rows, storage_node=node)
+            state.skip_pending(node, "preview-v4: no shared feasible topology; group-level QA evidence, not per-method performance")
+            state.set_stage_status(node, "blocked", row_count=len(rows))
+            continue
+        # Refresh at every group boundary. A previous group cannot authorize this one.
+        if not group_accepted(accepted, manifest, node):
+            state.set_selection("formal_preview_v4", {**enabled, "status": "awaiting_acceptance", "node": node})
+            return True
+        rows = tuple(j for j in jobs if j.node == node)
+        state.add_internal_jobs(rows, storage_node=node)
+        state.set_stage_status(node, "running", row_count=len(rows))
+        _run_pending_jobs(config, state, node, stop_event, state.pending_jobs(node))
+        _write_preview_status(config, state)
+        if stop_event.is_set():
+            return True
+        counts = state.status_counts(node)
+        if any(counts.get(s) for s in ("failed", "running", "pending")):
+            raise RuntimeError(f"preview-v4 runtime failure: {node}: {counts}")
+        state.set_stage_status(node, "completed", row_count=len(rows))
+    evidence = [row for node in NODES for row in _metric_rows(state, node)]
+    for job in jobs:
+        if state.stage_status(job.node) == "blocked":
+            evidence.append((job.to_dict(), {"hard_feasible": False, "scientific_outcome": "blocked",
+                "capacity_reason": "no common topology; group-level QA outcome, not measured method infeasibility"}))
+    preview_summary(evidence, jobs, config.run_dir / "stages/preview-v4")
+    state.set_selection("formal_preview_v4", {**enabled, "status": "measurement_complete", "leaf_cells": 180})
+    return True
 
 
 def _run_preview_v1(config: ExperimentConfig, state: StateStore, stop_event: threading.Event) -> None:
@@ -8747,6 +8859,8 @@ class PaperRunner:
         old_term = signal.signal(signal.SIGTERM, self._signal)
         old_int = signal.signal(signal.SIGINT, self._signal)
         try:
+            if _run_preview_v4(self.config, self.state, self.stop_event):
+                return
             if _run_preview_v3(self.config, self.state, self.stop_event):
                 return
             _run_preview_v1(self.config, self.state, self.stop_event)

@@ -2,15 +2,15 @@
 const {chromium}=require('playwright');
 const http=require('node:http'),fs=require('node:fs'),assert=require('node:assert/strict');
 (async()=>{
- let started=false, clients=[],submitted=0;
+ let started=false, clients=[],submitted=0,requestCount=8;
  const common={label:'EXCLUDED SYNTHETIC UI TEST',model:'SYNTHETIC',tp:2,dispatcher_concurrency:8,input_tokens_per_request:16384,max_output_tokens:1024};
  const send=(res,type,data,id)=>res.write(`${id?`id: ${id}\n`:''}event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
  const complete=res=>{
-  for(let index=0;index<8;index++){
+  for(let index=0;index<requestCount;index++){
    send(res,'token',{sequence:2*index+1,index,elapsed_seconds:.5,token_ids:[1],chunk:{output_ids:[1],text:'中�',meta_info:{completion_tokens:1,finish_reason:null}}},2*index+1);
    send(res,'token',{sequence:2*index+2,index,elapsed_seconds:1,token_ids:[2],chunk:{output_ids:[1,2],text:'中文🙂 <not HTML>',meta_info:{completion_tokens:2,finish_reason:{type:'stop'}}}},2*index+2);
   }
-  send(res,'state',{...common,status:'completed',event_count:16,committed_tokens:16,duration_seconds:2,aggregate_tok_s:8,per_user_tok_s:12});res.end();
+  send(res,'state',{...common,status:'completed',event_count:2*requestCount,committed_tokens:2*requestCount,duration_seconds:2,aggregate_tok_s:requestCount,per_user_tok_s:12});res.end();
  };
  const server=http.createServer((req,res)=>{
   if(req.url==='/clock'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({recording_hostname:require('node:os').hostname(),server_epoch_ns:String(BigInt(Date.now())*1000000n)}));return;}
@@ -42,6 +42,16 @@ const http=require('node:http'),fs=require('node:fs'),assert=require('node:asser
   await page.waitForFunction(()=>document.body.dataset.status==='failed');
   assert.match(await page.locator('#metrics').textContent(),/local HTML file/);
   assert.deepEqual(errors,[]);
+  started=false;clients=[];requestCount=48;common.request_count=48;
+  common.video_disclosure={state_scope:'cohort'};
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  await page.waitForFunction(()=>document.body.dataset.status==='ready');
+  await page.click('#start');await page.waitForFunction(()=>document.body.dataset.status==='completed');
+  assert.equal(await page.locator('article').count(),48);
+  assert.equal(await page.locator('article:visible').count(),8);
+  assert.match(await page.locator('#metrics').textContent(),/48\/48 completed/);
+  assert.match(await page.locator('#configuration').textContent(),/SELECTED EFFECT CASE, NOT AVERAGE PERFORMANCE/);
+  requestCount=8;delete common.request_count;delete common.video_disclosure;
   if(process.env.PREVIEW_CAPTURE_TEST_DIRECTORY){
    // Optional real frame/codec smoke against this explicitly synthetic fixture;
    // these artifacts must never be presented as a model benchmark/video.

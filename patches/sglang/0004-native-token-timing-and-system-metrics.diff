@@ -140,7 +140,7 @@ index 861c13fb4e..e906f2e02a 100644
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4029,6 +4031,116 @@ class Scheduler(
+@@ -4029,6 +4031,119 @@ class Scheduler(
              if info_record is not None:
                  ret["dspark_info_record"] = info_record
  
@@ -202,6 +202,9 @@ index 861c13fb4e..e906f2e02a 100644
 +                    f"speculative runtime is missing counters {sorted(missing_counters)}"
 +                )
 +            speed = {
++                "delivered_draft_tokens": self.metrics_reporter.speed_study_delivered_drafts,
++                "delivered_bonus_tokens": self.metrics_reporter.speed_study_delivered_bonus,
++                "delivered_verification_calls": self.metrics_reporter.speed_study_delivered_calls,
 +                "committed_tokens": self.metrics_reporter.speed_study_committed_tokens,
 +                "target_calls": self.metrics_reporter.spec_total_num_forward_ct
 +                + self.metrics_reporter.spec_num_forward_ct,
@@ -269,11 +272,12 @@ index 248a92939e..e0f99901f3 100644
  from dataclasses import dataclass
  from typing import (
      TYPE_CHECKING,
-@@ -13,6 +14,10 @@ from typing import (
+@@ -13,6 +14,11 @@ from typing import (
  
  import torch
  
 +from sglang.srt.managers.native_token_timestamps import (
++    delivered_spec_counts,
 +    newly_committed_output_tokens,
 +    record_committed_output_tokens,
 +)
@@ -309,7 +313,7 @@ index 248a92939e..e0f99901f3 100644
                          self._maybe_collect_routed_experts(req)
                          self._maybe_collect_indexer_topk(req)
                          release_kv_cache(req, self.tree_cache)
-@@ -778,12 +799,21 @@ class SchedulerBatchResultProcessor:
+@@ -778,12 +799,27 @@ class SchedulerBatchResultProcessor:
              next_token_id = next_token_ids[i]
              is_spec = not batch.spec_algorithm.is_none()
  
@@ -328,6 +332,12 @@ index 248a92939e..e0f99901f3 100644
 +                self.metrics_reporter.speed_study_committed_tokens += len(
 +                    committed_tokens
 +                )
++                if is_spec and self.metrics_reporter.preview_v4_delivery_counts:
++                    raw_run = int(result.accept_lens[i])
++                    drafts, bonus = delivered_spec_counts(len(committed_tokens), raw_run)
++                    self.metrics_reporter.speed_study_delivered_drafts += drafts
++                    self.metrics_reporter.speed_study_delivered_bonus += bonus
++                    self.metrics_reporter.speed_study_delivered_calls += 1
  
              self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
  
@@ -335,7 +345,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 index 15e1b814d7..35f76daea5 100644
 --- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 +++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
-@@ -141,6 +141,17 @@ class SchedulerMetricsReporter:
+@@ -141,6 +141,22 @@ class SchedulerMetricsReporter:
          self.spec_total_num_forward_ct = 0
          self.spec_num_block_accept_tokens = 0
          self.spec_num_cap_tokens = 0
@@ -343,6 +353,11 @@ index 15e1b814d7..35f76daea5 100644
 +            self.scheduler.server_args.speculative_speed_study_metrics
 +        )
 +        self.speed_study_committed_tokens = 0
++        import os
++        self.preview_v4_delivery_counts = os.environ.get("LIGHTCONE_PREVIEW_V4_STATS") == "1"
++        self.speed_study_delivered_drafts = 0
++        self.speed_study_delivered_bonus = 0
++        self.speed_study_delivered_calls = 0
 +        if self.speed_study_enabled:
 +            self.speed_study_graph_hits = 0
 +            self.speed_study_graph_total = 0
@@ -710,7 +725,7 @@ new file mode 100644
 index 0000000000..8babb9afa4
 --- /dev/null
 +++ b/python/sglang/srt/managers/native_token_timestamps.py
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,61 @@
 +"""Scheduler commit times for output tokens."""
 +
 +from __future__ import annotations
@@ -721,6 +736,14 @@ index 0000000000..8babb9afa4
 +NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
 +NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "scheduler_committed_token_v1"
 +NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "SCHEDULER_COMMIT"
++
++
++def delivered_spec_counts(delivered: int, verified_run: int) -> tuple[int, int]:
++    """Verified run ends with a target bonus; EOS/grammar may hide that suffix."""
++    if not 0 <= delivered <= verified_run or verified_run < 1:
++        raise ValueError("invalid delivered speculative prefix")
++    bonus = int(delivered == verified_run)
++    return delivered - bonus, bonus
 +
 +
 +def newly_committed_output_tokens(req: Any, previous_length: int) -> Sequence[int]:

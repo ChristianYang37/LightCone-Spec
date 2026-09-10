@@ -11,6 +11,8 @@ from pathlib import Path
 
 def submission_alignment(inputs):
     """Require captured clock evidence; a recorder start is not a submission."""
+    if len(inputs) not in (2, 6):
+        raise ValueError("expected six main takes or two full-flow appendix takes")
     records = [json.loads(path.with_name("capture.json").read_text()) for path in inputs]
     configurations, labels, offsets, bounds = set(), set(), [], []
     for path, record in zip(inputs, records, strict=True):
@@ -32,17 +34,23 @@ def submission_alignment(inputs):
         # Start at the earliest plausible submission: never discard prefill.
         offsets.append(offset - bound)
         bounds.append(bound)
-    if len(configurations) != 1 or len(labels) != 6 or None in labels:
+    if len(configurations) != 1 or len(labels) != len(inputs) or None in labels:
         raise ValueError("six distinct methods must share model, TP and workload")
     model, tp, concurrency, inputs_count, outputs_count = next(iter(configurations))
-    if not model or tp not in (1, 2) or (concurrency, inputs_count, outputs_count) != (8, 16384, 1024):
+    expected = (8, 16384, 1024) if len(inputs) == 6 else (1, "native", 2048)
+    if not model or tp not in (1, 2) or (concurrency, inputs_count, outputs_count) != expected:
         raise ValueError("video must use accepted common TP, actual c8 and 16K/1024 budget")
+    if len(inputs) == 2 and any(r["measurement"].get("request_count") != 48 for r in records):
+        raise ValueError("appendix must retain the full 48-request cold flow")
+    disclosures = [r["measurement"].get("video_disclosure") for r in records]
+    if any(disclosures) and (not all(disclosures) or len({d["selected_scene"] for d in disclosures}) != 1):
+        raise ValueError("selected scene differs across methods")
     return offsets, bounds
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--inputs", type=Path, nargs=6, required=True)
+    parser.add_argument("--inputs", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     args = parser.parse_args()
@@ -54,9 +62,11 @@ def main():
     command = [args.ffmpeg, "-n"]
     for path in args.inputs:
         command.extend(("-i", str(path)))
-    filters = ";".join(f"[{i}:v]trim=start={offsets[i]:.9f},setpts=PTS-STARTPTS,scale=800:526[v{i}]" for i in range(6))
-    filters += ";" + "".join(f"[v{i}]" for i in range(6)) + (
-        "xstack=inputs=6:layout=0_0|800_0|1600_0|0_526|800_526|1600_526:fill=black,"
+    count = len(args.inputs)
+    filters = ";".join(f"[{i}:v]trim=start={offsets[i]:.9f},setpts=PTS-STARTPTS,scale=800:526[v{i}]" for i in range(count))
+    layout = "0_0|800_0|1600_0|0_526|800_526|1600_526" if count == 6 else "0_0|800_0"
+    filters += ";" + "".join(f"[v{i}]" for i in range(count)) + (
+        f"xstack=inputs={count}:layout={layout}:fill=black,"
         "drawtext=text='Independent real runs - submission aligned within 200ms plus frame resolution - 1x':"
         "x=20:y=h-34:fontsize=24:fontcolor=white:box=1:boxcolor=black[v]"
     )

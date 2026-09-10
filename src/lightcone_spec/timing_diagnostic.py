@@ -106,6 +106,12 @@ def _model_phase(self, args, kwargs):
 
 def _instrument(module):
     name = module.__name__
+    if os.environ.get("LIGHTCONE_PREVIEW_RESET_QA"):
+        from .preview_reset_qa import install as install_reset_qa
+        if name.endswith(".dflash_online_adaptation"):
+            install_reset_qa(module.DFlashDrafterAdapter, os.environ["LIGHTCONE_PREVIEW_RESET_QA"])
+        elif name.endswith(".native_backend_online_adaptation"):
+            install_reset_qa(module.NativeBackendOnlineAdapter, os.environ["LIGHTCONE_PREVIEW_RESET_QA"])
     if name.endswith(".dflash_online_adaptation") and os.environ.get("LIGHTCONE_HOTPATH_EQUIVALENCE_SOURCE"):
         from .hotpath_equivalence import install
         install(module, os.environ["LIGHTCONE_HOTPATH_EQUIVALENCE_SOURCE"],
@@ -204,14 +210,15 @@ TARGETS = {
     "sglang.srt.speculative.online_adaptation_runtime",
     "sglang.srt.speculative.dflash_online_adaptation",
     "sglang.srt.managers.scheduler",
+    "sglang.srt.speculative.native_backend_online_adaptation",
 }
 
 
-def install():
+def install(settings=None):
     global _settings
     if _settings is not None:
         raise RuntimeError("timing hooks already installed")
-    _settings = json.loads(os.environ["LIGHTCONE_TIMING_AUDIT"])
+    _settings = settings if settings is not None else json.loads(os.environ["LIGHTCONE_TIMING_AUDIT"])
     if not Path(_settings["output_directory"]).is_absolute():
         raise ValueError("audit directory must be absolute")
 

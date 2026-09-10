@@ -51,6 +51,9 @@ QWEN38_VIDEO_METHODS = tuple(
 
 def preview_jobs(manifest: dict) -> tuple[Job, ...]:
     """All mutable selections and prompt/trace decisions are frozen once upstream."""
+    if manifest.get("version") == 4:
+        from .preview_v4 import jobs
+        return jobs(manifest)
     if manifest.get("version") == 3:
         from .preview_revision import revision_jobs
         return revision_jobs(manifest)
@@ -217,6 +220,9 @@ def held_out_pool(records, calibration, count: int) -> list[dict]:
 
 def preview_summary(evidence, expected_jobs, output: Path) -> dict:
     """Allowlisted public counters; raw prompt text and local paths never exported."""
+    if any(j.parameters.get("preview_revision") == 4 for j in expected_jobs):
+        from .preview_v4_report import summary
+        return summary(evidence, expected_jobs, output)
     expected = {job.job_id: job for job in expected_jobs}
     measured = {}
     fields = (
@@ -323,6 +329,7 @@ def preview_eta(evidence, remaining_jobs, *, repetitions=10000) -> dict:
                 job.parameters.get("generation_tokens"), job.parameters.get("topology", "tp1_dp1"),
                 job.parameters["preview_panel"],
                 job.parameters.get("preview_revision", 1), job.parameters.get("stride"),
+                job.parameters.get("preview_state_scope"), job.parameters.get("flow_order"),
                 job.parameters.get("memory_budget_policy"), policy)
 
     pools = defaultdict(list)

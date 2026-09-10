@@ -143,6 +143,46 @@ def test_stride_audit_budget_split_identity_and_formal_isolation():
     assert template.parameters["frozen_recipe"]["stride"] == 1
 
 
+def test_preview_v4_frozen_matrix_state_and_data():
+    from collections import Counter
+    from copy import deepcopy
+
+    from preview_v4_fixture import manifest_v4
+
+    from lightcone_spec.preview import preview_jobs
+    from lightcone_spec.preview_v4 import NODES, ORDERS, cohort_records, record_key, request_seed
+    from lightcone_spec.runner import _dispatcher_concurrency
+    from lightcone_spec.scheduling import logical_unit_key
+
+    manifest = manifest_v4()
+    original = deepcopy(manifest)
+    jobs = preview_jobs(manifest)
+    assert manifest == original and jobs == preview_jobs(deepcopy(manifest))
+    assert Counter(j.node for j in jobs) == dict(zip(NODES, (36, 40, 32, 72), strict=True))
+    assert len(jobs) == len({j.job_id for j in jobs}) == 180
+    assert len(PAPER_NODES) == 21
+    assert not any(j.method.startswith("tts") for j in jobs)
+    units = {}
+    for job in jobs:
+        units.setdefault(logical_unit_key(job), []).append(job)
+        assert job.parameters["context_gate_v1"] is None
+        assert job.parameters["stride"] == 10
+        payload = adaptation_payload(job, job.parameters["frozen_recipe"])
+        if payload:
+            assert payload["stride"] == 10
+            assert payload["reset_scope"] == job.parameters["preview_state_scope"]
+        if job.parameters["preview_panel"] == "cohort":
+            assert len(job.parameters["preview_prompt_records"]) == 48
+            assert _dispatcher_concurrency(job) == 1
+    assert sorted(map(len, units.values())).count(3) == 12
+    for block in range(4):
+        sequences = [cohort_records(manifest["data"], block, order) for order in ORDERS]
+        assert all({record_key(r) for r in rows} == {record_key(r) for r in sequences[0]} for rows in sequences)
+        assert all(len({request_seed(block, r) for r in rows}) == 48 for rows in sequences)
+    static = next(j for j in jobs if j.node == NODES[2] and j.method == "static")
+    assert static.parameters["static_confidence_temperatures"] == [1.1] * 7
+
+
 def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     from collections import Counter
 

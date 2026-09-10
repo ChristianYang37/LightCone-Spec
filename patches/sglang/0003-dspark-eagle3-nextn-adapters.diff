@@ -749,11 +749,25 @@ index ae778ee..eb8fe29 100644
      def __init__(
          self,
          server_args: ServerArgs,
-@@ -254,6 +258,18 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -254,6 +258,32 @@ class DSparkWorkerV2(BaseSpecWorker):
              device=self.device,
              simulate_acc_len=self._simulate_acc_len,
          )
 +        self._online_drafter_adapter = None
++        # Explicit preview-only Static calibration; no online adapter is built.
++        import json
++        import math
++        import os
++        self._static_confidence_temperatures = None
++        raw_sts = os.environ.get("LIGHTCONE_STATIC_DSPARK_STS")
++        if raw_sts is not None:
++            temperatures = json.loads(raw_sts)
++            if (getattr(server_args, "speculative_adaptation_config", None)
++                    or len(temperatures) != 7
++                    or not all(isinstance(t, (int, float)) and not isinstance(t, bool)
++                               and math.isfinite(t) and t > 0 for t in temperatures)):
++                raise ValueError("invalid Static DSpark calibration")
++            self._static_confidence_temperatures = temperatures
 +        if getattr(server_args, "speculative_adaptation_config", None):
 +            from sglang.srt.speculative.native_backend_online_adaptation import (
 +                maybe_build_native_backend_adapter,
@@ -843,7 +857,7 @@ index ae778ee..eb8fe29 100644
  
          target_model = self.target_worker.model_runner.model
  
-@@ -530,19 +584,61 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -530,19 +584,63 @@ class DSparkWorkerV2(BaseSpecWorker):
                  device=device,
                  target_model=target_model,
                  sampling_info=sampling_info,
@@ -886,13 +900,15 @@ index ae778ee..eb8fe29 100644
 +                    confidence_tap=proposal.confidence_tap,
 +                )
 +                update_confidence = confidence
-+        if online_adapter is not None and confidence is not None:
++        if confidence is not None and (online_adapter is not None or self._static_confidence_temperatures is not None):
 +            position_temperatures = torch.as_tensor(
-+                online_adapter.config.confidence_temperatures,
++                online_adapter.config.confidence_temperatures if online_adapter is not None else self._static_confidence_temperatures,
 +                device=confidence.device,
 +                dtype=torch.float32,
 +            )
 +            if confidence.shape[-1] != position_temperatures.numel():
++                if online_adapter is None:
++                    raise RuntimeError("Static DSpark confidence temperature shape mismatch")
 +                online_adapter.runtime.disable(
 +                    "dspark_confidence_temperature_shape_mismatch", exactness=True
 +                )
@@ -905,7 +921,7 @@ index ae778ee..eb8fe29 100644
 +                    (probability >= online_adapter.config.confidence_threshold).to(
 +                        confidence.dtype
 +                    )
-+                    if online_adapter.config.confidence_threshold is not None
++                    if online_adapter is not None and online_adapter.config.confidence_threshold is not None
 +                    else probability
 +                )
  

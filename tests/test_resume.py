@@ -105,6 +105,27 @@ def _continuation_manifest():
             "qwen38": {"tp": 2, "checkpoints": QWEN38_CHECKPOINTS, "prompts": records[:8]}}
 
 
+def test_preview_v4_acceptance_is_group_specific_and_never_resumes_dag(tmp_path, monkeypatch):
+    from preview_v4_fixture import manifest_v4
+
+    from lightcone_spec.preview_v4 import NODES, group_accepted, group_digest
+    from lightcone_spec.runner import _run_preview_v4
+
+    manifest = manifest_v4()
+    receipt = {"groups": {NODES[0]: {"status": "accepted", "group_sha256": group_digest(manifest, NODES[0]),
+              "runtime_commit": "cpu-fixture", "qa_paths": ["fixture"],
+              "checks": {key: True for key in ("sampling", "parameter_optimizer_reset", "state_lifecycle", "kv_isolation", "tp_ranks", "full_budget")}}}}
+    assert group_accepted(receipt, manifest, NODES[0])
+    assert not group_accepted(receipt, manifest, NODES[1])
+    state = StateStore(tmp_path / "run")
+    state.set_selection("formal_preview_manifest_v4", manifest)
+    state.set_selection("formal_preview_v4", {"enabled": True})
+    # No acceptance: must not claim a cell or fall through to v3/full DAG.
+    assert _run_preview_v4(None, state, threading.Event())
+    assert state.selection("formal_preview_v4")["status"] == "awaiting_acceptance"
+    assert not state.jobs(NODES[0])
+
+
 def test_preview_s10_restore_is_atomic_preserves_old_attempts_and_baselines(tmp_path):
     from lightcone_spec.preview import preview_jobs
     from lightcone_spec.preview_continuation import group_accepted, restore_preview_s10

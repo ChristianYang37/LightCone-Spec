@@ -82,6 +82,68 @@ def test_context_static_and_adaptive_share_reserved_budget(monkeypatch):
     assert budget(SimpleNamespace())["headroom_bytes"] == 0
 
 
+def test_preview_v4_reset_checks_real_values_and_rejects_dirty_state():
+    from lightcone_spec.preview_reset_qa import check_reset
+    master = (torch.ones(2),)
+    optimizer = SimpleNamespace(master=master, first=(torch.zeros(2),), second=(torch.zeros(2),), step=0)
+    adapter = SimpleNamespace(optimizer=optimizer, initial=(torch.ones(2),),
+        inference=SimpleNamespace(active=(torch.ones(2),)), runtime=SimpleNamespace(active_version=0, round=0))
+    assert check_reset(adapter)["passed"]
+    optimizer.second[0][0] = 1
+    assert not check_reset(adapter)["passed"]
+    optimizer.second[0].zero_()
+    adapter.inference.active[0][0] = 2
+    assert not check_reset(adapter)["passed"]
+
+
+def test_preview_v4_delivered_bonus_counts_stop_truncation():
+    patch = (Path(__file__).parents[1] / "patches/sglang/0004-native-token-timing-and-system-metrics.diff").read_text()
+    section = patch.split("+++ b/python/sglang/srt/managers/native_token_timestamps.py\n", 1)[1].split("diff --git", 1)[0]
+    tree = ast.parse("\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "delivered_spec_counts")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "delivered-counts", "exec"), namespace)
+    count = namespace["delivered_spec_counts"]
+    assert count(5, 5) == (4, 1)
+    assert count(3, 5) == (3, 0)
+    assert count(0, 5) == (0, 0)
+    assert count(1, 1) == (0, 1)
+    with pytest.raises(ValueError):
+        count(6, 5)
+
+
+def test_preview_v4_rank_receipts_are_fresh_complete_and_topology_bound(tmp_path):
+    from lightcone_spec.rank_receipts import read_rank_receipts
+    for rank in range(2):
+        (tmp_path / f"rank-{rank}-metrics.jsonl").write_text(json.dumps({
+            "tp_rank": rank, "tp_size": 2, "captured_ns": 10, "state": {"rank": rank}}) + "\n")
+    assert len(read_rank_receipts(tmp_path, 2, 10)["internal_states"]) == 2
+    with pytest.raises(RuntimeError, match="fresh"):
+        read_rank_receipts(tmp_path, 2, 11, timeout=0)
+    with pytest.raises(RuntimeError, match="topology"):
+        read_rank_receipts(tmp_path, 1, 10)
+
+
+def test_preview_v4_lifecycle_distinguishes_persistent_and_request_reset():
+    from preview_v4_fixture import manifest_v4
+
+    from lightcone_spec.preview_v4 import NODES, jobs
+    from lightcone_spec.preview_v4_qa import review_lifecycle
+    for job in (j for j in jobs(manifest_v4()) if j.node == NODES[0] and j.method == "lightcone" and j.block == 0):
+        costs = []
+        request_scope = job.parameters["preview_state_scope"] == "request"
+        for i, source in enumerate(job.parameters["preview_prompt_records"]):
+            before = {"cohort_epoch": i if request_scope else 0, "active_version": 0 if request_scope else i, "round": 0 if request_scope else i*10}
+            after = {"cohort_epoch": i+1 if request_scope else 0, "active_version": 0 if request_scope else i+1, "round": 0 if request_scope else (i+1)*10}
+            costs.append({**source, "state_before": [before.copy() for _ in range(job.gpu_count)],
+                          "state_after": [after.copy() for _ in range(job.gpu_count)], "request_scope_release_checked": request_scope})
+        reset = [{"tp_rank": r, "passed": True} for r in range(job.gpu_count)]
+        assert review_lifecycle(job, costs, {}, reset)["state_lifecycle"]
+        costs[-1]["state_after"][0]["active_version"] = -1
+        with pytest.raises(RuntimeError):
+            review_lifecycle(job, costs, {}, reset)
+
+
 @pytest.mark.parametrize("mode", ["static", "always_s10", "gated_s10", "gated_s5"])
 def test_context_benchmark_full_last_bin_has_two_engine_guard_slots(tmp_path, mode):
     from lightcone_spec.preview_benchmark import FIXED_GATE, FIXED_VERSION

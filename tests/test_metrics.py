@@ -322,6 +322,51 @@ def test_video_nvml_window_keeps_rank_peaks_separate(tmp_path):
         recording_nvml_peaks(path, (0,))
 
 
+def test_preview_v4_separates_lifetimes_and_discloses_scene_selection(tmp_path):
+    from preview_v4_fixture import manifest_v4
+
+    from lightcone_spec.preview import preview_jobs, preview_summary
+    from lightcone_spec.preview_v4_report import cumulative_gain
+
+    jobs = preview_jobs(manifest_v4())
+    evidence = []
+    for job in jobs:
+        config = job.to_dict()
+        config["parameters"]["execution_policy"] = "test-isolated"
+        gain = 1.2 if job.parameters["state_variant"] == "cohort" else .9 if job.method == "lightcone" else 1.
+        evidence.append((config, {"hard_feasible": True, "goodput": 100 * gain,
+                                 "effective_load": job.load, "target_calls": 100,
+                                 "accepted_drafts": 300, "delivered_bonus_tokens": 98,
+                                 "delivered_verification_calls": 100, "delivered_draft_tokens": 299}))
+    report = preview_summary(evidence, jobs, tmp_path)
+    assert report["counts"] == {"measured": 180}
+    assert all(e["n_blocks"] == 4 for e in report["effects"] if e["metric"] == "goodput")
+    cohort = [e for e in report["effects"] if e["panel"] == "cohort" and e["metric"] == "goodput"
+              and e["baseline"] == "static:DFLASH:static"]
+    assert {round(e["ratio"], 1) for e in cohort} == {.9, 1.2}
+    assert report["selected_scenes"]["cohort_appendix"]["positive_gain"]
+    assert not report["selected_scenes"]["Qwen/Qwen3.8-27B"]["positive_gain"]
+    assert "prompt" not in (tmp_path / "preview.json").read_text()
+    assert all(r["metrics"]["al_with_bonus"] == pytest.approx(3.97)
+               for r in report["rows"] if not r["variant"].startswith("target_only:"))
+    assert (tmp_path / "cells.csv").read_text().count("\n") == 181
+    from lightcone_spec.preview_v4 import video_job
+    for index in range(6):
+        video = video_job(manifest_v4(), report, "Qwen/Qwen3-8B", index, 2)
+        assert video.parameters["preview_state_scope"] == "cohort"
+        assert video.parameters["respect_eos"] is True
+        assert not video.parameters.get("flow_order")
+        assert len(video.parameters["preview_prompt_records"]) == 8
+    assert len(video_job(manifest_v4(), report, "Qwen/Qwen3-8B", 1, 1, cohort=True)
+               .parameters["preview_prompt_records"]) == 48
+    baseline = [{"source": "Chat", "problem_id": str(i), "wall_seconds": 2.} for i in range(48)]
+    candidate = [{**r, "wall_seconds": 1.} for r in baseline]
+    curve = cumulative_gain(baseline, candidate, static_setup=0., candidate_setup=2.)
+    assert curve["first_payback_request"] == 3 and curve["final_net_seconds"] == 46
+    with pytest.raises(ValueError, match="identity"):
+        cumulative_gain(baseline, list(reversed(candidate)))
+
+
 def test_preview_four_block_effects_keep_missing_and_exclude_private_data(tmp_path):
     from lightcone_spec.preview import preview_summary
     from lightcone_spec.protocol import Job
