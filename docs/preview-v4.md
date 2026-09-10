@@ -44,11 +44,14 @@ generalization. Matching TP2 trace anchors are additional work, not part of 180.
 ## Data freezing and the cohort control
 
 Freeze source revisions, sample IDs, templates and checkpoint revisions. Exclude
-all prior tuning, preview, diagnostic and synthetic-benchmark samples by source
-ID and exact prompt text; do not resample after seeing performance. Each of the
-four cohort blocks has 48 distinct requests, 16 per domain; blocks are disjoint.
-Video pools are separate. Insufficient unseen data is a preparation blocker, not
-permission to fabricate or recycle tasks.
+all prior tuning, preview, diagnostic and synthetic-benchmark samples from the
+long-generation confirmation pool by source ID and exact prompt text. The 8B and
+27B models share the same 32 confirmation prompts per applicable domain; do not
+resample after seeing performance. Each of the four cohort blocks has 48 distinct
+requests, 16 per domain; blocks are disjoint. Cohort and video may reuse historical
+corpus samples, explicitly disclosed, and do not claim unseen-task generalization.
+Within v4, confirmation, cohort and video pools are separate. Insufficient fresh
+confirmation data is a preparation blocker, not permission to fabricate tasks.
 
 The three orders contain exactly the same block's sample IDs and ID-bound seeds:
 contiguous groups of 16; deterministic random interleaving; groups of eight per

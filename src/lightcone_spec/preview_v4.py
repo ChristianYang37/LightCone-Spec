@@ -79,7 +79,11 @@ def record_key(row):
 
 
 def freeze_data(pools, excluded):
-    """Allocate once, seed zero, with ID and exact-text exclusion across all pools."""
+    """Freeze fresh confirmation data; cohort/video may reuse historical corpora.
+
+    Models share confirmation prompts. Within v4, cohort/video are separate
+    from confirmation and each other; cohort blocks never repeat a request.
+    """
     used_ids = {record_key(r) for r in excluded if r.get("source") and r.get("problem_id") is not None}
     used_texts = {r["prompt"].strip() for r in excluded if r.get("prompt")}
     data = {"long8": {}, "long27": {}, "cohort": {}, "video": {}}
@@ -87,7 +91,7 @@ def freeze_data(pools, excluded):
         rows = sorted(pools[task], key=record_key)
         random.Random(f"preview-v4:0:{task}").shuffle(rows)
         chosen = []
-        needed = (0 if domain == "Chat" else 32) + 32 + 64 + 8
+        needed = 32
         for row in rows:
             key, text = record_key(row), row["prompt"].strip()
             if key in used_ids or text in used_texts:
@@ -99,11 +103,26 @@ def freeze_data(pools, excluded):
                 break
         if len(chosen) != needed:
             raise ValueError(f"{task}: need {needed} unseen prompts; have {len(chosen)}")
-        cursor = 0
-        for name, count in (("long8", 0 if domain == "Chat" else 32),
-                            ("long27", 32), ("cohort", 64), ("video", 8)):
-            data[name][task] = chosen[cursor:cursor + count]
-            cursor += count
+        data["long8"][task] = deepcopy(chosen) if domain != "Chat" else []
+        data["long27"][task] = chosen
+        # Historical exposure is not an exclusion for the cold-start cohort
+        # control or selected illustration. Do not claim held-out generalization.
+        allocated = [r for panel in data.values() for records in panel.values() for r in records]
+        allocated_ids = {record_key(r) for r in allocated}
+        allocated_texts = {r["prompt"].strip() for r in allocated}
+        other = []
+        for row in rows:
+            key, text = record_key(row), row["prompt"].strip()
+            if key in allocated_ids or text in allocated_texts:
+                continue
+            allocated_ids.add(key)
+            allocated_texts.add(text)
+            other.append(deepcopy(row))
+            if len(other) == 72:
+                break
+        if len(other) != 72:
+            raise ValueError(f"{task}: need 72 distinct cohort/video prompts; have {len(other)}")
+        data["cohort"][task], data["video"][task] = other[:64], other[64:]
     return data
 
 
@@ -116,6 +135,10 @@ def validate_data(data):
             rows = data[name][task]
             if len(rows) != count:
                 raise ValueError(f"{name}/{task}: expected {count} prompts")
+            if name == "long27" and domain != "Chat":
+                if rows != data["long8"][task]:
+                    raise ValueError("preview v4 models must share confirmation prompts")
+                continue
             for row in rows:
                 identity, text = record_key(row), row["prompt"].strip()
                 if identity in identities or text in texts:

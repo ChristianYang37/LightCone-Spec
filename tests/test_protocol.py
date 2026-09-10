@@ -183,6 +183,31 @@ def test_preview_v4_frozen_matrix_state_and_data():
     assert static.parameters["static_confidence_temperatures"] == [1.1] * 7
 
 
+def test_preview_v4_fresh_confirmation_and_disclosed_corpus_reuse():
+    from copy import deepcopy
+
+    from lightcone_spec.preview_v4 import DOMAINS, freeze_data, validate_data
+
+    pools = {task: [{"source": task, "problem_id": str(i), "prompt": f"{task}:{i}"}
+                    for i in range(104)] for task in DOMAINS.values()}
+    excluded = [row for rows in pools.values() for row in rows[:72]]
+    data = freeze_data(pools, excluded)
+    validate_data(data)
+    assert data == freeze_data(pools, excluded)
+    for domain, task in DOMAINS.items():
+        assert all(int(r["problem_id"]) >= 72 for r in data["long27"][task])
+        if domain != "Chat":
+            assert data["long8"][task] == data["long27"][task]
+        assert len({r["problem_id"] for r in data["cohort"][task]}) == 64
+        assert all(int(r["problem_id"]) < 72 for r in data["cohort"][task])
+    bad = deepcopy(data)
+    bad["cohort"]["MATH-500"][16] = bad["cohort"]["MATH-500"][0]
+    with pytest.raises(ValueError, match="overlap"):
+        validate_data(bad)
+    with pytest.raises(ValueError, match="unseen"):
+        freeze_data(pools, excluded + [pools["MATH-500"][72]])
+
+
 def test_preview_exact_56_frozen_pairs_and_no_public_node_change():
     from collections import Counter
 
